@@ -4,11 +4,12 @@
 //! `Hash32` is the single mechanism that serves as Merkle DAG pointer,
 //! integrity check, and dedup key throughout LCHFS.
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// A BLAKE3-256 content hash. The identity of every Extent Record's payload
 /// (§1) and the pointer type used throughout the Merkle DAG object schemas.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Hash32(pub [u8; 32]);
 
 impl Hash32 {

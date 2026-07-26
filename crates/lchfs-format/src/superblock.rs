@@ -2,6 +2,7 @@
 //! Shard Superblock, added to resolve the global-epoch fsync bottleneck).
 
 use crate::{ExtentLocation, Hash32};
+use serde::{Deserialize, Serialize};
 
 /// Magic bytes identifying a global superblock slot on disk.
 pub const SUPERBLOCK_MAGIC: [u8; 8] = *b"LCHFSBLK";
@@ -19,13 +20,13 @@ pub const SUPERBLOCK_SLOT_SIZE: usize = 4096;
 /// The global superblock: a 16-slot ring on disk. This type represents the
 /// *logical* superblock (in-memory view); `SuperblockSlot` is the on-disk
 /// per-slot record.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Superblock {
     pub slots: [SuperblockSlot; SUPERBLOCK_SLOT_COUNT as usize],
 }
 
 /// One 4KiB slot of the global superblock ring (ARCHITECTURE.md §1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SuperblockSlot {
     pub magic: [u8; 8],
     pub format_version: u32,
@@ -42,7 +43,7 @@ pub struct SuperblockSlot {
 
 /// Denormalized, informational-only stats carried in the superblock.
 /// Never authoritative — never used for correctness decisions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct SuperblockStats {
     pub live_bytes: u64,
     pub object_count: u64,
@@ -56,7 +57,7 @@ pub const SHARD_SUPERBLOCK_MAGIC: [u8; 8] = *b"LCHFSSB\0";
 /// exists so a shard's `fsync` fast path never contends with other shards
 /// or with the global superblock ring. A single slot suffices given far
 /// less per-slot metadata than the global superblock.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShardSuperblockSlot {
     pub magic: [u8; 8],
     pub shard_id: u32,

@@ -4,10 +4,11 @@
 //! decoded, in-memory shape only; encoding is bincode via lchfs-store.
 
 use crate::Hash32;
+use serde::{Deserialize, Serialize};
 
 /// The root of a point-in-time filesystem tree. A superblock's `root_hash`
 /// points at one of these. ARCHITECTURE.md §1.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RootObject {
     pub inomap_hash: Hash32,
     /// Root directory inode number, fixed at 1 by convention (matches
@@ -27,19 +28,19 @@ pub struct RootObject {
 /// between content-addressing (hash changes every write) and POSIX's need
 /// for stable inode numbers. ARCHITECTURE.md §1: "DirectoryObject entries
 /// reference `ino`, not a hash" is the key structural point this enables.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct InoMap {
     pub entries: Vec<InoMapEntry>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InoMapEntry {
     pub ino: u64,
     pub current_object_hash: Hash32,
 }
 
 /// What kind of inode a directory entry (or InodeObject) refers to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InodeKind {
     File,
     Directory,
@@ -48,12 +49,12 @@ pub enum InodeKind {
 
 /// A directory's contents: name -> ino mappings, sorted by name for
 /// deterministic hashing. ARCHITECTURE.md §1.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DirectoryObject {
     pub entries: Vec<DirEntry>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DirEntry {
     pub name: String,
     pub ino: u64,
@@ -61,7 +62,7 @@ pub struct DirEntry {
 }
 
 /// A file/dir/symlink's metadata and content pointer. ARCHITECTURE.md §1.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InodeObject {
     pub kind: InodeKind,
     pub mode: u32,
@@ -81,13 +82,13 @@ pub struct InodeObject {
 }
 
 /// Placeholder for reserved-but-unimplemented xattr storage.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct XattrBlob(pub Vec<u8>);
 
 /// How an InodeObject's content is stored. ARCHITECTURE.md §1: files below
 /// `PoolParams::inline_threshold` embed directly (deliberately not
 /// dedup'd — see rationale in ARCHITECTURE.md §1).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ContentRef {
     Inline(Vec<u8>),
     ChunkList(Hash32),
@@ -99,12 +100,12 @@ pub enum ContentRef {
 /// blocks. Sorted by `logical_offset`, capped at 64K entries per level
 /// (double-indirect beyond that). ARCHITECTURE.md §1, and §5 for why
 /// ingestion order never needs to match this logical order.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct IndirectHashList {
     pub chunks: Vec<ChunkRef>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkRef {
     pub content_hash: Hash32,
     pub logical_offset: u64,
@@ -114,12 +115,12 @@ pub struct ChunkRef {
 /// Named, retained point-in-time roots. Itself content-addressed and
 /// referenced from `RootObject`, so snapshots participate in ordinary GC
 /// reachability with no special-casing (ARCHITECTURE.md §6).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotTable {
     pub entries: Vec<SnapshotEntry>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotEntry {
     pub name: String,
     pub root_hash: Hash32,
@@ -130,7 +131,7 @@ pub struct SnapshotEntry {
 /// One entry in a logical shard's Delta Log (ARCHITECTURE.md §1, §3, §7):
 /// `{ino -> new_object_hash}`, applied on top of the base InoMap during
 /// the bounded, idempotent mount-time replay.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeltaLogEntry {
     pub ino: u64,
     pub new_object_hash: Hash32,
@@ -139,7 +140,7 @@ pub struct DeltaLogEntry {
 
 /// Pool-wide parameters, set at `create-pool` time and immutable
 /// thereafter (referenced from `RootObject`). ARCHITECTURE.md §1, §2.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PoolParams {
     pub data_segment_cap_bytes: u32,
     pub meta_segment_cap_bytes: u32,

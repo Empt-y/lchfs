@@ -9,3 +9,4 @@ license.workspace = true
 blake3 = { workspace = true }
 crc32fast = { workspace = true }
 thiserror = { workspace = true }
+serde = { workspace = true }
