@@ -27,36 +27,93 @@ pub trait Chunker {
 /// Default whole-file chunker. ARCHITECTURE.md §2: avg 64KiB / min 16KiB /
 /// max 256KiB by default (larger than FastCDC's typical 8-16KiB defaults,
 /// deliberately, for a bulk-ingest profile over a dedup-maximizing one).
+///
+/// Wraps `fastcdc::v2020::FastCDC`, which cuts over a complete in-memory
+/// slice rather than a live stream. To make it stateful across `push()`
+/// calls, this buffers incoming bytes and only emits a boundary once the
+/// buffer holds at least `max_size` bytes — the gear-hash cut decision for
+/// any position never looks more than `max_size` bytes ahead, so once that
+/// many trailing bytes are buffered, every cut point below them is final
+/// and can never change no matter what arrives next.
 pub struct FastCdcChunker {
-    // TODO(phase-B): wrap fastcdc::v2020::FastCDC or similar, stateful across push() calls
-    _avg_size: u32,
-    _min_size: u32,
-    _max_size: u32,
+    avg_size: u32,
+    min_size: u32,
+    max_size: u32,
+    buffer: Vec<u8>,
+    /// Absolute stream offset corresponding to `buffer[0]`.
+    base_offset: u64,
 }
 
 impl FastCdcChunker {
     pub fn new(avg_size: u32, min_size: u32, max_size: u32) -> Self {
-        Self { _avg_size: avg_size, _min_size: min_size, _max_size: max_size }
+        Self {
+            avg_size,
+            min_size,
+            max_size,
+            buffer: Vec::new(),
+            base_offset: 0,
+        }
     }
 }
 
 impl Chunker for FastCdcChunker {
-    fn push(&mut self, _data: &[u8]) -> Vec<ChunkBoundary> {
-        // TODO(phase-B): see ARCHITECTURE.md §2
-        todo!("lchfs-chunk: FastCdcChunker::push")
+    fn push(&mut self, data: &[u8]) -> Vec<ChunkBoundary> {
+        self.buffer.extend_from_slice(data);
+        let mut boundaries = Vec::new();
+        while self.buffer.len() >= self.max_size as usize {
+            let cutter = fastcdc::v2020::FastCDC::new(
+                &self.buffer,
+                self.min_size as usize,
+                self.avg_size as usize,
+                self.max_size as usize,
+            );
+            let (_hash, cutpoint) = cutter.cut(0, self.buffer.len());
+            if cutpoint == 0 {
+                break;
+            }
+            boundaries.push(ChunkBoundary {
+                offset: self.base_offset,
+                len: cutpoint as u32,
+            });
+            self.buffer.drain(0..cutpoint);
+            self.base_offset += cutpoint as u64;
+        }
+        boundaries
     }
 
+    /// Flushes whatever is left in the buffer (necessarily fewer than
+    /// `max_size` bytes, by `push()`'s loop invariant) as one final chunk.
+    /// This may skip an "ideal" interior CDC cut point that could exist
+    /// within that tail, but it never drops or exceeds `max_size` on any
+    /// byte — a deliberate simplification for the true end-of-stream case.
     fn finish(&mut self) -> Option<ChunkBoundary> {
-        todo!("lchfs-chunk: FastCdcChunker::finish")
+        if self.buffer.is_empty() {
+            return None;
+        }
+        let boundary = ChunkBoundary {
+            offset: self.base_offset,
+            len: self.buffer.len() as u32,
+        };
+        self.buffer.clear();
+        self.base_offset += boundary.len as u64;
+        Some(boundary)
     }
 }
 
 /// Overwrite-path chunker (ARCHITECTURE.md §2, "Overwrites" paragraph):
 /// re-chunks only the touched byte range plus a resync window (~2x avg
 /// chunk size), leaving untouched chunks in the IndirectHashList alone.
-pub struct SpliceChunker {
-    // TODO(phase-B/E): resync-window splice logic against an existing IndirectHashList
-}
+///
+/// Deliberately deferred past this crate's initial implementation pass:
+/// resync needs to compare candidate new cut points against the *content*
+/// of untouched neighboring chunks, which lives in segments on disk and is
+/// looked up by hash — that's `lchfs-store`/`lchfs-index` territory, and
+/// this crate must not depend on either (ARCHITECTURE.md §11 dependency
+/// order: `chunk` sits *below* `format`/`store`/`index`). Real
+/// implementation belongs in Phase E once `lchfs-store` exists to supply
+/// byte access; see `lchfs-store`'s TODOs for the write-path integration.
+// TODO(phase-E): resync-window splice logic against an existing IndirectHashList, wired through lchfs-store for byte access
+pub struct SpliceChunker {}
 
 impl SpliceChunker {
     pub fn new() -> Self {

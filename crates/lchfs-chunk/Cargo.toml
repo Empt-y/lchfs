@@ -7,3 +7,6 @@ license.workspace = true
 
 [dependencies]
 fastcdc = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
