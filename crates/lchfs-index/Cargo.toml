@@ -1,0 +1,12 @@
+[package]
+name = "lchfs-index"
+description = "Persisted and in-memory hash/location indexes for LCHFS -- a rebuildable cache, never authoritative"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+lchfs-format = { workspace = true }
+lchfs-crypto = { workspace = true }
+redb = { workspace = true }
+thiserror = { workspace = true }

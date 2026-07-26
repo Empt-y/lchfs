@@ -1,0 +1,15 @@
+[package]
+name = "lchfs-cli"
+description = "LCHFS command-line interface: create-pool, mount, fsck, snapshot, stats"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+lchfs-fuse = { workspace = true }
+lchfs-fsck = { workspace = true }
+lchfs-store = { workspace = true }
+lchfs-index = { workspace = true }
+clap = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }

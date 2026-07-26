@@ -1,0 +1,13 @@
+[package]
+name = "lchfs-fsck"
+description = "DAG-walk verification/diagnostics library for LCHFS, shared by the CLI and crash-consistency tests"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+lchfs-store = { workspace = true }
+lchfs-index = { workspace = true }
+lchfs-format = { workspace = true }
+lchfs-crypto = { workspace = true }
+thiserror = { workspace = true }

@@ -1,0 +1,9 @@
+[package]
+name = "lchfs-compress"
+description = "Adaptive entropy-sampled zstd compression for LCHFS"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+zstd = { workspace = true }

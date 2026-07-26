@@ -1,0 +1,16 @@
+[package]
+name = "lchfs-fuse"
+description = "FUSE3 frontend for LCHFS -- a thin protocol adapter over lchfs-store::Pool (see ARCHITECTURE.md §5a)"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+lchfs-store = { workspace = true }
+lchfs-index = { workspace = true }
+lchfs-format = { workspace = true }
+lchfs-chunk = { workspace = true }
+lchfs-crypto = { workspace = true }
+fuser = { workspace = true }
+nix = { workspace = true }
+tracing = { workspace = true }

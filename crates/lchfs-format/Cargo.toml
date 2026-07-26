@@ -1,0 +1,12 @@
+[package]
+name = "lchfs-format"
+description = "On-disk schema for LCHFS: superblock, extent records, Merkle DAG objects. No I/O."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+lchfs-crypto = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+thiserror = { workspace = true }

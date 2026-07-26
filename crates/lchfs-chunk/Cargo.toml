@@ -1,0 +1,9 @@
+[package]
+name = "lchfs-chunk"
+description = "FastCDC content-defined chunking and overwrite chunk-splicing for LCHFS"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+fastcdc = { workspace = true }
