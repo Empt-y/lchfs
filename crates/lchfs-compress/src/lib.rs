@@ -27,14 +27,14 @@ impl Codec for ZstdCodec {
         CodecId::Zstd
     }
 
-    fn compress(&self, _data: &[u8], _level: i32) -> Vec<u8> {
-        // TODO(phase-B): zstd::stream::encode_all or bulk API
-        todo!("lchfs-compress: ZstdCodec::compress")
+    fn compress(&self, data: &[u8], level: i32) -> Vec<u8> {
+        zstd::bulk::compress(data, level)
+            .expect("zstd compression of an in-memory buffer should not fail")
     }
 
-    fn decompress(&self, _data: &[u8], _uncompressed_len: usize) -> Vec<u8> {
-        // TODO(phase-B): zstd::stream::decode_all or bulk API
-        todo!("lchfs-compress: ZstdCodec::decompress")
+    fn decompress(&self, data: &[u8], uncompressed_len: usize) -> Vec<u8> {
+        zstd::bulk::decompress(data, uncompressed_len)
+            .expect("zstd decompression of a record written by this codec should not fail")
     }
 }
 
@@ -50,8 +50,56 @@ pub enum CompressionDecision {
     Compress { codec: CodecId, level: i32 },
 }
 
-pub fn sample_and_decide(_chunk: &[u8]) -> CompressionDecision {
-    // TODO(phase-B): sample ~10% (first 4KiB + strided windows, capped),
-    // trial-compress at level 1, threshold check per ARCHITECTURE.md §8
-    todo!("lchfs-compress: sample_and_decide")
+/// Size of each sampled window, and the size of the always-included first
+/// window ("first 4KiB" per ARCHITECTURE.md §2).
+const SAMPLE_WINDOW_BYTES: usize = 4096;
+/// Target sample size as a fraction of the chunk ("sample ~10%").
+const SAMPLE_FRACTION: f64 = 0.10;
+/// Trial-compression level — cheap, just to estimate compressibility.
+const TRIAL_LEVEL: i32 = 1;
+/// Level used for the real compression pass if the trial looks promising.
+const TARGET_LEVEL: i32 = 3;
+/// Minimum reduction the trial must show to bother compressing the full
+/// chunk ("if the sample achieves >=10% reduction").
+const MIN_REDUCTION: f64 = 0.10;
+
+/// Builds the ~10% sample used to decide compressibility: the first
+/// `SAMPLE_WINDOW_BYTES` of the chunk, plus additional same-size windows
+/// strided evenly through the rest, until the sample reaches ~10% of the
+/// chunk's size (or the chunk is small enough that "10%" already covers all
+/// of it, in which case the whole chunk is the sample).
+fn build_sample(chunk: &[u8]) -> Vec<u8> {
+    let target_len = (((chunk.len() as f64) * SAMPLE_FRACTION).ceil() as usize).max(1);
+    if chunk.len() <= SAMPLE_WINDOW_BYTES || target_len >= chunk.len() {
+        return chunk.to_vec();
+    }
+    let window = SAMPLE_WINDOW_BYTES;
+    let num_windows = (target_len / window).max(1);
+    if num_windows == 1 {
+        return chunk[..window].to_vec();
+    }
+    let stride = chunk.len() / num_windows;
+    let mut sample = Vec::with_capacity(num_windows * window);
+    for i in 0..num_windows {
+        let start = (i * stride).min(chunk.len() - window);
+        sample.extend_from_slice(&chunk[start..start + window]);
+    }
+    sample
+}
+
+pub fn sample_and_decide(chunk: &[u8]) -> CompressionDecision {
+    if chunk.is_empty() {
+        return CompressionDecision::StoreRaw;
+    }
+    let sample = build_sample(chunk);
+    let trial = ZstdCodec.compress(&sample, TRIAL_LEVEL);
+    let reduction = 1.0 - (trial.len() as f64 / sample.len() as f64);
+    if reduction >= MIN_REDUCTION {
+        CompressionDecision::Compress {
+            codec: CodecId::Zstd,
+            level: TARGET_LEVEL,
+        }
+    } else {
+        CompressionDecision::StoreRaw
+    }
 }

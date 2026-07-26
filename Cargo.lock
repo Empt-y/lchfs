@@ -454,6 +454,7 @@ dependencies = [
 name = "lchfs-compress"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "zstd",
 ]
 
