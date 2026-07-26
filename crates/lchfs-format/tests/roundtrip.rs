@@ -287,6 +287,41 @@ prop_compose! {
     }
 }
 
+fn stream_kind() -> impl Strategy<Value = StreamKind> {
+    prop_oneof![Just(StreamKind::Data), Just(StreamKind::Meta)]
+}
+
+fn segment_state() -> impl Strategy<Value = SegmentState> {
+    prop_oneof![
+        Just(SegmentState::Open),
+        Just(SegmentState::Sealed),
+        Just(SegmentState::Coalesced),
+    ]
+}
+
+prop_compose! {
+    fn segment_header()(
+        magic in any::<[u8; 8]>(),
+        segment_id in any::<u64>(),
+        stream_kind in stream_kind(),
+        owner_shard in any::<u32>(),
+        state in segment_state(),
+        header_checksum in any::<u32>(),
+    ) -> SegmentHeader {
+        SegmentHeader { magic, segment_id, stream_kind, owner_shard, state, header_checksum }
+    }
+}
+
+prop_compose! {
+    fn segment_footer()(
+        record_count in any::<u64>(),
+        aggregate_fingerprint in hash32(),
+        footer_checksum in any::<u32>(),
+    ) -> SegmentFooter {
+        SegmentFooter { record_count, aggregate_fingerprint, footer_checksum }
+    }
+}
+
 macro_rules! roundtrip_test {
     ($name:ident, $strategy:expr, $ty:ty) => {
         proptest! {
@@ -336,6 +371,8 @@ roundtrip_test!(
     shard_superblock_slot(),
     ShardSuperblockSlot
 );
+roundtrip_test!(roundtrip_segment_header, segment_header(), SegmentHeader);
+roundtrip_test!(roundtrip_segment_footer, segment_footer(), SegmentFooter);
 
 proptest! {
     /// ARCHITECTURE.md §1: header_checksum is a cheap CRC32C pre-check.

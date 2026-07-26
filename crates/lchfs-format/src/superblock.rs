@@ -67,3 +67,27 @@ pub struct ShardSuperblockSlot {
     pub local_epoch: u64,
     pub header_checksum: u32,
 }
+
+/// Same zero-then-CRC32C pattern as `extent::compute_header_checksum`.
+pub fn compute_superblock_slot_checksum(slot: &SuperblockSlot) -> u32 {
+    let mut zeroed = *slot;
+    zeroed.header_checksum = 0;
+    let bytes = bincode::serialize(&zeroed).expect("SuperblockSlot serialization is infallible");
+    lchfs_crypto::header_checksum(&bytes)
+}
+
+pub fn finalize_superblock_slot_checksum(slot: &mut SuperblockSlot) {
+    slot.header_checksum = compute_superblock_slot_checksum(slot);
+}
+
+pub fn compute_shard_superblock_slot_checksum(slot: &ShardSuperblockSlot) -> u32 {
+    let mut zeroed = *slot;
+    zeroed.header_checksum = 0;
+    let bytes =
+        bincode::serialize(&zeroed).expect("ShardSuperblockSlot serialization is infallible");
+    lchfs_crypto::header_checksum(&bytes)
+}
+
+pub fn finalize_shard_superblock_slot_checksum(slot: &mut ShardSuperblockSlot) {
+    slot.header_checksum = compute_shard_superblock_slot_checksum(slot);
+}

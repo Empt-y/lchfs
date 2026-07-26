@@ -6,6 +6,7 @@
 pub mod codec;
 pub mod extent;
 pub mod objects;
+pub mod segment;
 pub mod superblock;
 
 pub use codec::{DecodeError, EncodeError, decode, encode};
@@ -19,7 +20,16 @@ pub use objects::{
     InodeKind, InodeObject, IndirectHashList, PoolParams, RootObject, SnapshotEntry,
     SnapshotTable, XattrBlob,
 };
-pub use superblock::{ShardSuperblockSlot, Superblock, SuperblockSlot, SuperblockStats};
+pub use segment::{
+    SEGMENT_HEADER_MAGIC, SegmentFooter, SegmentHeader, SegmentState, StreamKind,
+    compute_segment_footer_checksum, compute_segment_header_checksum,
+    finalize_segment_footer_checksum, finalize_segment_header_checksum,
+};
+pub use superblock::{
+    ShardSuperblockSlot, Superblock, SuperblockSlot, SuperblockStats,
+    compute_shard_superblock_slot_checksum, compute_superblock_slot_checksum,
+    finalize_shard_superblock_slot_checksum, finalize_superblock_slot_checksum,
+};
 
 /// On-disk format version, stored in every superblock slot. Bump on any
 /// breaking schema change; `lchfs-fsck`/mount-time checks refuse to proceed
