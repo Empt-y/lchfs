@@ -123,6 +123,22 @@ fn mkdir_lookup_and_readdir() {
 }
 
 #[test]
+fn parent_of_resolves_correctly_including_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let pool = Pool::create(dir.path(), small_params()).unwrap();
+        let sub = pool.mkdir(1, "subdir", 0o755).unwrap();
+        assert_eq!(pool.parent_of(1).unwrap(), 1);
+        assert_eq!(pool.parent_of(sub).unwrap(), 1);
+        pool.checkpoint().unwrap();
+    }
+    let pool = Pool::open(dir.path()).unwrap();
+    let sub = pool.lookup(1, "subdir").unwrap().unwrap();
+    assert_eq!(pool.parent_of(1).unwrap(), 1);
+    assert_eq!(pool.parent_of(sub).unwrap(), 1);
+}
+
+#[test]
 fn create_duplicate_name_fails() {
     let dir = tempfile::tempdir().unwrap();
     let pool = Pool::create(dir.path(), small_params()).unwrap();

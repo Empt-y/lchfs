@@ -123,6 +123,11 @@ struct PoolInner {
     /// overwrite needs the whole file in memory to re-chunk it).
     file_contents: HashMap<u64, Vec<u8>>,
     next_ino: u64,
+    /// `ino -> parent_ino`, for resolving `..` in readdir. Not part of the
+    /// on-disk schema (DirectoryObject entries only point child->parent by
+    /// virtue of being listed in the parent, not the reverse) — rebuilt at
+    /// mount alongside `dirs`/`inodes`.
+    parents: HashMap<u64, u64>,
 
     /// Content-address -> location, for both RawChunk (data stream) and
     /// every meta object kind (meta stream). Rebuilt at mount by scanning
@@ -189,6 +194,7 @@ impl Pool {
             file_chunks: HashMap::new(),
             file_contents: HashMap::new(),
             next_ino: ROOT_DIR_INO + 1,
+            parents: HashMap::from([(ROOT_DIR_INO, ROOT_DIR_INO)]),
             locations: HashMap::new(),
             readers: HashMap::new(),
             data_writer,
@@ -242,6 +248,7 @@ impl Pool {
 
         let mut inodes = HashMap::new();
         let mut dirs = HashMap::new();
+        let mut parents = HashMap::from([(ROOT_DIR_INO, ROOT_DIR_INO)]);
         for entry in &ino_map.entries {
             let loc = *locations.get(&entry.current_object_hash).ok_or_else(|| {
                 PoolError::Format(format!("InodeObject for ino {} missing from scan", entry.ino))
@@ -267,6 +274,9 @@ impl Pool {
                 };
                 let dir: DirectoryObject = lchfs_format::decode(&dir_bytes)
                     .map_err(|e| PoolError::Format(e.to_string()))?;
+                for child in &dir.entries {
+                    parents.insert(child.ino, entry.ino);
+                }
                 dirs.insert(entry.ino, dir);
             }
             inodes.insert(entry.ino, inode);
@@ -288,6 +298,7 @@ impl Pool {
             file_chunks: HashMap::new(),
             file_contents: HashMap::new(),
             next_ino,
+            parents,
             locations,
             readers,
             data_writer,
@@ -337,6 +348,13 @@ impl Pool {
             .get(&ino)
             .map(|d| d.entries.clone())
             .ok_or(PoolError::NotADirectory(ino))
+    }
+
+    /// Resolves `ino`'s parent directory's ino — for `..` in readdir. The
+    /// root directory is its own parent, matching FUSE convention.
+    pub fn parent_of(&self, ino: u64) -> Result<u64, PoolError> {
+        let inner = self.inner.lock();
+        inner.parents.get(&ino).copied().ok_or(PoolError::NoSuchInode(ino))
     }
 
     pub fn mkdir(&self, parent_ino: u64, name: &str, mode: u32) -> Result<u64, PoolError> {
@@ -744,6 +762,7 @@ impl PoolInner {
             kind,
         });
         dir.entries.sort_by(|a, b| a.name.cmp(&b.name));
+        self.parents.insert(ino, parent_ino);
 
         self.dirty_inodes.insert(parent_ino);
         self.dirty_inodes.insert(ino);

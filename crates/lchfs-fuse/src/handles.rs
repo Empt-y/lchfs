@@ -10,20 +10,23 @@ pub struct FileHandle(pub u64);
 
 #[derive(Default)]
 pub struct FileHandleTable {
-    // TODO(phase-D): HashMap<FileHandle, OpenFileState>, next-handle counter
     open: HashMap<FileHandle, u64>,
+    next: u64,
 }
 
 impl FileHandleTable {
-    pub fn open(&mut self, _ino: u64) -> FileHandle {
-        todo!("lchfs-fuse: FileHandleTable::open")
+    pub fn open(&mut self, ino: u64) -> FileHandle {
+        self.next += 1;
+        let handle = FileHandle(self.next);
+        self.open.insert(handle, ino);
+        handle
     }
 
     pub fn ino_for(&self, handle: FileHandle) -> Option<u64> {
         self.open.get(&handle).copied()
     }
 
-    pub fn close(&mut self, _handle: FileHandle) {
-        todo!("lchfs-fuse: FileHandleTable::close")
+    pub fn close(&mut self, handle: FileHandle) {
+        self.open.remove(&handle);
     }
 }
