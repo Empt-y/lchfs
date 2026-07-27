@@ -518,6 +518,7 @@ dependencies = [
 name = "lchfs-store"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "bytes",
  "crossbeam",
  "lchfs-chunk",
@@ -528,6 +529,8 @@ dependencies = [
  "parking_lot",
  "rayon",
  "roaring",
+ "serde",
+ "tempfile",
  "thiserror",
  "tracing",
 ]

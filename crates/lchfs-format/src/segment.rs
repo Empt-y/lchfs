@@ -11,7 +11,7 @@ pub const SEGMENT_HEADER_MAGIC: [u8; 8] = *b"LCHFSEG\0";
 /// Which stream a segment belongs to — data and metadata are kept as
 /// separate segment streams (ARCHITECTURE.md §1) so mount-time index
 /// rebuild and fsck can scan metadata first without touching bulk data.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum StreamKind {
     Data,
     Meta,

@@ -26,6 +26,7 @@ pub use segment::{
     finalize_segment_footer_checksum, finalize_segment_header_checksum,
 };
 pub use superblock::{
+    SHARD_SUPERBLOCK_MAGIC, SUPERBLOCK_MAGIC, SUPERBLOCK_SLOT_COUNT, SUPERBLOCK_SLOT_SIZE,
     ShardSuperblockSlot, Superblock, SuperblockSlot, SuperblockStats,
     compute_shard_superblock_slot_checksum, compute_superblock_slot_checksum,
     finalize_shard_superblock_slot_checksum, finalize_superblock_slot_checksum,
