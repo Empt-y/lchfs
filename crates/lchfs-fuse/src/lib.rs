@@ -65,6 +65,7 @@ fn errno_for(err: &PoolError) -> Errno {
         PoolError::NotADirectory(_) => Errno::ENOTDIR,
         PoolError::AlreadyExists(_) => Errno::EEXIST,
         PoolError::Io(_) | PoolError::Format(_) | PoolError::IntegrityFailure(_) => Errno::EIO,
+        PoolError::Index(_) => Errno::EIO,
     }
 }
 
@@ -127,6 +128,43 @@ impl Filesystem for LchfsFilesystem {
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<fuser::FileHandle>, reply: ReplyAttr) {
+        match self.pool.getattr(ino.0) {
+            Ok(inode) => reply.attr(&TTL, &file_attr(ino.0, &inode)),
+            Err(e) => reply.error(errno_for(&e)),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn setattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _mode: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        size: Option<u64>,
+        _atime: Option<fuser::TimeOrNow>,
+        _mtime: Option<fuser::TimeOrNow>,
+        _ctime: Option<std::time::SystemTime>,
+        _fh: Option<fuser::FileHandle>,
+        _crtime: Option<std::time::SystemTime>,
+        _chgtime: Option<std::time::SystemTime>,
+        _bkuptime: Option<std::time::SystemTime>,
+        _flags: Option<fuser::BsdFileFlags>,
+        reply: ReplyAttr,
+    ) {
+        // Only `size` (truncate/zero-extend) is wired to `Pool` -- mode,
+        // uid/gid, and timestamps have no `Pool` support yet (same gap as
+        // the hardcoded root uid/gid noted in lchfs-cli's `mount()`), so
+        // those fields are silently ignored rather than rejected: most
+        // callers (`cp`, `>` redirection) only need size-truncation to
+        // succeed and don't check whether metadata changes stuck.
+        if let Some(size) = size
+            && let Err(e) = self.pool.set_size(ino.0, size)
+        {
+            reply.error(errno_for(&e));
+            return;
+        }
         match self.pool.getattr(ino.0) {
             Ok(inode) => reply.attr(&TTL, &file_attr(ino.0, &inode)),
             Err(e) => reply.error(errno_for(&e)),

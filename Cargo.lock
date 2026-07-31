@@ -514,6 +514,7 @@ dependencies = [
  "lchfs-crypto",
  "lchfs-format",
  "redb",
+ "tempfile",
  "thiserror",
 ]
 

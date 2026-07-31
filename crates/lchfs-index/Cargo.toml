@@ -10,3 +10,6 @@ lchfs-format = { workspace = true }
 lchfs-crypto = { workspace = true }
 redb = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -17,11 +17,13 @@
 //! that optimization requires the Phase E machinery this Pool doesn't have
 //! yet.
 //!
-//! **No persisted index yet** (that's Phase C's `lchfs-index`): `Pool::open`
-//! rebuilds an in-memory `Hash32 -> ExtentLocation` map by scanning every
-//! segment once at mount time. This is exactly the "cold rebuild" path
-//! ARCHITECTURE.md §4 describes for an index_generation mismatch — Phase B
-//! just always takes it, since there's no cached index to compare against.
+//! **Persisted index (Phase C, `lchfs-index`'s `RedbIndex`)**: `Pool::open`
+//! trusts `INDEX.redb`'s chunk-location map and skips the full segment
+//! scan only when its checkpointed generation matches the recovered
+//! superblock slot's `index_generation`; otherwise it falls back to
+//! scanning every segment once (the "cold rebuild" path ARCHITECTURE.md
+//! §4 describes for an index_generation mismatch) and rebuilds the index
+//! from that scan so the *next* mount can take the fast path.
 
 pub mod backend;
 pub mod checkpoint;
@@ -42,6 +44,7 @@ use lchfs_format::{
     SnapshotTable, StreamKind, SuperblockSlot, SUPERBLOCK_MAGIC, SUPERBLOCK_SLOT_COUNT,
     SUPERBLOCK_SLOT_SIZE, compute_superblock_slot_checksum, finalize_superblock_slot_checksum,
 };
+use lchfs_index::{IndexError, IndexStore, RedbIndex};
 use parking_lot::Mutex;
 use segment::{SegmentError, SegmentReader, SegmentWriter};
 use std::collections::{HashMap, HashSet};
@@ -67,6 +70,8 @@ pub enum PoolError {
     AlreadyExists(String),
     #[error("not found: {0}")]
     NotFound(String),
+    #[error("index error: {0}")]
+    Index(#[from] IndexError),
 }
 
 impl From<SegmentError> for PoolError {
@@ -91,6 +96,12 @@ const ROOT_DIR_INO: u64 = 1;
 /// backpointers) used only to decide when to roll a segment over — exact
 /// byte-perfect cap enforcement isn't a Phase B correctness requirement.
 const RECORD_OVERHEAD_ESTIMATE: u64 = 256;
+
+fn index_path(pool_root: &Path) -> PathBuf {
+    pool_root.join("INDEX.redb")
+}
+
+type SegmentReaders = HashMap<(u64, StreamKind), SegmentReader>;
 
 /// The engine's entire public API. A frontend (lchfs-fuse today; see
 /// ARCHITECTURE.md §5a for the future-kernel-module rationale) is a thin
@@ -130,11 +141,18 @@ struct PoolInner {
     parents: HashMap<u64, u64>,
 
     /// Content-address -> location, for both RawChunk (data stream) and
-    /// every meta object kind (meta stream). Rebuilt at mount by scanning
-    /// every segment; see module docs for why this stands in for
-    /// Phase C's `lchfs-index`.
+    /// every meta object kind (meta stream). In-memory hot path; mirrored
+    /// (write-through, `Durability::None`) into `index` below so mount
+    /// doesn't need a full segment scan when the persisted index is
+    /// fresh — see `Pool::open`.
     locations: HashMap<Hash32, ExtentLocation>,
-    readers: HashMap<(u64, StreamKind), SegmentReader>,
+    /// Persisted `INDEX.redb` (Phase C, ARCHITECTURE.md §4): "a
+    /// rebuildable cache, never authoritative." `Pool::open` trusts it
+    /// only when its `generation()` matches the recovered superblock
+    /// slot's `index_generation`; otherwise falls back to a full segment
+    /// scan and rebuilds it.
+    index: RedbIndex,
+    readers: SegmentReaders,
 
     data_writer: SegmentWriter,
     meta_writer: SegmentWriter,
@@ -183,6 +201,7 @@ impl Pool {
 
         let data_writer = SegmentWriter::create(pool_root, 0, StreamKind::Data, 0)?;
         let meta_writer = SegmentWriter::create(pool_root, 1, StreamKind::Meta, 0)?;
+        let index = RedbIndex::create(&index_path(pool_root))?;
 
         let mut inner = PoolInner {
             pool_root: pool_root.to_path_buf(),
@@ -196,6 +215,7 @@ impl Pool {
             next_ino: ROOT_DIR_INO + 1,
             parents: HashMap::from([(ROOT_DIR_INO, ROOT_DIR_INO)]),
             locations: HashMap::new(),
+            index,
             readers: HashMap::new(),
             data_writer,
             meta_writer,
@@ -223,9 +243,41 @@ impl Pool {
             ))
         })?;
 
-        let mut readers: HashMap<(u64, StreamKind), SegmentReader> = HashMap::new();
-        let mut locations: HashMap<Hash32, ExtentLocation> = HashMap::new();
-        let max_segment_id = scan_segments(pool_root, &mut readers, &mut locations)?;
+        let index_file = index_path(pool_root);
+        let fresh_index = index_file
+            .try_exists()
+            .unwrap_or(false)
+            .then(|| RedbIndex::open(&index_file).ok())
+            .flatten()
+            .filter(|idx| idx.generation() == slot.generation);
+
+        let (mut readers, locations, max_segment_id, index) = if let Some(index) = fresh_index {
+            // Fast path (ARCHITECTURE.md §4): the persisted index's
+            // generation matches the recovered superblock slot, so it's
+            // trusted -- skip the O(all records in every segment) scan
+            // and just open readers (cheap: one open() per file, no
+            // record iteration) plus load the already-known location map.
+            let (readers, max_segment_id) = open_all_segment_readers(pool_root)?;
+            let locations: HashMap<Hash32, ExtentLocation> =
+                index.iter_chunk_locations()?.into_iter().collect();
+            (readers, locations, max_segment_id, index)
+        } else {
+            // Slow path: no index file, an unreadable/corrupt one, or its
+            // generation is stale relative to the superblock (e.g. it
+            // predates a crash that never got to checkpoint the index).
+            // Falls back to the Phase B full segment scan, then rebuilds
+            // the persisted index from that so the *next* mount can take
+            // the fast path above -- this is an eager full rebuild at
+            // mount time rather than ARCHITECTURE.md §4's more elaborate
+            // "lazy on-demand, self-healing as paths are accessed"; that
+            // refinement is future work, not required for index_generation
+            // to mean anything.
+            let mut readers = HashMap::new();
+            let mut locations = HashMap::new();
+            let max_segment_id = scan_segments(pool_root, &mut readers, &mut locations)?;
+            let index = rebuild_index(&index_file, &locations, slot.generation)?;
+            (readers, locations, max_segment_id, index)
+        };
 
         let root_bytes = {
             let reader = get_reader(&mut readers, pool_root, slot.root_location.segment_id, StreamKind::Meta)?;
@@ -300,6 +352,7 @@ impl Pool {
             next_ino,
             parents,
             locations,
+            index,
             readers,
             data_writer,
             meta_writer,
@@ -325,6 +378,12 @@ impl Pool {
     pub fn write(&self, ino: u64, offset: u64, buf: &[u8]) -> Result<(), PoolError> {
         let mut inner = self.inner.lock();
         inner.write(ino, offset, buf)
+    }
+
+    /// `setattr`'s `size` field: truncate or zero-extend a file in place.
+    pub fn set_size(&self, ino: u64, new_size: u64) -> Result<(), PoolError> {
+        let mut inner = self.inner.lock();
+        inner.set_size(ino, new_size)
     }
 
     pub fn lookup(&self, parent_ino: u64, name: &str) -> Result<Option<u64>, PoolError> {
@@ -386,7 +445,7 @@ impl Pool {
 }
 
 fn get_reader<'a>(
-    readers: &'a mut HashMap<(u64, StreamKind), SegmentReader>,
+    readers: &'a mut SegmentReaders,
     pool_root: &Path,
     segment_id: u64,
     kind: StreamKind,
@@ -403,11 +462,17 @@ fn get_reader<'a>(
 /// segment_id seen (or 0 if none), so the caller can allocate fresh IDs
 /// above it. This is Phase B's stand-in for a persisted index — see module
 /// docs.
-fn scan_segments(
+/// Opens a `SegmentReader` for every existing segment file under
+/// `pool_root/segments/{data,meta}` and returns the highest segment_id
+/// seen -- cheap (one `open()` per file, parsed from its filename), no
+/// per-record iteration. Shared by `scan_segments` (full scan, below) and
+/// `Pool::open`'s fast mount path, which needs the readers and the next
+/// segment_id to allocate but not a record-by-record rebuild of
+/// `locations` when the persisted index already has it.
+fn open_all_segment_readers(
     pool_root: &Path,
-    readers: &mut HashMap<(u64, StreamKind), SegmentReader>,
-    locations: &mut HashMap<Hash32, ExtentLocation>,
-) -> Result<u64, PoolError> {
+) -> Result<(SegmentReaders, u64), PoolError> {
+    let mut readers = HashMap::new();
     let mut max_segment_id = 0u64;
     for kind in [StreamKind::Data, StreamKind::Meta] {
         let sub = match kind {
@@ -431,11 +496,48 @@ fn scan_segments(
             };
             max_segment_id = max_segment_id.max(segment_id);
             let reader = SegmentReader::open(pool_root, segment_id, kind)?;
-            scan_one_segment(&reader, segment_id, locations)?;
             readers.insert((segment_id, kind), reader);
         }
     }
+    Ok((readers, max_segment_id))
+}
+
+fn scan_segments(
+    pool_root: &Path,
+    readers: &mut SegmentReaders,
+    locations: &mut HashMap<Hash32, ExtentLocation>,
+) -> Result<u64, PoolError> {
+    let (opened, max_segment_id) = open_all_segment_readers(pool_root)?;
+    for (&(segment_id, _kind), reader) in &opened {
+        scan_one_segment(reader, segment_id, locations)?;
+    }
+    *readers = opened;
     Ok(max_segment_id)
+}
+
+/// Rebuilds `INDEX.redb` from a freshly (re)scanned `locations` map and
+/// checkpoints it at `generation` so the *next* `Pool::open` can take the
+/// fast path. Reuses the existing file if it opens (even if its
+/// generation is stale -- old entries are harmless leftovers, since
+/// content-addressed extents are immutable and Phase B has no GC yet to
+/// have invalidated them); starts fresh only if it's missing or corrupt.
+fn rebuild_index(
+    index_file: &Path,
+    locations: &HashMap<Hash32, ExtentLocation>,
+    generation: u64,
+) -> Result<RedbIndex, PoolError> {
+    let mut index = match RedbIndex::open(index_file) {
+        Ok(idx) => idx,
+        Err(_) => {
+            let _ = std::fs::remove_file(index_file);
+            RedbIndex::create(index_file)?
+        }
+    };
+    for (&hash, &loc) in locations {
+        index.put_chunk_location(hash, loc)?;
+    }
+    index.checkpoint(generation)?;
+    Ok(index)
 }
 
 fn scan_one_segment(
@@ -554,6 +656,7 @@ impl PoolInner {
             Vec::new(),
         )?;
         self.locations.insert(hash, loc);
+        self.index.put_chunk_location(hash, loc)?;
         Ok((hash, loc))
     }
 
@@ -579,6 +682,7 @@ impl PoolInner {
             Vec::new(),
         )?;
         self.locations.insert(hash, loc);
+        self.index.put_chunk_location(hash, loc)?;
         Ok((hash, loc))
     }
 
@@ -666,8 +770,39 @@ impl PoolInner {
             content.resize(end, 0);
         }
         content[offset as usize..end].copy_from_slice(buf);
-        let new_size = content.len() as u64;
-        let content_snapshot = content.clone();
+        self.rechunk_and_touch(ino)
+    }
+
+    /// `setattr`'s `size` field (ARCHITECTURE.md §9): truncate/zero-extend
+    /// a file's content, independent of any `write()`. Without this, any
+    /// syscall that combines `O_TRUNC` with a fresh, already-empty file
+    /// (e.g. shell `>` redirection's `open(O_CREAT|O_TRUNC)`) fails, since
+    /// the kernel FUSE client issues a separate `setattr(size=0)` after
+    /// `create()` regardless of whether truncation is actually a no-op.
+    fn set_size(&mut self, ino: u64, new_size: u64) -> Result<(), PoolError> {
+        let kind = self
+            .inodes
+            .get(&ino)
+            .map(|i| i.kind)
+            .ok_or(PoolError::NoSuchInode(ino))?;
+        if kind != InodeKind::File {
+            return Err(PoolError::Format(format!("ino {ino} is not a regular file")));
+        }
+        self.hydrate_file_contents(ino)?;
+        self.file_contents
+            .get_mut(&ino)
+            .unwrap()
+            .resize(new_size as usize, 0);
+        self.rechunk_and_touch(ino)
+    }
+
+    /// Shared tail of `write()`/`set_size()`: re-derives inline-vs-chunked
+    /// representation from `self.file_contents[ino]`'s current bytes,
+    /// updates size/mtime/ctime, and marks the inode dirty for the next
+    /// checkpoint.
+    fn rechunk_and_touch(&mut self, ino: u64) -> Result<(), PoolError> {
+        let content_snapshot = self.file_contents[&ino].clone();
+        let new_size = content_snapshot.len() as u64;
 
         if new_size <= self.pool_params.inline_threshold as u64 {
             self.file_chunks.insert(ino, Vec::new());
@@ -861,6 +996,15 @@ impl PoolInner {
         self.meta_writer.fsync()?;
 
         self.generation += 1;
+
+        // Durably checkpoint the persisted index (Durability::Immediate,
+        // fsyncs INDEX.redb) *before* the superblock slot below claims
+        // `index_generation = self.generation` is valid -- if we crashed
+        // in between, the old superblock slot (still pointing at the
+        // previous generation) stays the recovery target and this index
+        // checkpoint is simply orphaned, not referenced by anything yet.
+        self.index.checkpoint(self.generation)?;
+
         let mut slot = SuperblockSlot {
             magic: SUPERBLOCK_MAGIC,
             format_version: lchfs_format::FORMAT_VERSION,
