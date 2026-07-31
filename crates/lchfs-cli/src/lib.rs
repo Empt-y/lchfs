@@ -56,14 +56,27 @@ pub fn run() -> anyhow::Result<()> {
     }
 }
 
-fn create_pool(_path: &std::path::Path) -> anyhow::Result<()> {
-    // TODO(phase-D): lchfs_store::Pool::open with create semantics + default PoolParams
-    todo!("lchfs-cli: create_pool")
+fn create_pool(path: &std::path::Path) -> anyhow::Result<()> {
+    lchfs_store::Pool::create(path, lchfs_format::PoolParams::default())?;
+    Ok(())
 }
 
-fn mount(_pool: &std::path::Path, _mountpoint: &std::path::Path) -> anyhow::Result<()> {
-    // TODO(phase-D): open Pool, wrap in lchfs_fuse::LchfsFilesystem, fuser::mount2
-    todo!("lchfs-cli: mount")
+fn mount(pool: &std::path::Path, mountpoint: &std::path::Path) -> anyhow::Result<()> {
+    let pool = std::sync::Arc::new(lchfs_store::Pool::open(pool)?);
+    let fs = lchfs_fuse::LchfsFilesystem::new(pool);
+    // No `DefaultPermissions`: `Pool` hardcodes uid/gid 0 on the root
+    // inode (ARCHITECTURE.md's `setattr`/chown support is still
+    // unimplemented, so there's no way to change that), and the kernel
+    // enforcing normal permission bits against that would lock out every
+    // non-root mounting user. Deferring entirely to the filesystem layer
+    // (which performs no checks yet) matches Phase B's not-yet-modeled
+    // permissions story instead of accidentally denying everyone.
+    let mut config = fuser::Config::default();
+    config
+        .mount_options
+        .push(fuser::MountOption::FSName("lchfs".to_string()));
+    fuser::mount(fs, mountpoint, &config)?;
+    Ok(())
 }
 
 fn fsck(_pool: &std::path::Path, _verify_index: bool, _rebuild_index: bool) -> anyhow::Result<()> {

@@ -13,4 +13,5 @@ lchfs-chunk = { workspace = true }
 lchfs-crypto = { workspace = true }
 fuser = { workspace = true }
 nix = { workspace = true }
+parking_lot = { workspace = true }
 tracing = { workspace = true }

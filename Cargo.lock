@@ -443,6 +443,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "fuser",
+ "lchfs-format",
  "lchfs-fsck",
  "lchfs-fuse",
  "lchfs-index",
@@ -501,6 +503,7 @@ dependencies = [
  "lchfs-index",
  "lchfs-store",
  "nix",
+ "parking_lot",
  "tracing",
 ]
 

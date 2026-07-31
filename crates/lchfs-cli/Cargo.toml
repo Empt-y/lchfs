@@ -10,6 +10,8 @@ lchfs-fuse = { workspace = true }
 lchfs-fsck = { workspace = true }
 lchfs-store = { workspace = true }
 lchfs-index = { workspace = true }
+lchfs-format = { workspace = true }
+fuser = { workspace = true }
 clap = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
