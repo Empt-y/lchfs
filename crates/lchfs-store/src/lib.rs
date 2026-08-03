@@ -1316,10 +1316,9 @@ impl PoolShared {
     /// the slower global checkpoint path (ARCHITECTURE.md §3's explicit
     /// carve-out), so `fsync` on a directory/symlink just runs one.
     fn fsync(&self, ino: u64) -> Result<(), PoolError> {
-        let (kind, size) = {
+        let kind = {
             let namespace = self.namespace.lock();
-            let inode = namespace.inodes.get(&ino).ok_or(PoolError::NoSuchInode(ino))?;
-            (inode.kind, inode.size)
+            namespace.inodes.get(&ino).ok_or(PoolError::NoSuchInode(ino))?.kind
         };
         if kind != InodeKind::File {
             return self.run_checkpoint();
@@ -1337,8 +1336,26 @@ impl PoolShared {
 
         let session_chunks = self.finalize_incremental_session(ino)?;
 
+        // Deliberately not read before `ino_lock` was acquired: a
+        // concurrent write() on another thread could otherwise grow the
+        // file past inline_threshold between that read and here, and
+        // deciding the branch below from a stale size would silently
+        // discard `session_chunks` (already committed to disk by
+        // `finalize_incremental_session` above) in the inline branch. A
+        // session's mere existence already proves the file was chunked
+        // (write()'s own eligibility gate requires size >
+        // inline_threshold to ever start one) -- see run_checkpoint's
+        // matching fix for the same bug.
+        let is_chunked = session_chunks.is_some() || {
+            let namespace = self.namespace.lock();
+            namespace
+                .inodes
+                .get(&ino)
+                .is_some_and(|i| i.size > self.pool_params.inline_threshold as u64)
+        };
+
         let mut records = Vec::new();
-        let content_ref = if size <= self.pool_params.inline_threshold as u64 {
+        let content_ref = if !is_chunked {
             let bytes = self
                 .file_state
                 .lock()
@@ -1451,7 +1468,6 @@ impl PoolShared {
         struct DirtyWork {
             ino: u64,
             kind: InodeKind,
-            size: u64,
             dir: Option<DirectoryObject>,
         }
         let work: Vec<DirtyWork> = {
@@ -1462,7 +1478,6 @@ impl PoolShared {
                     namespace.inodes.get(ino).map(|inode| DirtyWork {
                         ino: *ino,
                         kind: inode.kind,
-                        size: inode.size,
                         dir: if inode.kind == InodeKind::Directory {
                             namespace.dirs.get(ino).cloned()
                         } else {
@@ -1505,6 +1520,35 @@ impl PoolShared {
                     let ino_lock = self.lock_for_ino(w.ino);
                     let _guard = ino_lock.lock();
                     let session_chunks = self.finalize_incremental_session(w.ino)?;
+
+                    // dirty_inodes marking is "at least once", not exactly
+                    // once: write_incremental/rechunk_and_touch mark an
+                    // ino dirty on *every* call, so a write can re-mark an
+                    // ino dirty after this checkpoint's dirty_inodes.drain()
+                    // already ran but before this per-file loop actually
+                    // reaches it -- e.g. an earlier write already got
+                    // captured and correctly encoded by this *same*
+                    // checkpoint pass when it processed this ino, but a
+                    // *later* write's redundant dirty-mark (from writes
+                    // #1..N-1, not this specific run's own progress) can
+                    // also make the ino dirty again for the *next*
+                    // checkpoint pass with nothing new to actually encode.
+                    // If neither source below has data for this ino, that
+                    // is exactly what happened: the previous checkpoint
+                    // pass already consumed the session (and, since it was
+                    // chunked, invalidated file_state) and wrote the
+                    // correct ContentRef. Treating a data-less dirty-mark
+                    // as "encode nothing" would be a real, observed bug --
+                    // it silently overwrote the correct ChunkList with an
+                    // empty one. The safe, correct handling is to leave
+                    // the existing ContentRef untouched: there is nothing
+                    // new to reflect, and the current one is already
+                    // right.
+                    let has_fresh_data = session_chunks.is_some() || file_state_snapshot.contains_key(&w.ino);
+                    if !has_fresh_data {
+                        continue;
+                    }
+
                     // A fast-path session was active (now finalized): any
                     // `file_state[ino]` entry is either absent or stale
                     // relative to it. Safe to invalidate here specifically
@@ -1517,7 +1561,33 @@ impl PoolShared {
                         self.file_state.lock().remove(&w.ino);
                     }
 
-                    let content_ref = if w.size <= self.pool_params.inline_threshold as u64 {
+                    // `w.size` was snapshotted before this per-file loop
+                    // started and can be stale by the time we reach this
+                    // specific ino -- concurrent writes on other threads
+                    // may have grown the file well past
+                    // `inline_threshold` since then. Deciding the branch
+                    // from that stale value would be a real bug, not just
+                    // an inefficiency: the inline branch below completely
+                    // ignores `session_chunks`, so a session that
+                    // `finalize_incremental_session` just committed to
+                    // disk above would be silently discarded from the
+                    // ContentRef, even though its bytes are already
+                    // durably written. A session's mere existence already
+                    // proves the file was chunked (write()'s own
+                    // eligibility gate requires size > inline_threshold to
+                    // ever start one), so that alone is authoritative;
+                    // only fall back to a size check (re-read fresh, not
+                    // the stale snapshot -- a fallback-path write could
+                    // have grown it too) when no session existed.
+                    let is_chunked = session_chunks.is_some() || {
+                        let namespace = self.namespace.lock();
+                        namespace
+                            .inodes
+                            .get(&w.ino)
+                            .is_some_and(|i| i.size > self.pool_params.inline_threshold as u64)
+                    };
+
+                    let content_ref = if !is_chunked {
                         let bytes = file_state_snapshot
                             .get(&w.ino)
                             .map(|s| s.contents.clone())
