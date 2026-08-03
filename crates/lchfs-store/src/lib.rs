@@ -33,6 +33,7 @@
 pub mod backend;
 pub mod checkpoint;
 pub mod coalesce;
+pub(crate) mod dag_walk;
 pub mod dedup;
 pub mod delta_log;
 pub mod gc;
@@ -116,7 +117,7 @@ fn index_path(pool_root: &Path) -> PathBuf {
     pool_root.join("INDEX.redb")
 }
 
-type SegmentReaders = HashMap<(u64, StreamKind), SegmentReader>;
+pub(crate) type SegmentReaders = HashMap<(u64, StreamKind), SegmentReader>;
 
 fn committer_thread_count() -> usize {
     std::thread::available_parallelism()
@@ -680,6 +681,15 @@ impl Pool {
     /// periodic epochs, and explicit consolidation.
     pub fn checkpoint(&self) -> Result<(), PoolError> {
         self.0.run_checkpoint()
+    }
+
+    /// The current global root's content hash (test/tooling support --
+    /// e.g. constructing a `GcEngine::mark` live-roots list against a
+    /// specific past checkpoint without needing real snapshot-retention
+    /// support). Not meant for filesystem-logic use; `Pool`'s own
+    /// checkpoint/GC machinery reads this from `Namespace` directly.
+    pub fn debug_root_hash(&self) -> Hash32 {
+        self.0.namespace.lock().root_hash
     }
 }
 
@@ -1710,7 +1720,7 @@ impl PoolShared {
     }
 }
 
-fn get_reader<'a>(
+pub(crate) fn get_reader<'a>(
     readers: &'a mut SegmentReaders,
     pool_root: &Path,
     segment_id: u64,

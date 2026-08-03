@@ -49,7 +49,7 @@ fn segment_dir(pool_root: &Path, kind: StreamKind) -> PathBuf {
     pool_root.join("segments").join(sub)
 }
 
-fn segment_path(pool_root: &Path, segment_id: u64, kind: StreamKind) -> PathBuf {
+pub(crate) fn segment_path(pool_root: &Path, segment_id: u64, kind: StreamKind) -> PathBuf {
     let ext = match kind {
         StreamKind::Data => "aseg",
         StreamKind::Meta => "mseg",
