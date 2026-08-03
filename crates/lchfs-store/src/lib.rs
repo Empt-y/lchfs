@@ -41,7 +41,7 @@ pub mod prep;
 pub mod segment;
 
 use bytes::Bytes;
-use delta_log::ShardDeltaLog;
+use delta_log::{ShardCommitRecord, ShardDeltaLog};
 use ingress::{CommitterPool, IngressOp};
 use lchfs_chunk::{ChunkBoundary, Chunker, FastCdcChunker};
 use lchfs_format::{
@@ -1027,13 +1027,17 @@ impl PoolShared {
         }
         // `file_state[ino]`, if present, was populated by an *earlier*
         // fallback-path write and only covers content up to that point --
-        // stale relative to what this session just added. Invalidate it
-        // rather than leave it silently out of date: `hydrate_file_state`
-        // only re-reads when there's no cache entry at all, so a stale
-        // entry would otherwise make every subsequent `read()` return
-        // truncated content until something else happens to overwrite the
-        // cache.
-        self.file_state.lock().remove(&ino);
+        // stale relative to what this session just added. Deliberately
+        // NOT invalidated here (unlike an earlier version of this
+        // function): whether that's safe depends on whether the caller's
+        // encoded result ends up globally resolvable (checkpoint's
+        // put_meta_object, yes) or not (fsync's shard-local delta log, no
+        // -- `read_meta_object_bytes` would fail to resolve it via the
+        // global index). Each caller handles this explicitly: checkpoint
+        // invalidates (safe, its ContentRef hash is globally indexed);
+        // fsync repopulates `file_state` directly instead (its ContentRef
+        // hash is only resolvable through the shard's own delta log,
+        // which ordinary reads don't know how to consult).
         Ok(Some(state.chunks))
     }
 
@@ -1220,11 +1224,106 @@ impl PoolShared {
         Ok(ino)
     }
 
-    /// The fast per-shard fsync path — E.5 placeholder still delegates to
-    /// the full checkpoint (upgraded to the real per-shard delta-log path
-    /// in E.7).
-    fn fsync(&self, _ino: u64) -> Result<(), PoolError> {
-        self.run_checkpoint()
+    /// The fast per-shard fsync path (ARCHITECTURE.md §3, "Subtree
+    /// durability via per-shard delta logs"): O(this shard's dirty data
+    /// since its own last local checkpoint), never touching the global
+    /// meta stream, `persisted_index`, or any other shard. Only meaningful
+    /// for File inodes -- directory-structure changes always go through
+    /// the slower global checkpoint path (ARCHITECTURE.md §3's explicit
+    /// carve-out), so `fsync` on a directory/symlink just runs one.
+    fn fsync(&self, ino: u64) -> Result<(), PoolError> {
+        let (kind, size) = {
+            let namespace = self.namespace.lock();
+            let inode = namespace.inodes.get(&ino).ok_or(PoolError::NoSuchInode(ino))?;
+            (inode.kind, inode.size)
+        };
+        if kind != InodeKind::File {
+            return self.run_checkpoint();
+        }
+
+        let shard_id = ingress::shard_for_inode(ino, self.shard_delta_logs.len() as u32);
+
+        // Barrier: this shard's data segment must be durable before the
+        // IndirectHashList we're about to write can reference its chunk
+        // hashes.
+        self.committer_pool.shard(shard_id).fsync_data()?;
+
+        let ino_lock = self.lock_for_ino(ino);
+        let _guard = ino_lock.lock();
+
+        let session_chunks = self.finalize_incremental_session(ino)?;
+
+        let mut records = Vec::new();
+        let content_ref = if size <= self.pool_params.inline_threshold as u64 {
+            let bytes = self
+                .file_state
+                .lock()
+                .get(&ino)
+                .map(|s| s.contents.clone())
+                .unwrap_or_default();
+            ContentRef::Inline(bytes)
+        } else {
+            let chunks = session_chunks
+                .clone()
+                .or_else(|| self.file_state.lock().get(&ino).map(|s| s.chunks.clone()))
+                .unwrap_or_default();
+            let ihl = IndirectHashList { chunks };
+            let encoded =
+                lchfs_format::encode(&ihl).map_err(|e| PoolError::Format(e.to_string()))?;
+            let hash = Hash32::of(&encoded);
+            records.push(ShardCommitRecord {
+                kind: ExtentKind::IndirectHashList,
+                content_hash: hash,
+                encoded,
+            });
+            ContentRef::ChunkList(hash)
+        };
+
+        // A fast-path session was active: unlike checkpoint's equivalent
+        // step, this content ref's hash is only resolvable through this
+        // shard's own delta log (nothing here touches the global meta
+        // stream or persisted_index), so `file_state` must be repopulated
+        // directly rather than invalidated -- otherwise the next
+        // `hydrate_file_state` (an ordinary `read()`, before the next
+        // global checkpoint) would try to resolve it via the global index
+        // and fail. Chunk payloads themselves are unaffected (committed to
+        // the global Data stream by `commit_chunk`, same as always) --
+        // only their *listing* (the IndirectHashList) lives in the
+        // shard-local stream here, so reading them back is exactly what a
+        // fresh `hydrate_file_state` would otherwise do.
+        if let Some(chunks) = &session_chunks {
+            let mut contents = Vec::new();
+            for chunk in chunks {
+                contents.extend_from_slice(&self.read_chunk_bytes(chunk.content_hash)?);
+            }
+            self.file_state.lock().insert(
+                ino,
+                FileWorkingState {
+                    contents,
+                    chunks: chunks.clone(),
+                },
+            );
+        }
+
+        let new_object_hash = {
+            let mut namespace = self.namespace.lock();
+            let inode = namespace.inodes.get_mut(&ino).ok_or(PoolError::NoSuchInode(ino))?;
+            inode.content = content_ref;
+            let encoded = lchfs_format::encode(inode).map_err(|e| PoolError::Format(e.to_string()))?;
+            let hash = Hash32::of(&encoded);
+            records.push(ShardCommitRecord {
+                kind: ExtentKind::InodeObject,
+                content_hash: hash,
+                encoded,
+            });
+            hash
+        };
+
+        self.shard_delta_logs[shard_id as usize]
+            .lock()
+            .commit(ino, new_object_hash, &records)?;
+
+        Ok(())
     }
 
     /// The 5-step global checkpoint (ARCHITECTURE.md §3): flush/fsync data
@@ -1305,6 +1404,17 @@ impl PoolShared {
                     let ino_lock = self.lock_for_ino(w.ino);
                     let _guard = ino_lock.lock();
                     let session_chunks = self.finalize_incremental_session(w.ino)?;
+                    // A fast-path session was active (now finalized): any
+                    // `file_state[ino]` entry is either absent or stale
+                    // relative to it. Safe to invalidate here specifically
+                    // because checkpoint's `put_meta_object` below
+                    // globally registers the resulting ContentRef's hash
+                    // (unlike fsync's shard-local delta log), so the next
+                    // `hydrate_file_state` will correctly re-derive fresh
+                    // content from it.
+                    if session_chunks.is_some() {
+                        self.file_state.lock().remove(&w.ino);
+                    }
 
                     let content_ref = if w.size <= self.pool_params.inline_threshold as u64 {
                         let bytes = file_state_snapshot
