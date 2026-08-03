@@ -174,12 +174,21 @@ struct FileWorkingState {
 /// `FileWorkingState` path the moment a write arrives out of order.
 struct IncrementalWriteState {
     chunker: FastCdcChunker,
+    /// The file's size when this session began -- `FastCdcChunker`'s own
+    /// boundary offsets always start from 0 for a fresh instance, so this
+    /// is added back in to get each `ChunkRef`'s true logical offset.
+    base_offset: u64,
     next_expected_offset: u64,
-    /// Finalized chunk refs accumulated so far this "session" (since the
-    /// file was first opened for incremental writing, or since the last
-    /// fallback). Combined with the chunker's still-buffered tail at
-    /// checkpoint/fsync time.
+    /// Finalized chunk refs: the file's existing chunks as of session
+    /// start (seeded via `PoolShared::current_chunk_refs`, cheap -- reads
+    /// just the IndirectHashList's metadata, no chunk payloads) plus any
+    /// newly committed during this session.
     chunks: Vec<ChunkRef>,
+    /// Mirrors `chunker`'s internal buffered tail so a finalized
+    /// `ChunkBoundary` (which carries only an offset/len, not bytes) can
+    /// be sliced out of *something* -- the chunker itself doesn't expose
+    /// its buffer. Drained in lockstep with the chunker's own draining.
+    pending_bytes: Vec<u8>,
 }
 
 struct BackgroundThread {
@@ -212,6 +221,15 @@ struct PoolShared {
     namespace: Mutex<Namespace>,
     file_state: Mutex<HashMap<u64, FileWorkingState>>,
     open_files: Mutex<HashMap<u64, IncrementalWriteState>>,
+    /// Per-inode lock serializing `write()`/`set_size()`/checkpoint's
+    /// dirty-file finalization for a *given* inode end-to-end (splice or
+    /// incremental-commit through the Namespace update), matching
+    /// ARCHITECTURE.md §3's per-inode ordering guarantee. Cross-inode
+    /// writes stay fully concurrent -- only same-inode operations
+    /// serialize. Lazily populated, never pruned (one tiny `Arc<Mutex<()>>`
+    /// per ever-touched inode for the pool's lifetime -- an accepted,
+    /// bounded-in-practice simplification, not addressed here).
+    ino_locks: Mutex<HashMap<u64, Arc<Mutex<()>>>>,
 
     /// Content-address -> location, for both RawChunk (data stream) and
     /// every meta object kind (meta stream) — same dual purpose Phase B's
@@ -310,6 +328,7 @@ impl Pool {
             namespace: Mutex::new(namespace),
             file_state: Mutex::new(HashMap::new()),
             open_files: Mutex::new(HashMap::new()),
+            ino_locks: Mutex::new(HashMap::new()),
             dedup_index,
             persisted_index: RwLock::new(persisted_index),
             readers: Mutex::new(HashMap::new()),
@@ -473,6 +492,7 @@ impl Pool {
             namespace: Mutex::new(namespace),
             file_state: Mutex::new(HashMap::new()),
             open_files: Mutex::new(HashMap::new()),
+            ino_locks: Mutex::new(HashMap::new()),
             dedup_index,
             persisted_index: RwLock::new(persisted_index),
             readers: Mutex::new(readers),
@@ -617,12 +637,72 @@ impl PoolShared {
         if kind != InodeKind::File {
             return Err(PoolError::Format(format!("ino {ino} is not a regular file")));
         }
-        self.hydrate_file_state(ino)?;
-        let file_state = self.file_state.lock();
-        let content = &file_state[&ino].contents;
+
+        // An active incremental-append session (E.6) hasn't been
+        // checkpointed/fsync'd yet, so the persisted ContentRef is stale --
+        // assemble straight from the session instead of touching
+        // `file_state` at all. Rare path (reads interleaved with an
+        // in-flight append session), not the hot path this optimization
+        // targets, so a straightforward (already-committed chunks read
+        // back + buffered tail) assembly is an acceptable cost here.
+        let session_snapshot = self
+            .open_files
+            .lock()
+            .get(&ino)
+            .map(|s| (s.chunks.clone(), s.pending_bytes.clone()));
+        let content = if let Some((chunks, pending)) = session_snapshot {
+            let mut buf = Vec::new();
+            for chunk in &chunks {
+                buf.extend_from_slice(&self.read_chunk_bytes(chunk.content_hash)?);
+            }
+            buf.extend_from_slice(&pending);
+            buf
+        } else {
+            self.hydrate_file_state(ino)?;
+            self.file_state.lock()[&ino].contents.clone()
+        };
+
         let start = (offset as usize).min(content.len());
         let end = (start + len as usize).min(content.len());
         Ok(Bytes::copy_from_slice(&content[start..end]))
+    }
+
+    /// The file's current chunk list, for seeding a new incremental-append
+    /// session. `Namespace.inodes[ino].content` only gets updated at
+    /// checkpoint time (see `run_checkpoint`'s per-file loop) -- it lags
+    /// behind `file_state[ino].chunks`, which every fallback-path write
+    /// keeps current immediately. So: prefer `file_state` when hydrated
+    /// (no chunk-payload reads, just a clone of already-in-memory refs);
+    /// only fall back to decoding the persisted `IndirectHashList` (cheap,
+    /// metadata only, no chunk payload reads either) when `file_state` was
+    /// never populated -- e.g. right after `Pool::open`, before any write
+    /// has touched this ino yet. Empty for anything not currently chunked
+    /// by either source (inline files, directories, symlinks).
+    fn current_chunks_for_new_session(&self, ino: u64) -> Result<Vec<ChunkRef>, PoolError> {
+        if let Some(state) = self.file_state.lock().get(&ino) {
+            return Ok(state.chunks.clone());
+        }
+        self.current_chunk_refs(ino)
+    }
+
+    fn current_chunk_refs(&self, ino: u64) -> Result<Vec<ChunkRef>, PoolError> {
+        let content_ref = {
+            let namespace = self.namespace.lock();
+            namespace
+                .inodes
+                .get(&ino)
+                .map(|i| i.content.clone())
+                .ok_or(PoolError::NoSuchInode(ino))?
+        };
+        match content_ref {
+            ContentRef::ChunkList(hash) => {
+                let bytes = self.read_meta_object_bytes(hash)?;
+                let ihl: IndirectHashList =
+                    lchfs_format::decode(&bytes).map_err(|e| PoolError::Format(e.to_string()))?;
+                Ok(ihl.chunks)
+            }
+            _ => Ok(Vec::new()),
+        }
     }
 
     /// Lazily loads (if not already cached) the full current byte content
@@ -777,6 +857,25 @@ impl PoolShared {
         Ok(())
     }
 
+    /// Gets (creating if absent) the per-inode lock serializing this
+    /// inode's write-path operations end-to-end (ARCHITECTURE.md §3's
+    /// per-inode ordering guarantee -- see `ino_locks`'s doc comment).
+    fn lock_for_ino(&self, ino: u64) -> Arc<Mutex<()>> {
+        Arc::clone(
+            self.ino_locks
+                .lock()
+                .entry(ino)
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        )
+    }
+
+    /// ARCHITECTURE.md §3 (write path). Sequential-append writes onto an
+    /// already-chunked file (the dominant real pattern: cp/tar/log-append)
+    /// take the incremental fast path straight through `write_incremental`
+    /// -- no whole-file rehydrate, no full rechunk-from-scratch, just the
+    /// new bytes. Anything else (a genuine seek/overwrite, or a file still
+    /// small enough to be inline) falls back to the whole-file rehydrate-
+    /// and-rechunk path, unchanged from E.5/Phase B.
     fn write(&self, ino: u64, offset: u64, buf: &[u8]) -> Result<(), PoolError> {
         let kind = {
             let namespace = self.namespace.lock();
@@ -789,12 +888,58 @@ impl PoolShared {
         if kind != InodeKind::File {
             return Err(PoolError::Format(format!("ino {ino} is not a regular file")));
         }
+        if buf.is_empty() {
+            return Ok(());
+        }
 
-        // E.5: always the whole-file fallback path (ported as-is from
+        let ino_lock = self.lock_for_ino(ino);
+        let _guard = ino_lock.lock();
+
+        let continuation = self
+            .open_files
+            .lock()
+            .get(&ino)
+            .is_some_and(|s| s.next_expected_offset == offset);
+        if continuation {
+            return self.write_incremental(ino, buf);
+        }
+
+        // Any existing session is now stale relative to this write --
+        // either it didn't exist, or this write arrived out of order
+        // relative to it. Either way the fallback path below needs
+        // file_state to reflect the session's content first (a no-op if
+        // no session was open): the session's bytes were never
+        // checkpointed, so `hydrate_file_state` below would otherwise read
+        // stale on-disk content and silently lose them.
+        self.materialize_session_into_file_state(ino)?;
+
+        let fresh_session_eligible = {
+            let namespace = self.namespace.lock();
+            let inode = namespace.inodes.get(&ino).ok_or(PoolError::NoSuchInode(ino))?;
+            offset == inode.size && inode.size > self.pool_params.inline_threshold as u64
+        };
+        if fresh_session_eligible {
+            let existing_chunks = self.current_chunks_for_new_session(ino)?;
+            self.open_files.lock().insert(
+                ino,
+                IncrementalWriteState {
+                    chunker: FastCdcChunker::new(
+                        self.pool_params.chunk_avg_size,
+                        self.pool_params.chunk_min_size,
+                        self.pool_params.chunk_max_size,
+                    ),
+                    base_offset: offset,
+                    next_expected_offset: offset,
+                    chunks: existing_chunks,
+                    pending_bytes: Vec::new(),
+                },
+            );
+            return self.write_incremental(ino, buf);
+        }
+
+        // Fallback: whole-file rehydrate + rechunk (ported as-is from
         // Phase B, but committing chunks through prep/committer instead of
-        // a direct segment-writer call) — proves the new concurrent
-        // plumbing end-to-end before E.6 layers the sequential fast path
-        // on top.
+        // a direct segment-writer call).
         self.hydrate_file_state(ino)?;
         {
             let mut file_state = self.file_state.lock();
@@ -808,8 +953,123 @@ impl PoolShared {
         self.rechunk_and_touch(ino)
     }
 
+    /// The sequential-append fast path: feed `buf` to `ino`'s live
+    /// incremental chunker, commit any newly-finalized boundaries through
+    /// prep/committer, update the file's size in `Namespace`. Never
+    /// touches `file_state` -- `read()` assembles straight from the
+    /// session while one is open (see `read`'s doc comment).
+    fn write_incremental(&self, ino: u64, buf: &[u8]) -> Result<(), PoolError> {
+        let base_offset;
+        let mut prepared: Vec<(u64, Vec<u8>)> = Vec::new();
+        {
+            let mut open_files = self.open_files.lock();
+            let state = open_files.get_mut(&ino).unwrap();
+            base_offset = state.base_offset;
+            state.pending_bytes.extend_from_slice(buf);
+            let boundaries = state.chunker.push(buf);
+            for b in &boundaries {
+                let bytes: Vec<u8> = state.pending_bytes.drain(0..b.len as usize).collect();
+                prepared.push((b.offset, bytes));
+            }
+        }
+
+        let mut new_refs = Vec::with_capacity(prepared.len());
+        for (rel_offset, bytes) in &prepared {
+            let logical_offset = base_offset + rel_offset;
+            let (hash, _loc) = self.commit_chunk(ino, logical_offset, bytes)?;
+            new_refs.push(ChunkRef {
+                content_hash: hash,
+                logical_offset,
+                len: bytes.len() as u32,
+            });
+        }
+
+        let new_size = {
+            let mut open_files = self.open_files.lock();
+            let state = open_files.get_mut(&ino).unwrap();
+            state.chunks.extend(new_refs);
+            state.next_expected_offset += buf.len() as u64;
+            state.next_expected_offset
+        };
+
+        let (now_secs, now_nanos) = now_unix();
+        let mut namespace = self.namespace.lock();
+        let inode = namespace.inodes.get_mut(&ino).unwrap();
+        inode.size = new_size;
+        inode.mtime = (now_secs, now_nanos);
+        inode.ctime = (now_secs, now_nanos);
+        namespace.dirty_inodes.insert(ino);
+        Ok(())
+    }
+
+    /// Ends `ino`'s open incremental-append session (if any): flushes the
+    /// chunker's still-buffered tail as one final chunk, commits it, and
+    /// returns the session's complete chunk list. Caller (checkpoint's
+    /// dirty-file processing, or E.7's fsync fast path) is responsible for
+    /// holding `ino`'s lock (via `lock_for_ino`) across this call and
+    /// whatever it does with the result, to close the same race a
+    /// concurrent `write()` could otherwise open (see `ino_locks`'s doc
+    /// comment).
+    fn finalize_incremental_session(&self, ino: u64) -> Result<Option<Vec<ChunkRef>>, PoolError> {
+        let mut state = match self.open_files.lock().remove(&ino) {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        if let Some(b) = state.chunker.finish() {
+            let bytes: Vec<u8> = state.pending_bytes.drain(0..b.len as usize).collect();
+            let logical_offset = state.base_offset + b.offset;
+            let (hash, _loc) = self.commit_chunk(ino, logical_offset, &bytes)?;
+            state.chunks.push(ChunkRef {
+                content_hash: hash,
+                logical_offset,
+                len: b.len,
+            });
+        }
+        // `file_state[ino]`, if present, was populated by an *earlier*
+        // fallback-path write and only covers content up to that point --
+        // stale relative to what this session just added. Invalidate it
+        // rather than leave it silently out of date: `hydrate_file_state`
+        // only re-reads when there's no cache entry at all, so a stale
+        // entry would otherwise make every subsequent `read()` return
+        // truncated content until something else happens to overwrite the
+        // cache.
+        self.file_state.lock().remove(&ino);
+        Ok(Some(state.chunks))
+    }
+
+    /// Ends `ino`'s open incremental-append session (if any) and captures
+    /// its content into `file_state`, so a caller about to fall back to
+    /// the whole-file path doesn't silently lose already-committed-but-
+    /// not-yet-checkpointed bytes that only the session (not the on-disk
+    /// `InodeObject`, not `file_state`) currently knows about. Unlike
+    /// `finalize_incremental_session`, this reads chunk payloads back
+    /// (`read_chunk_bytes`) since the fallback path needs full byte
+    /// content, not just a chunk list -- more expensive, but only run on
+    /// the already-slow-path transition, never in the fast path itself.
+    fn materialize_session_into_file_state(&self, ino: u64) -> Result<(), PoolError> {
+        let Some(state) = self.open_files.lock().remove(&ino) else {
+            return Ok(());
+        };
+        let mut contents = Vec::new();
+        for chunk in &state.chunks {
+            contents.extend_from_slice(&self.read_chunk_bytes(chunk.content_hash)?);
+        }
+        contents.extend_from_slice(&state.pending_bytes);
+        self.file_state.lock().insert(
+            ino,
+            FileWorkingState {
+                contents,
+                chunks: state.chunks,
+            },
+        );
+        Ok(())
+    }
+
     /// `setattr`'s `size` field (ARCHITECTURE.md §9): truncate/zero-extend
-    /// a file's content, independent of any `write()`.
+    /// a file's content, independent of any `write()`. Always the
+    /// whole-file fallback path -- not worth optimizing a truncate, and it
+    /// must invalidate any open incremental session regardless (the
+    /// session's assumptions about current size no longer hold).
     fn set_size(&self, ino: u64, new_size: u64) -> Result<(), PoolError> {
         let kind = {
             let namespace = self.namespace.lock();
@@ -822,6 +1082,15 @@ impl PoolShared {
         if kind != InodeKind::File {
             return Err(PoolError::Format(format!("ino {ino} is not a regular file")));
         }
+
+        let ino_lock = self.lock_for_ino(ino);
+        let _guard = ino_lock.lock();
+        // Must materialize (not just discard) any open session first: the
+        // resize below needs to operate on the file's true current
+        // content, which the session -- not yet checkpointed -- is the
+        // only thing that knows about.
+        self.materialize_session_into_file_state(ino)?;
+
         self.hydrate_file_state(ino)?;
         self.file_state
             .lock()
@@ -1012,47 +1281,59 @@ impl PoolShared {
                 .collect()
         };
 
-        let mut new_content: HashMap<u64, ContentRef> = HashMap::new();
+        // Applied immediately per-file rather than collected into a map to
+        // apply later: for File inodes, `ino`'s lock is held from
+        // `finalize_incremental_session` through the Namespace write-back
+        // below, in the same scope. This closes a real race a two-step
+        // "compute everything, write back everything" version would leave
+        // open -- a concurrent `write()` starting a *new* incremental
+        // session right after `finalize_incremental_session` removes the
+        // old one, but before Namespace reflects this checkpoint's result,
+        // would otherwise seed itself from a stale ContentRef via
+        // `current_chunk_refs` and silently lose the just-finalized
+        // chunks once it's eventually finalized in turn.
         for w in &work {
-            let content_ref = match w.kind {
+            match w.kind {
                 InodeKind::Directory => {
                     let dir = w.dir.clone().unwrap_or_default();
                     let (hash, _loc) = self.put_meta_object(ExtentKind::DirectoryObject, &dir)?;
-                    ContentRef::DirEntries(hash)
+                    if let Some(inode) = self.namespace.lock().inodes.get_mut(&w.ino) {
+                        inode.content = ContentRef::DirEntries(hash);
+                    }
                 }
                 InodeKind::File => {
-                    if w.size <= self.pool_params.inline_threshold as u64 {
+                    let ino_lock = self.lock_for_ino(w.ino);
+                    let _guard = ino_lock.lock();
+                    let session_chunks = self.finalize_incremental_session(w.ino)?;
+
+                    let content_ref = if w.size <= self.pool_params.inline_threshold as u64 {
                         let bytes = file_state_snapshot
                             .get(&w.ino)
                             .map(|s| s.contents.clone())
                             .unwrap_or_default();
                         ContentRef::Inline(bytes)
                     } else {
-                        let chunks = file_state_snapshot
-                            .get(&w.ino)
-                            .map(|s| s.chunks.clone())
+                        let chunks = session_chunks
+                            .or_else(|| file_state_snapshot.get(&w.ino).map(|s| s.chunks.clone()))
                             .unwrap_or_default();
                         let ihl = IndirectHashList { chunks };
                         let (hash, _loc) =
                             self.put_meta_object(ExtentKind::IndirectHashList, &ihl)?;
                         ContentRef::ChunkList(hash)
+                    };
+                    if let Some(inode) = self.namespace.lock().inodes.get_mut(&w.ino) {
+                        inode.content = content_ref;
                     }
                 }
-                InodeKind::Symlink => continue, // unchanged; content already correct
-            };
-            new_content.insert(w.ino, content_ref);
+                InodeKind::Symlink => {} // unchanged; content already correct
+            }
         }
 
-        // Snapshot every inode (not just dirty ones) for the InoMap, under
-        // one namespace lock, writing back the freshly-derived content
-        // refs for dirty ones first.
+        // Snapshot every inode (not just dirty ones) for the InoMap. The
+        // freshly-derived content refs for dirty inodes were already
+        // written back above, per-file, under that file's own ino lock.
         let ino_snapshot: Vec<(u64, InodeObject)> = {
-            let mut namespace = self.namespace.lock();
-            for (ino, content) in new_content {
-                if let Some(inode) = namespace.inodes.get_mut(&ino) {
-                    inode.content = content;
-                }
-            }
+            let namespace = self.namespace.lock();
             let mut snap: Vec<_> = namespace
                 .inodes
                 .iter()
