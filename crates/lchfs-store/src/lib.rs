@@ -30,6 +30,7 @@
 //! hot path in front of it, used for both RawChunk and meta-object hashes
 //! exactly as Phase B's flat `locations` map was.
 
+pub(crate) mod background;
 pub mod backend;
 pub mod checkpoint;
 pub mod coalesce;
@@ -112,6 +113,11 @@ const SHARD_RING_CAPACITY: usize = 256;
 /// (ARCHITECTURE.md §3: "every 5s default, or on fsync(), ring pressure,
 /// or unmount").
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
+/// How often the Coalescing Daemon (which drives GC mark-and-sweep) runs
+/// an idle-cycle pass. Deliberately much longer than the checkpoint
+/// interval -- this is idle-cycle background work, not foreground-
+/// critical durability (ARCHITECTURE.md §5).
+const COALESCE_INTERVAL: Duration = Duration::from_secs(60);
 
 fn index_path(pool_root: &Path) -> PathBuf {
     pool_root.join("INDEX.redb")
@@ -247,10 +253,12 @@ struct PoolShared {
     shard_delta_logs: Vec<Mutex<ShardDeltaLog>>,
 
     checkpoint_lock: Mutex<()>,
+    coalesce: Mutex<coalesce::CoalesceDaemon>,
     /// `None` until `spawn_background_threads` runs (after this
-    /// `PoolShared` is wrapped in its `Arc`, which the coordinator's timer
-    /// closure needs to clone -- see that method's doc comment).
-    checkpoint_coordinator: Mutex<Option<checkpoint::CheckpointCoordinator>>,
+    /// `PoolShared` is wrapped in its `Arc`, which each timer's closure
+    /// needs to clone -- see that method's doc comment).
+    checkpoint_task: Mutex<Option<background::PeriodicTask>>,
+    coalesce_task: Mutex<Option<background::PeriodicTask>>,
 }
 
 impl Pool {
@@ -326,7 +334,7 @@ impl Pool {
             file_state: Mutex::new(HashMap::new()),
             open_files: Mutex::new(HashMap::new()),
             ino_locks: Mutex::new(HashMap::new()),
-            dedup_index,
+            dedup_index: Arc::clone(&dedup_index),
             persisted_index: RwLock::new(persisted_index),
             readers: Mutex::new(HashMap::new()),
             meta_writer: Mutex::new(meta_writer),
@@ -335,7 +343,12 @@ impl Pool {
             prep_pool,
             shard_delta_logs,
             checkpoint_lock: Mutex::new(()),
-            checkpoint_coordinator: Mutex::new(None),
+            coalesce: Mutex::new(coalesce::CoalesceDaemon::new(
+                pool_root.to_path_buf(),
+                Arc::clone(&dedup_index),
+            )),
+            checkpoint_task: Mutex::new(None),
+            coalesce_task: Mutex::new(None),
         });
 
         shared.run_checkpoint()?;
@@ -592,7 +605,7 @@ impl Pool {
             file_state: Mutex::new(file_state_from_replay),
             open_files: Mutex::new(HashMap::new()),
             ino_locks: Mutex::new(HashMap::new()),
-            dedup_index,
+            dedup_index: Arc::clone(&dedup_index),
             persisted_index: RwLock::new(persisted_index),
             readers: Mutex::new(readers),
             meta_writer: Mutex::new(meta_writer),
@@ -601,7 +614,12 @@ impl Pool {
             prep_pool,
             shard_delta_logs,
             checkpoint_lock: Mutex::new(()),
-            checkpoint_coordinator: Mutex::new(None),
+            coalesce: Mutex::new(coalesce::CoalesceDaemon::new(
+                pool_root.to_path_buf(),
+                Arc::clone(&dedup_index),
+            )),
+            checkpoint_task: Mutex::new(None),
+            coalesce_task: Mutex::new(None),
         });
 
         shared.spawn_background_threads();
@@ -691,32 +709,66 @@ impl Pool {
     pub fn debug_root_hash(&self) -> Hash32 {
         self.0.namespace.lock().root_hash
     }
+
+    /// Runs one GC-mark-and-coalesce pass synchronously (ARCHITECTURE.md
+    /// §6). The background `CoalesceDaemon` (coalesce.rs) calls this same
+    /// path on its own timer; exposed publicly so tests can call it
+    /// directly instead of racing that timer.
+    pub fn run_gc_and_coalesce_pass(&self) -> Result<(), PoolError> {
+        self.0.run_gc_and_coalesce_pass()
+    }
 }
 
 impl Drop for Pool {
     fn drop(&mut self) {
-        // Dropping the CheckpointCoordinator (its own Drop impl) signals
-        // its shutdown flag and joins its thread -- see checkpoint.rs.
-        // Must happen before the Arc's refcount can reach zero (the
-        // coordinator's own closure holds a clone), which is exactly what
-        // taking it out of the Mutex and letting it drop right here
-        // achieves.
-        self.0.checkpoint_coordinator.lock().take();
+        // Dropping each PeriodicTask (its own Drop impl) signals its
+        // shutdown flag and joins its thread -- see background.rs. Must
+        // happen before the Arc's refcount can reach zero (each task's
+        // own closure holds a clone), which is exactly what taking them
+        // out of their Mutexes and letting them drop right here achieves.
+        self.0.checkpoint_task.lock().take();
+        self.0.coalesce_task.lock().take();
     }
 }
 
 impl PoolShared {
     /// Spawns background threads that need to call back into `self` --
     /// must run after this `PoolShared` is wrapped in its `Arc` (`create`/
-    /// `open` do so immediately after construction), since the
-    /// checkpoint timer's closure needs its own `Arc<PoolShared>` clone.
+    /// `open` do so immediately after construction), since each timer's
+    /// closure needs its own `Arc<PoolShared>` clone.
     fn spawn_background_threads(self: &Arc<Self>) {
-        let shared = Arc::clone(self);
-        let coordinator =
-            checkpoint::CheckpointCoordinator::spawn(CHECKPOINT_INTERVAL, move || {
-                let _ = shared.run_checkpoint();
-            });
-        *self.checkpoint_coordinator.lock() = Some(coordinator);
+        let checkpoint_shared = Arc::clone(self);
+        let checkpoint_task = background::PeriodicTask::spawn(
+            "lchfs-checkpoint",
+            CHECKPOINT_INTERVAL,
+            move || {
+                let _ = checkpoint_shared.run_checkpoint();
+            },
+        );
+        *self.checkpoint_task.lock() = Some(checkpoint_task);
+
+        let coalesce_shared = Arc::clone(self);
+        let coalesce_task = background::PeriodicTask::spawn(
+            "lchfs-coalesce",
+            COALESCE_INTERVAL,
+            move || {
+                let _ = coalesce_shared.run_gc_and_coalesce_pass();
+            },
+        );
+        *self.coalesce_task.lock() = Some(coalesce_task);
+    }
+
+    /// One idle-cycle GC-mark-and-coalesce pass (ARCHITECTURE.md §6):
+    /// snapshot the current root as the live-roots list, then hand off to
+    /// `CoalesceDaemon`. `Pool::run_gc_and_coalesce_pass` (below) is the
+    /// same thing, exposed publicly for tests to call synchronously
+    /// instead of racing the background timer.
+    fn run_gc_and_coalesce_pass(&self) -> Result<(), PoolError> {
+        let live_roots = vec![self.namespace.lock().root_hash];
+        self.coalesce
+            .lock()
+            .run_pass(&live_roots, &self.persisted_index, &self.next_segment_id)?;
+        Ok(())
     }
 
     fn read(&self, ino: u64, offset: u64, len: u32) -> Result<Bytes, PoolError> {

@@ -212,3 +212,76 @@ fn sweep_candidates_flags_low_liveness_segment_but_not_a_fresh_pool() {
     let candidates2 = gc2.sweep_candidates(&live2);
     assert!(candidates2.is_empty(), "a fresh pool with no overwrites should have no sweep candidates");
 }
+
+#[test]
+fn grace_window_protects_most_recently_sealed_segments() {
+    // Single shard so "highest N sealed segment_ids" is unambiguous and
+    // deterministic to reason about (sweep_candidates' grace window is
+    // global across all shards' data segments combined, not per-shard).
+    let mut params = small_params();
+    params.logical_shard_count = 1;
+    params.data_segment_cap_bytes = 4096;
+
+    let dir = tempfile::tempdir().unwrap();
+    let pool = Pool::create(dir.path(), params).unwrap();
+
+    // Enough distinct ~3000-byte writes to force several segment
+    // rollovers within the one shard.
+    let mut inos = Vec::new();
+    for i in 0..8u64 {
+        let ino = pool.create_file(1, &format!("f{i}"), 0o644).unwrap();
+        pool.write(ino, 0, &deterministic_bytes(i + 1, 3000)).unwrap();
+        inos.push(ino);
+    }
+    pool.checkpoint().unwrap();
+
+    // Overwrite everything with tiny content -- every original chunk
+    // becomes unreferenced, so every *sealed* segment should end up at or
+    // near 0% liveness, differing only in how recently each was sealed.
+    for &ino in &inos {
+        pool.write(ino, 0, &deterministic_bytes(999, 50)).unwrap();
+    }
+    pool.checkpoint().unwrap();
+    let root = pool.debug_root_hash();
+    drop(pool);
+
+    let locations = load_locations(dir.path());
+    let mut gc = GcEngine::new(dir.path().to_path_buf(), locations);
+    let live = gc.mark(&[root]);
+    let candidates = gc.sweep_candidates(&live);
+
+    // Enumerate every *sealed* data segment directly (bypassing
+    // sweep_candidates) to know what the full universe of low-liveness
+    // segments would be without the grace window.
+    let data_dir = dir.path().join("segments/data");
+    let mut all_ids: Vec<u64> = std::fs::read_dir(&data_dir)
+        .unwrap()
+        .filter_map(|e| {
+            e.ok()?
+                .path()
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.parse::<u64>().ok())
+        })
+        .collect();
+    all_ids.sort_unstable();
+    assert!(
+        all_ids.len() >= 3,
+        "test setup should force at least 3 segments; got {}",
+        all_ids.len()
+    );
+
+    let newest_two = &all_ids[all_ids.len() - 2..];
+    for id in newest_two {
+        assert!(
+            !candidates.contains(id),
+            "segment {id} is within the grace window (one of the 2 most recently sealed) and must not be swept yet"
+        );
+    }
+
+    let oldest = all_ids[0];
+    assert!(
+        candidates.contains(&oldest),
+        "the oldest sealed segment, well outside the grace window, should be a sweep candidate given ~0% liveness"
+    );
+}

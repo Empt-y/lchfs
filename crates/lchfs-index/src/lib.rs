@@ -116,6 +116,21 @@ impl RedbIndex {
         })
     }
 
+    /// Forces a durable (`Durability::Immediate`) commit of whatever's
+    /// currently pending, *without* touching the checkpoint/`generation`
+    /// metadata `checkpoint()` updates. Used by the Coalescing Daemon
+    /// (coalesce.rs) before deleting an old segment: the repointed chunk
+    /// locations must be durable first, but a coalesce pass has no
+    /// business claiming a new checkpoint generation happened -- that's
+    /// still `Pool::checkpoint()`'s job alone.
+    pub fn flush(&mut self) -> Result<(), IndexError> {
+        let mut txn = self.db.begin_write().map_err(err)?;
+        txn.set_durability(Durability::Immediate).map_err(err)?;
+        txn.open_table(CHUNK_LOCATIONS).map_err(err)?;
+        txn.commit().map_err(err)?;
+        Ok(())
+    }
+
     /// Loads every persisted chunk location at once — the mount-time fast
     /// path (ARCHITECTURE.md §4) that lets `Pool::open` skip a full
     /// segment scan when this index's generation matches the superblock's

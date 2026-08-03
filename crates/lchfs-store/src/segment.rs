@@ -260,6 +260,30 @@ impl SegmentWriter {
     }
 }
 
+/// Flips an already-sealed segment's header page to `SegmentState::Coalesced`
+/// in place -- a tombstone the Coalescing Daemon (coalesce.rs) writes
+/// after a repack's new segment is durably fsync'd and the index update
+/// is durable, but before deleting the old segment file. A crash between
+/// the tombstone and the actual deletion leaves something self-describing
+/// behind: the segment is unambiguously marked as superseded, safe to
+/// finish deleting on the next pass (or, per ARCHITECTURE.md §7, during
+/// mount-time recovery, which can treat a `Coalesced` segment as
+/// definitely-not-live).
+pub(crate) fn mark_coalesced(pool_root: &Path, segment_id: u64, kind: StreamKind) -> io::Result<()> {
+    let path = segment_path(pool_root, segment_id, kind);
+    let file = OpenOptions::new().read(true).write(true).open(&path)?;
+    let mut page = vec![0u8; SEGMENT_HEADER_PAGE_SIZE as usize];
+    file.read_exact_at(&mut page, 0)?;
+    let header_len = u32::from_le_bytes(page[0..4].try_into().unwrap()) as usize;
+    let mut header: SegmentHeader = lchfs_format::decode(&page[4..4 + header_len])
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    header.state = SegmentState::Coalesced;
+    header.header_checksum = 0;
+    finalize_segment_header_checksum(&mut header);
+    write_header_page(&file, &header)?;
+    file.sync_all()
+}
+
 fn write_header_page(file: &File, header: &SegmentHeader) -> io::Result<()> {
     let encoded = lchfs_format::encode(header).expect("SegmentHeader encoding is infallible");
     assert!(
@@ -314,13 +338,12 @@ impl SegmentReader {
         Ok(header)
     }
 
-    /// Read and validate one Extent Record at `loc`. Performs the full
-    /// mandatory check sequence from ARCHITECTURE.md §1: magic -> bounds ->
-    /// header checksum -> decompress -> BLAKE3(decompressed) == content_hash.
-    pub fn read_record(
-        &self,
-        loc: ExtentLocation,
-    ) -> Result<(ExtentRecordHeader, Vec<u8>), SegmentError> {
+    /// Shared bounds/checksum-validated raw-bytes extraction for
+    /// `read_record`/`read_record_raw` below -- returns the payload
+    /// exactly as stored (still compressed, if `codec_id != None`),
+    /// structurally validated (magic, bounds, header checksum) but not
+    /// yet decompressed or content-hash verified.
+    fn read_raw(&self, loc: ExtentLocation) -> Result<(ExtentRecordHeader, Vec<u8>), SegmentError> {
         let mut record_bytes = vec![0u8; loc.len as usize];
         self.file
             .read_exact_at(&mut record_bytes, loc.offset as u64)?;
@@ -338,6 +361,17 @@ impl SegmentReader {
         };
         let payload_start = 4 + header_len;
         let payload = record_bytes[payload_start..payload_start + payload_len].to_vec();
+        Ok((header, payload))
+    }
+
+    /// Read and validate one Extent Record at `loc`. Performs the full
+    /// mandatory check sequence from ARCHITECTURE.md §1: magic -> bounds ->
+    /// header checksum -> decompress -> BLAKE3(decompressed) == content_hash.
+    pub fn read_record(
+        &self,
+        loc: ExtentLocation,
+    ) -> Result<(ExtentRecordHeader, Vec<u8>), SegmentError> {
+        let (header, payload) = self.read_raw(loc)?;
 
         let decompressed = if header.codec_id == CodecId::None {
             payload
@@ -357,6 +391,43 @@ impl SegmentReader {
         }
 
         Ok((header, decompressed))
+    }
+
+    /// Like `read_record`, but returns the *raw* (still-compressed, if
+    /// applicable) payload bytes instead of decompressed ones. Used by
+    /// the Coalescing Daemon (coalesce.rs) to physically repack a segment
+    /// without a wasted decompress-then-recompress round trip -- the
+    /// original compression decision is preserved exactly, so coalescing
+    /// a segment full of highly-compressible content doesn't perversely
+    /// make it *larger*. Still performs the full mandatory validation,
+    /// including content-hash verification (via a throwaway decompress,
+    /// discarded): coalescing must never propagate corrupted data forward
+    /// into a fresh segment just because the bytes being kept aren't the
+    /// ones being verified against.
+    pub fn read_record_raw(
+        &self,
+        loc: ExtentLocation,
+    ) -> Result<(ExtentRecordHeader, Vec<u8>), SegmentError> {
+        let (header, payload) = self.read_raw(loc)?;
+
+        let decompressed = if header.codec_id == CodecId::None {
+            payload.clone()
+        } else {
+            use lchfs_compress::{Codec, ZstdCodec};
+            ZstdCodec.decompress(&payload, header.uncompressed_len as usize)
+        };
+
+        if let Err(_verify_err) = lchfs_crypto::verify(&decompressed, header.content_hash) {
+            let actual = Hash32::of(&decompressed);
+            return Err(SegmentError::ContentHash {
+                segment_id: self.segment_id,
+                offset: loc.offset,
+                expected: header.content_hash,
+                actual,
+            });
+        }
+
+        Ok((header, payload))
     }
 
     /// Best-effort scan helper for mount-time segment scanning (Phase B's

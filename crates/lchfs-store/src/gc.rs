@@ -41,6 +41,14 @@ pub struct GcEngine {
 }
 
 impl GcEngine {
+    /// The dedup/resolution cache this engine resolves hashes through --
+    /// exposed so `CoalesceDaemon` (which owns a `GcEngine`) can update it
+    /// after physically relocating a chunk during a repack, without
+    /// needing its own separate `Arc` clone of the same cache.
+    pub fn locations(&self) -> &ChunkLocationCache {
+        &self.locations
+    }
+
     pub fn new(pool_root: PathBuf, locations: Arc<ChunkLocationCache>) -> Self {
         Self {
             pool_root,
