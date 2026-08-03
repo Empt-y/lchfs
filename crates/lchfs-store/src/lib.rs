@@ -51,14 +51,13 @@ use lchfs_format::{
     SUPERBLOCK_SLOT_SIZE, compute_superblock_slot_checksum, finalize_superblock_slot_checksum,
 };
 use lchfs_index::{ChunkLocationCache, IndexError, IndexStore, RedbIndex};
-use parking_lot::{Condvar, Mutex, RwLock};
+use parking_lot::{Mutex, RwLock};
 use prep::{IngestPreparationPool, PrepTask, PreparedChunk};
 use segment::{SegmentError, SegmentReader, SegmentWriter};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::thread::JoinHandle;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
@@ -191,10 +190,6 @@ struct IncrementalWriteState {
     pending_bytes: Vec<u8>,
 }
 
-struct BackgroundThread {
-    handle: JoinHandle<()>,
-}
-
 /// The engine's entire public API. A frontend (lchfs-fuse today; see
 /// ARCHITECTURE.md §5a for the future-kernel-module rationale) is a thin
 /// adapter that does nothing but translate protocol calls into these
@@ -251,9 +246,10 @@ struct PoolShared {
     shard_delta_logs: Vec<Mutex<ShardDeltaLog>>,
 
     checkpoint_lock: Mutex<()>,
-    shutdown: Arc<AtomicBool>,
-    background_wake: Arc<(Mutex<()>, Condvar)>,
-    background: Mutex<Vec<BackgroundThread>>,
+    /// `None` until `spawn_background_threads` runs (after this
+    /// `PoolShared` is wrapped in its `Arc`, which the coordinator's timer
+    /// closure needs to clone -- see that method's doc comment).
+    checkpoint_coordinator: Mutex<Option<checkpoint::CheckpointCoordinator>>,
 }
 
 impl Pool {
@@ -338,9 +334,7 @@ impl Pool {
             prep_pool,
             shard_delta_logs,
             checkpoint_lock: Mutex::new(()),
-            shutdown: Arc::new(AtomicBool::new(false)),
-            background_wake: Arc::new((Mutex::new(()), Condvar::new())),
-            background: Mutex::new(Vec::new()),
+            checkpoint_coordinator: Mutex::new(None),
         });
 
         shared.run_checkpoint()?;
@@ -502,9 +496,7 @@ impl Pool {
             prep_pool,
             shard_delta_logs,
             checkpoint_lock: Mutex::new(()),
-            shutdown: Arc::new(AtomicBool::new(false)),
-            background_wake: Arc::new((Mutex::new(()), Condvar::new())),
-            background: Mutex::new(Vec::new()),
+            checkpoint_coordinator: Mutex::new(None),
         });
 
         shared.spawn_background_threads();
@@ -589,40 +581,28 @@ impl Pool {
 
 impl Drop for Pool {
     fn drop(&mut self) {
-        self.0.shutdown.store(true, Ordering::Release);
-        {
-            let (lock, cvar) = &*self.0.background_wake;
-            let _guard = lock.lock();
-            cvar.notify_all();
-        }
-        let mut background = self.0.background.lock();
-        for bg in background.drain(..) {
-            let _ = bg.handle.join();
-        }
+        // Dropping the CheckpointCoordinator (its own Drop impl) signals
+        // its shutdown flag and joins its thread -- see checkpoint.rs.
+        // Must happen before the Arc's refcount can reach zero (the
+        // coordinator's own closure holds a clone), which is exactly what
+        // taking it out of the Mutex and letting it drop right here
+        // achieves.
+        self.0.checkpoint_coordinator.lock().take();
     }
 }
 
 impl PoolShared {
+    /// Spawns background threads that need to call back into `self` --
+    /// must run after this `PoolShared` is wrapped in its `Arc` (`create`/
+    /// `open` do so immediately after construction), since the
+    /// checkpoint timer's closure needs its own `Arc<PoolShared>` clone.
     fn spawn_background_threads(self: &Arc<Self>) {
         let shared = Arc::clone(self);
-        let shutdown = Arc::clone(&self.shutdown);
-        let wake = Arc::clone(&self.background_wake);
-        let handle = std::thread::Builder::new()
-            .name("lchfs-checkpoint".into())
-            .spawn(move || {
-                while !shutdown.load(Ordering::Acquire) {
-                    let (lock, cvar) = &*wake;
-                    let mut guard = lock.lock();
-                    cvar.wait_for(&mut guard, CHECKPOINT_INTERVAL);
-                    drop(guard);
-                    if shutdown.load(Ordering::Acquire) {
-                        break;
-                    }
-                    let _ = shared.run_checkpoint();
-                }
-            })
-            .expect("spawn checkpoint thread");
-        self.background.lock().push(BackgroundThread { handle });
+        let coordinator =
+            checkpoint::CheckpointCoordinator::spawn(CHECKPOINT_INTERVAL, move || {
+                let _ = shared.run_checkpoint();
+            });
+        *self.checkpoint_coordinator.lock() = Some(coordinator);
     }
 
     fn read(&self, ino: u64, offset: u64, len: u32) -> Result<Bytes, PoolError> {
@@ -1338,9 +1318,26 @@ impl PoolShared {
         // Barrier #1: every shard's committer has appended to its own
         // Data-stream segment since the last checkpoint; fsync all of them
         // before any parent hash referencing their contents is committed.
-        // (E.8 upgrade point for shard_watermarks -- fsync_all already
-        // covers every shard today.)
         self.committer_pool.fsync_all()?;
+
+        // Read every shard's current local_epoch *now*, before the InoMap
+        // snapshot below -- not after. `Pool::fsync` (E.7) runs fully
+        // concurrently with checkpoint (no shared lock between them by
+        // design), so a shard's delta log can advance mid-checkpoint. If
+        // watermarks were read *after* the InoMap snapshot, a concurrent
+        // fsync landing in between could make a watermark claim more than
+        // this checkpoint's InoMap actually reflects -- at recovery (E.9)
+        // that would make replay wrongly *skip* an entry it still needs,
+        // real data loss. Reading watermarks first means the reverse can
+        // happen instead (a watermark under-claims what the InoMap
+        // actually has), which is always safe: ARCHITECTURE.md §7's
+        // replay is idempotent, so redundantly re-applying an
+        // already-reflected entry is a no-op, never a correctness issue.
+        let shard_watermarks: Vec<u64> = self
+            .shard_delta_logs
+            .iter()
+            .map(|log| log.lock().read_shard_superblock().map(|slot| slot.local_epoch))
+            .collect::<Result<_, _>>()?;
 
         let dirty: Vec<u64> = {
             let mut namespace = self.namespace.lock();
@@ -1481,10 +1478,6 @@ impl PoolShared {
             let namespace = self.namespace.lock();
             (namespace.next_ino, namespace.generation)
         };
-
-        // E.8 upgrade point: populate from each shard's ShardDeltaLog
-        // local_epoch instead of zeros.
-        let shard_watermarks = vec![0u64; self.shard_delta_logs.len()];
 
         let root = RootObject {
             inomap_hash,
