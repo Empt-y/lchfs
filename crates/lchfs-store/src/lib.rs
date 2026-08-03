@@ -83,7 +83,19 @@ pub enum PoolError {
     NotFound(String),
     #[error("index error: {0}")]
     Index(#[from] IndexError),
+    #[error("requested file size {0} exceeds the maximum ({MAX_FILE_SIZE})")]
+    TooLarge(u64),
 }
+
+/// Hard cap on file size while `write()`'s fallback path and `set_size()`
+/// still materialize a file's entire content in memory (`file_state`).
+/// Not a permanent limit -- once `SpliceChunker` (lchfs-chunk's own
+/// tracked TODO) lands and overwrites no longer require a whole-file
+/// rehydrate, this can grow substantially. For now it exists purely so a
+/// user-triggered `write(2)`/`truncate(2)` to an enormous offset/size
+/// returns EFBIG instead of attempting a multi-terabyte allocation that
+/// can OOM-kill the whole mount daemon.
+const MAX_FILE_SIZE: u64 = 8 * 1024 * 1024 * 1024; // 8 GiB
 
 impl From<SegmentError> for PoolError {
     fn from(e: SegmentError) -> Self {
@@ -1184,11 +1196,16 @@ impl PoolShared {
         // Fallback: whole-file rehydrate + rechunk (ported as-is from
         // Phase B, but committing chunks through prep/committer instead of
         // a direct segment-writer call).
+        let end = offset
+            .checked_add(buf.len() as u64)
+            .filter(|&end| end <= MAX_FILE_SIZE)
+            .ok_or(PoolError::TooLarge(offset.saturating_add(buf.len() as u64)))?;
+        let end = end as usize;
+
         self.hydrate_file_state(ino)?;
         {
             let mut file_state = self.file_state.lock();
             let state = file_state.get_mut(&ino).unwrap();
-            let end = offset as usize + buf.len();
             if state.contents.len() < end {
                 state.contents.resize(end, 0);
             }
@@ -1329,6 +1346,9 @@ impl PoolShared {
         };
         if kind != InodeKind::File {
             return Err(PoolError::Format(format!("ino {ino} is not a regular file")));
+        }
+        if new_size > MAX_FILE_SIZE {
+            return Err(PoolError::TooLarge(new_size));
         }
 
         let ino_lock = self.lock_for_ino(ino);

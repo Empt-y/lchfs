@@ -66,6 +66,7 @@ fn errno_for(err: &PoolError) -> Errno {
         PoolError::AlreadyExists(_) => Errno::EEXIST,
         PoolError::Io(_) | PoolError::Format(_) | PoolError::IntegrityFailure(_) => Errno::EIO,
         PoolError::Index(_) => Errno::EIO,
+        PoolError::TooLarge(_) => Errno::EFBIG,
     }
 }
 

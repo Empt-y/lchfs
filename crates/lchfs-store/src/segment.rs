@@ -275,6 +275,12 @@ pub(crate) fn mark_coalesced(pool_root: &Path, segment_id: u64, kind: StreamKind
     let mut page = vec![0u8; SEGMENT_HEADER_PAGE_SIZE as usize];
     file.read_exact_at(&mut page, 0)?;
     let header_len = u32::from_le_bytes(page[0..4].try_into().unwrap()) as usize;
+    if 4 + header_len > page.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "corrupted segment header: header_len prefix out of bounds",
+        ));
+    }
     let mut header: SegmentHeader = lchfs_format::decode(&page[4..4 + header_len])
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
     header.state = SegmentState::Coalesced;
@@ -327,6 +333,12 @@ impl SegmentReader {
         let mut page = vec![0u8; SEGMENT_HEADER_PAGE_SIZE as usize];
         self.file.read_exact_at(&mut page, 0)?;
         let header_len = u32::from_le_bytes(page[0..4].try_into().unwrap()) as usize;
+        if 4 + header_len > page.len() {
+            return Err(SegmentError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "corrupted segment header: header_len prefix out of bounds",
+            )));
+        }
         let header: SegmentHeader = lchfs_format::decode(&page[4..4 + header_len])
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         if header.magic != SEGMENT_HEADER_MAGIC {
@@ -348,7 +360,19 @@ impl SegmentReader {
         self.file
             .read_exact_at(&mut record_bytes, loc.offset as u64)?;
 
+        if record_bytes.len() < 4 {
+            return Err(SegmentError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "corrupted record: shorter than the length prefix itself",
+            )));
+        }
         let header_len = u32::from_le_bytes(record_bytes[0..4].try_into().unwrap()) as usize;
+        if 4 + header_len > record_bytes.len() {
+            return Err(SegmentError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "corrupted record: header_len prefix out of bounds",
+            )));
+        }
         let header: ExtentRecordHeader = lchfs_format::decode(&record_bytes[4..4 + header_len])
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
@@ -360,7 +384,16 @@ impl SegmentReader {
             header.compressed_len as usize
         };
         let payload_start = 4 + header_len;
-        let payload = record_bytes[payload_start..payload_start + payload_len].to_vec();
+        let payload_end = payload_start
+            .checked_add(payload_len)
+            .filter(|&end| end <= record_bytes.len())
+            .ok_or_else(|| {
+                SegmentError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "corrupted record: payload length out of bounds",
+                ))
+            })?;
+        let payload = record_bytes[payload_start..payload_end].to_vec();
         Ok((header, payload))
     }
 
