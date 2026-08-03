@@ -54,7 +54,7 @@ use lchfs_format::{
 };
 use lchfs_index::{ChunkLocationCache, IndexError, IndexStore, RedbIndex};
 use parking_lot::{Mutex, RwLock};
-use prep::{IngestPreparationPool, PrepTask, PreparedChunk};
+use prep::{IngestPreparationPool, PrepTask, PreparedChunk, prepare_chunk};
 use segment::{SegmentError, SegmentReader, SegmentWriter};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -118,6 +118,11 @@ const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
 /// interval -- this is idle-cycle background work, not foreground-
 /// critical durability (ARCHITECTURE.md §5).
 const COALESCE_INTERVAL: Duration = Duration::from_secs(60);
+/// How often the Dedup Index Scanner runs. Shorter than the coalesce
+/// interval: its pass is cheap (header scans + index lookups, no
+/// physical rewrite), and faster convergence bounds how long duplicate
+/// space sits around before Coalesce/GC can reclaim it.
+const DEDUP_INTERVAL: Duration = Duration::from_secs(30);
 
 fn index_path(pool_root: &Path) -> PathBuf {
     pool_root.join("INDEX.redb")
@@ -254,11 +259,13 @@ struct PoolShared {
 
     checkpoint_lock: Mutex<()>,
     coalesce: Mutex<coalesce::CoalesceDaemon>,
+    dedup: Mutex<dedup::DedupScanner>,
     /// `None` until `spawn_background_threads` runs (after this
     /// `PoolShared` is wrapped in its `Arc`, which each timer's closure
     /// needs to clone -- see that method's doc comment).
     checkpoint_task: Mutex<Option<background::PeriodicTask>>,
     coalesce_task: Mutex<Option<background::PeriodicTask>>,
+    dedup_task: Mutex<Option<background::PeriodicTask>>,
 }
 
 impl Pool {
@@ -347,8 +354,13 @@ impl Pool {
                 pool_root.to_path_buf(),
                 Arc::clone(&dedup_index),
             )),
+            dedup: Mutex::new(dedup::DedupScanner::new(
+                pool_root.to_path_buf(),
+                Arc::clone(&dedup_index),
+            )),
             checkpoint_task: Mutex::new(None),
             coalesce_task: Mutex::new(None),
+            dedup_task: Mutex::new(None),
         });
 
         shared.run_checkpoint()?;
@@ -618,8 +630,13 @@ impl Pool {
                 pool_root.to_path_buf(),
                 Arc::clone(&dedup_index),
             )),
+            dedup: Mutex::new(dedup::DedupScanner::new(
+                pool_root.to_path_buf(),
+                Arc::clone(&dedup_index),
+            )),
             checkpoint_task: Mutex::new(None),
             coalesce_task: Mutex::new(None),
+            dedup_task: Mutex::new(None),
         });
 
         shared.spawn_background_threads();
@@ -717,6 +734,19 @@ impl Pool {
     pub fn run_gc_and_coalesce_pass(&self) -> Result<(), PoolError> {
         self.0.run_gc_and_coalesce_pass()
     }
+
+    /// Runs one Dedup Index Scanner pass synchronously. The background
+    /// `DedupScanner` (dedup.rs) calls this same path on its own timer;
+    /// exposed publicly so tests can call it directly instead of racing
+    /// that timer.
+    pub fn run_dedup_pass(&self) -> Result<Vec<dedup::DedupMerge>, PoolError> {
+        self.0.run_dedup_pass()
+    }
+
+    /// Test/tooling support -- see `PoolShared::debug_force_duplicate_chunk`.
+    pub fn debug_force_duplicate_chunk(&self, raw_bytes: &[u8]) -> Result<ExtentLocation, PoolError> {
+        self.0.debug_force_duplicate_chunk(raw_bytes)
+    }
 }
 
 impl Drop for Pool {
@@ -728,6 +758,7 @@ impl Drop for Pool {
         // out of their Mutexes and letting them drop right here achieves.
         self.0.checkpoint_task.lock().take();
         self.0.coalesce_task.lock().take();
+        self.0.dedup_task.lock().take();
     }
 }
 
@@ -756,6 +787,12 @@ impl PoolShared {
             },
         );
         *self.coalesce_task.lock() = Some(coalesce_task);
+
+        let dedup_shared = Arc::clone(self);
+        let dedup_task = background::PeriodicTask::spawn("lchfs-dedup", DEDUP_INTERVAL, move || {
+            let _ = dedup_shared.run_dedup_pass();
+        });
+        *self.dedup_task.lock() = Some(dedup_task);
     }
 
     /// One idle-cycle GC-mark-and-coalesce pass (ARCHITECTURE.md §6):
@@ -769,6 +806,12 @@ impl PoolShared {
             .lock()
             .run_pass(&live_roots, &self.persisted_index, &self.next_segment_id)?;
         Ok(())
+    }
+
+    /// One idle-cycle Dedup Index Scanner pass. `Pool::run_dedup_pass`
+    /// (below) is the same thing, exposed publicly for tests.
+    fn run_dedup_pass(&self) -> Result<Vec<dedup::DedupMerge>, PoolError> {
+        Ok(self.dedup.lock().run_pass(&self.persisted_index)?)
     }
 
     fn read(&self, ino: u64, offset: u64, len: u32) -> Result<Bytes, PoolError> {
@@ -954,6 +997,45 @@ impl PoolShared {
                 Ok((content_hash, location))
             }
         }
+    }
+
+    /// Test/tooling support for exercising `DedupScanner`'s convergence
+    /// (dedup.rs) deterministically, without depending on real thread
+    /// timing to reproduce the race it's meant to catch (two logical
+    /// shards committing byte-identical new content in the same epoch,
+    /// neither seeing the other's not-yet-indexed write). This is
+    /// `commit_chunk`'s `New` path with the dedup-hit check bypassed
+    /// (`prepare_chunk` run against a throwaway, always-empty cache) and,
+    /// deliberately, the index update skipped afterward -- updating it
+    /// here would immediately erase the very duplicate this exists to
+    /// create.
+    pub fn debug_force_duplicate_chunk(&self, raw_bytes: &[u8]) -> Result<ExtentLocation, PoolError> {
+        let throwaway = ChunkLocationCache::new();
+        let prepared = prepare_chunk(raw_bytes, &throwaway);
+        let PreparedChunk::New {
+            content_hash,
+            codec_id,
+            uncompressed_len,
+            payload,
+        } = prepared
+        else {
+            unreachable!("a fresh, empty ChunkLocationCache never produces a Dedup hit");
+        };
+
+        let (tx, rx) = crossbeam::channel::bounded(1);
+        self.committer_pool.push(IngressOp {
+            inode_id: 0,
+            content_hash,
+            codec_id,
+            uncompressed_len,
+            payload,
+            logical_offset: 0,
+            completion: tx,
+        });
+        let location = rx
+            .recv()
+            .map_err(|_| PoolError::Format("committer pool completion channel closed".into()))??;
+        Ok(location)
     }
 
     /// Writes any serde-encodable meta object to the (global, unsharded)
