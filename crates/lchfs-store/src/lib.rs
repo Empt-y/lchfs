@@ -365,18 +365,22 @@ impl Pool {
             .flatten()
             .filter(|idx| idx.generation() == slot.generation);
 
-        let (mut readers, locations, max_segment_id, persisted_index) =
+        let (mut readers, mut locations, max_segment_id, persisted_index, took_fast_path) =
             if let Some(index) = fresh_index {
                 let (readers, max_segment_id) = open_all_segment_readers(pool_root)?;
                 let locations: HashMap<Hash32, ExtentLocation> =
                     index.iter_chunk_locations()?.into_iter().collect();
-                (readers, locations, max_segment_id, index)
+                (readers, locations, max_segment_id, index, true)
             } else {
                 let mut readers = HashMap::new();
                 let mut locations = HashMap::new();
                 let max_segment_id = scan_segments(pool_root, &mut readers, &mut locations)?;
                 let index = rebuild_index(&index_file, &locations, slot.generation)?;
-                (readers, locations, max_segment_id, index)
+                // The slow path's full scan already covers every segment
+                // unconditionally, so it has no analog of the fast path's
+                // "index might be missing recent, un-checkpointed
+                // entries" gap -- no owner_shard rescan needed here.
+                (readers, locations, max_segment_id, index, false)
             };
 
         let root_bytes = {
@@ -460,9 +464,109 @@ impl Pool {
         let meta_id = next_segment_id.fetch_add(1, Ordering::Relaxed);
         let meta_writer = SegmentWriter::create(pool_root, meta_id, StreamKind::Meta, 0)?;
 
-        let shard_delta_logs = (0..shard_count)
-            .map(|id| ShardDeltaLog::open(pool_root, id).map(Mutex::new))
-            .collect::<Result<Vec<_>, _>>()?;
+        // Two-tier crash recovery (ARCHITECTURE.md §7): the InoMap walk
+        // above is tier one (the last full checkpoint's base state). Tier
+        // two replays each shard's delta log for anything committed via
+        // `fsync` (E.7) since that checkpoint's `shard_watermarks` entry
+        // for it -- unconditional, every mount, never skipped by the
+        // index-freshness fast path (that fast path only concerns
+        // `locations`/`INDEX.redb`, not delta-log replay, which exists
+        // specifically to cover activity *after* the index's own last
+        // checkpoint).
+        let mut shard_delta_logs = Vec::with_capacity(shard_count as usize);
+        let mut file_state_from_replay: HashMap<u64, FileWorkingState> = HashMap::new();
+        for shard_id in 0..shard_count {
+            let shard_log = ShardDeltaLog::open(pool_root, shard_id)?;
+            let watermark = root
+                .shard_watermarks
+                .get(shard_id as usize)
+                .copied()
+                .unwrap_or(0);
+            let replay = shard_log.replay_since(watermark)?;
+
+            if !replay.entries.is_empty() {
+                // The InodeObject/IndirectHashList records this shard's
+                // replayed entries reference live only in its own Delta
+                // stream -- resolved from `replay.locations` directly,
+                // deliberately kept separate from the shared `locations`/
+                // `dedup_index` (which callers elsewhere assume means
+                // Data/Meta streams specifically).
+                let delta_locations: HashMap<Hash32, ExtentLocation> =
+                    replay.locations.into_iter().collect();
+
+                // Backfill this shard's chunk locations that the fast
+                // mount path's INDEX.redb snapshot might be missing --
+                // see `owner_shard_rescan`'s doc comment. Skipped on the
+                // slow path, which already scanned everything.
+                if took_fast_path {
+                    owner_shard_rescan(&readers, shard_id, &mut locations)?;
+                }
+
+                for entry in &replay.entries {
+                    let loc = delta_locations.get(&entry.new_object_hash).ok_or_else(|| {
+                        PoolError::Format(format!(
+                            "replayed InodeObject for ino {} (shard {shard_id}) missing from its delta log",
+                            entry.ino
+                        ))
+                    })?;
+                    let delta_reader =
+                        SegmentReader::open_delta(pool_root, shard_id, loc.segment_id)?;
+                    let (_h, bytes) = delta_reader.read_record(*loc)?;
+                    let inode: InodeObject = lchfs_format::decode(&bytes)
+                        .map_err(|e| PoolError::Format(e.to_string()))?;
+
+                    // Same reasoning as E.7's fsync: this InodeObject's
+                    // ContentRef hash (if ChunkList) is only resolvable
+                    // through this shard's own delta log, not the global
+                    // index -- so materialize file_state directly here,
+                    // at recovery time, rather than leave a dangling
+                    // reference an ordinary future read() can't resolve.
+                    if inode.kind == InodeKind::File
+                        && let ContentRef::ChunkList(ihl_hash) = &inode.content
+                    {
+                        let ihl_loc = delta_locations.get(ihl_hash).ok_or_else(|| {
+                            PoolError::Format(format!(
+                                "replayed IndirectHashList for ino {} (shard {shard_id}) missing from its delta log",
+                                entry.ino
+                            ))
+                        })?;
+                        let ihl_reader =
+                            SegmentReader::open_delta(pool_root, shard_id, ihl_loc.segment_id)?;
+                        let (_h, ihl_bytes) = ihl_reader.read_record(*ihl_loc)?;
+                        let ihl: IndirectHashList = lchfs_format::decode(&ihl_bytes)
+                            .map_err(|e| PoolError::Format(e.to_string()))?;
+                        let mut contents = Vec::new();
+                        for chunk in &ihl.chunks {
+                            let chunk_loc = locations.get(&chunk.content_hash).ok_or_else(|| {
+                                PoolError::Format(format!(
+                                    "chunk {:?} referenced by replayed ino {} not found",
+                                    chunk.content_hash, entry.ino
+                                ))
+                            })?;
+                            let reader = get_reader(
+                                &mut readers,
+                                pool_root,
+                                chunk_loc.segment_id,
+                                StreamKind::Data,
+                            )?;
+                            let (_h, bytes) = reader.read_record(*chunk_loc)?;
+                            contents.extend_from_slice(&bytes);
+                        }
+                        file_state_from_replay.insert(
+                            entry.ino,
+                            FileWorkingState {
+                                contents,
+                                chunks: ihl.chunks.clone(),
+                            },
+                        );
+                    }
+
+                    inodes.insert(entry.ino, inode);
+                }
+            }
+
+            shard_delta_logs.push(Mutex::new(shard_log));
+        }
 
         let dedup_index = Arc::new(ChunkLocationCache::new());
         dedup_index.extend(locations);
@@ -484,7 +588,7 @@ impl Pool {
             pool_params: root.pool_params,
             superblock_backend,
             namespace: Mutex::new(namespace),
-            file_state: Mutex::new(HashMap::new()),
+            file_state: Mutex::new(file_state_from_replay),
             open_files: Mutex::new(HashMap::new()),
             ino_locks: Mutex::new(HashMap::new()),
             dedup_index,
@@ -1643,6 +1747,34 @@ fn scan_one_segment(
             },
         );
         offset = next_offset;
+    }
+    Ok(())
+}
+
+/// ARCHITECTURE.md §7's owner_shard-filtered rescan (E.9): on the fast
+/// mount path, `locations` comes entirely from the durably-checkpointed
+/// `INDEX.redb`, which does not reflect any chunk `commit_chunk` wrote
+/// after the last full checkpoint (`persisted_index`'s per-write
+/// registration is `Durability::None`, not crash-durable -- only
+/// `checkpoint()`'s own `Durability::Immediate` commit is). A shard whose
+/// delta log has entries newer than its checkpointed watermark can
+/// reference exactly such chunks from its replayed IndirectHashLists, so
+/// this does a cheap header-only pass over every Data-stream segment
+/// (`read_header` first) and only fully scans (`scan_one_segment`) the
+/// ones actually owned by `shard_id`.
+fn owner_shard_rescan(
+    readers: &SegmentReaders,
+    shard_id: u32,
+    locations: &mut HashMap<Hash32, ExtentLocation>,
+) -> Result<(), PoolError> {
+    for (&(segment_id, kind), reader) in readers {
+        if kind != StreamKind::Data {
+            continue;
+        }
+        if reader.read_header()?.owner_shard != shard_id {
+            continue;
+        }
+        scan_one_segment(reader, segment_id, locations)?;
     }
     Ok(())
 }
