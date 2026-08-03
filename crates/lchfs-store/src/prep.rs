@@ -9,53 +9,107 @@
 //! file, because every `ChunkRef` carries its own `logical_offset`
 //! (ARCHITECTURE.md §1, §5) — ingestion order and logical order are fully
 //! decoupled by design, so no reordering buffer is needed here.
+//!
+//! This pool's job ends at producing a `PreparedChunk` — building the
+//! `IngressOp` (with its completion channel) and pushing it onto the
+//! `CommitterPool` is `Pool::write`'s orchestration job (see lib.rs), kept
+//! out of this crate-internal module so `prepare_chunk` stays a pure,
+//! independently testable function with no knowledge of the ingress ring.
 
-use crate::ingress::IngressOp;
-use lchfs_chunk::ChunkBoundary;
-use lchfs_compress::CompressionDecision;
-use lchfs_format::Hash32;
+use lchfs_compress::{Codec, CompressionDecision, ZstdCodec};
+use lchfs_format::{CodecId, ExtentLocation, Hash32};
+use lchfs_index::ChunkLocationCache;
+use std::sync::Arc;
 
 /// A byte range handed to the prep pool after `FastCdcChunker` (lchfs-chunk)
 /// has already cut a boundary. This pool's job is everything *after* that:
 /// hash, dedup-check, maybe-compress.
 pub struct PrepTask {
     pub inode_id: u64,
-    pub boundary: ChunkBoundary,
+    pub logical_offset: u64,
     pub raw_bytes: bytes::Bytes,
+}
+
+/// One chunk's fully-prepared result. Two shapes, not one flat struct,
+/// because a dedup hit fundamentally has no ingest work left to do: the
+/// bytes are already durable at a known location, so there is nothing to
+/// commit through the committer pool at all, and no `payload`/compression
+/// `decision` to speak of. The caller (`Pool::write`, E.6) branches on
+/// this: `Dedup` skips the committer pool entirely and records a
+/// `ChunkRef` at the existing location directly; `New` builds an
+/// `IngressOp` and pushes it through `CommitterPool::push`.
+pub enum PreparedChunk {
+    Dedup {
+        content_hash: Hash32,
+        location: ExtentLocation,
+    },
+    New {
+        content_hash: Hash32,
+        codec_id: CodecId,
+        uncompressed_len: u32,
+        payload: bytes::Bytes,
+    },
+}
+
+/// The full per-chunk pipeline (ARCHITECTURE.md §2): hash -> dedup index
+/// lookup (fast path: return early on hit) -> sample-and-decide -> maybe
+/// compress. Hashing always runs on the *uncompressed* bytes (§2:
+/// "Hashing uncompressed bytes" — compression settings can change over
+/// time, hashing compressed output would break dedup for identical logical
+/// content compressed differently on different occasions).
+pub fn prepare_chunk(raw_bytes: &[u8], dedup_index: &ChunkLocationCache) -> PreparedChunk {
+    let content_hash = Hash32::of(raw_bytes);
+    if let Some(location) = dedup_index.get(content_hash) {
+        return PreparedChunk::Dedup {
+            content_hash,
+            location,
+        };
+    }
+
+    let decision = lchfs_compress::sample_and_decide(raw_bytes);
+    let (codec_id, payload): (CodecId, Vec<u8>) = match decision {
+        CompressionDecision::StoreRaw => (CodecId::None, raw_bytes.to_vec()),
+        CompressionDecision::Compress { level, .. } => {
+            (CodecId::Zstd, ZstdCodec.compress(raw_bytes, level))
+        }
+    };
+
+    PreparedChunk::New {
+        content_hash,
+        codec_id,
+        uncompressed_len: raw_bytes.len() as u32,
+        payload: bytes::Bytes::from(payload),
+    }
 }
 
 /// `rayon`-style work-stealing pool, sized to `num_cpus`
 /// (ARCHITECTURE.md §5).
 pub struct IngestPreparationPool {
-    // TODO(phase-E): rayon::ThreadPool or equivalent
+    pool: rayon::ThreadPool,
+    dedup_index: Arc<ChunkLocationCache>,
 }
 
 impl IngestPreparationPool {
-    pub fn new(_worker_count: usize) -> Self {
-        todo!("lchfs-store: IngestPreparationPool::new — see ARCHITECTURE.md §5")
+    pub fn new(worker_count: usize, dedup_index: Arc<ChunkLocationCache>) -> Self {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(worker_count.max(1))
+            .thread_name(|i| format!("lchfs-prep-{i}"))
+            .build()
+            .expect("build Ingest Preparation Pool");
+        Self { pool, dedup_index }
     }
 
-    /// Runs the full per-chunk pipeline (ARCHITECTURE.md §2): hash ->
-    /// dedup index lookup -> (on miss) sample-and-decide -> maybe compress
-    /// -> produce an `IngressOp` ready for its logical shard's ring.
-    pub fn submit(&self, _task: PrepTask) -> IngressOp {
-        todo!("lchfs-store: IngestPreparationPool::submit — see ARCHITECTURE.md §2")
+    /// Runs `prepare_chunk` on the prep pool, blocking the calling thread
+    /// until it completes. Blocking here (via `ThreadPool::install`) is
+    /// intentional and matches ARCHITECTURE.md §5's actual intent: what
+    /// must not stall is the `fuser` worker thread pool *broadly* (many
+    /// concurrent FUSE requests serviced by many worker threads), not this
+    /// one `write()` call's own progress — moving the CPU-bound work off
+    /// the calling thread and onto a K-wide pool is the actual concurrency
+    /// win, not avoiding a blocking wait on its own result.
+    pub fn submit(&self, task: PrepTask) -> PreparedChunk {
+        let dedup_index = &self.dedup_index;
+        self.pool
+            .install(|| prepare_chunk(&task.raw_bytes, dedup_index))
     }
-}
-
-/// One chunk's fully-prepared result, before being wrapped as an
-/// `IngressOp`. Exposed separately so tests can exercise the pipeline
-/// without a full pool.
-pub struct PreparedChunk {
-    pub content_hash: Hash32,
-    pub decision: CompressionDecision,
-    pub payload: bytes::Bytes,
-}
-
-pub fn prepare_chunk(_raw_bytes: &[u8]) -> PreparedChunk {
-    // TODO(phase-E): Hash32::of -> dedup index lookup (fast path: return
-    // early on hit) -> lchfs_compress::sample_and_decide -> compress if
-    // decided. See ARCHITECTURE.md §2 for the exact pipeline and ordering
-    // rationale (hash uncompressed bytes, dedup before compress).
-    todo!("lchfs-store: prepare_chunk")
 }

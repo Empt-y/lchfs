@@ -11,10 +11,18 @@ pub const SEGMENT_HEADER_MAGIC: [u8; 8] = *b"LCHFSEG\0";
 /// Which stream a segment belongs to — data and metadata are kept as
 /// separate segment streams (ARCHITECTURE.md §1) so mount-time index
 /// rebuild and fsck can scan metadata first without touching bulk data.
+///
+/// `Delta` (Phase E, ARCHITECTURE.md §3 "Subtree durability via per-shard
+/// delta logs") is a third, per-shard-scoped stream: one logical shard's
+/// self-contained fast-fsync record stream (freshly-rewritten
+/// IndirectHashList/InodeObject records plus DeltaLogEntry pointers into
+/// them), kept separate from the global Data/Meta streams so a shard's
+/// `fsync()` never contends with any other shard or the global checkpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum StreamKind {
     Data,
     Meta,
+    Delta,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

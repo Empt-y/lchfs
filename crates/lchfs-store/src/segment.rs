@@ -44,6 +44,7 @@ fn segment_dir(pool_root: &Path, kind: StreamKind) -> PathBuf {
     let sub = match kind {
         StreamKind::Data => "data",
         StreamKind::Meta => "meta",
+        StreamKind::Delta => unreachable!("Delta streams are shard-scoped, use delta_segment_dir"),
     };
     pool_root.join("segments").join(sub)
 }
@@ -52,8 +53,24 @@ fn segment_path(pool_root: &Path, segment_id: u64, kind: StreamKind) -> PathBuf 
     let ext = match kind {
         StreamKind::Data => "aseg",
         StreamKind::Meta => "mseg",
+        StreamKind::Delta => unreachable!("Delta streams are shard-scoped, use delta_segment_path"),
     };
     segment_dir(pool_root, kind).join(format!("{segment_id}.{ext}"))
+}
+
+/// Per-shard Delta stream directory (ARCHITECTURE.md §3, Phase E): each
+/// logical shard's delta segments live in their own subdirectory so
+/// mount-time recovery (§7) can discover exactly one shard's delta history
+/// without scanning any other shard's or the global Data/Meta streams.
+pub(crate) fn delta_segment_dir(pool_root: &Path, shard_id: u32) -> PathBuf {
+    pool_root
+        .join("segments")
+        .join("delta")
+        .join(format!("{shard_id:05}"))
+}
+
+fn delta_segment_path(pool_root: &Path, shard_id: u32, segment_id: u64) -> PathBuf {
+    delta_segment_dir(pool_root, shard_id).join(format!("{segment_id}.dseg"))
 }
 
 /// Append-only writer for one segment, owned exclusively by one logical
@@ -80,6 +97,28 @@ impl SegmentWriter {
     ) -> io::Result<Self> {
         std::fs::create_dir_all(segment_dir(pool_root, kind))?;
         let path = segment_path(pool_root, segment_id, kind);
+        Self::create_at(&path, segment_id, kind, owner_shard)
+    }
+
+    /// Open a fresh segment in shard `shard_id`'s own Delta stream
+    /// (ARCHITECTURE.md §3, Phase E) — the per-shard fast-fsync path's
+    /// dedicated segment stream, kept separate from the global Data/Meta
+    /// streams. `owner_shard` is set to `shard_id`, matching every other
+    /// segment kind's convention of recording its owning shard in the
+    /// header even though only Delta streams are shard-scoped by directory
+    /// too.
+    pub fn create_delta(pool_root: &Path, shard_id: u32, segment_id: u64) -> io::Result<Self> {
+        std::fs::create_dir_all(delta_segment_dir(pool_root, shard_id))?;
+        let path = delta_segment_path(pool_root, shard_id, segment_id);
+        Self::create_at(&path, segment_id, StreamKind::Delta, shard_id)
+    }
+
+    fn create_at(
+        path: &Path,
+        segment_id: u64,
+        kind: StreamKind,
+        owner_shard: u32,
+    ) -> io::Result<Self> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -242,6 +281,17 @@ pub struct SegmentReader {
 impl SegmentReader {
     pub fn open(pool_root: &Path, segment_id: u64, kind: StreamKind) -> io::Result<Self> {
         let path = segment_path(pool_root, segment_id, kind);
+        Self::open_at(&path, segment_id)
+    }
+
+    /// Open a reader for shard `shard_id`'s own Delta stream segment
+    /// `segment_id`. See `SegmentWriter::create_delta`.
+    pub fn open_delta(pool_root: &Path, shard_id: u32, segment_id: u64) -> io::Result<Self> {
+        let path = delta_segment_path(pool_root, shard_id, segment_id);
+        Self::open_at(&path, segment_id)
+    }
+
+    fn open_at(path: &Path, segment_id: u64) -> io::Result<Self> {
         let file = OpenOptions::new().read(true).open(path)?;
         Ok(Self { file, segment_id })
     }

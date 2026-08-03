@@ -478,6 +478,9 @@ fn open_all_segment_readers(
         let sub = match kind {
             StreamKind::Data => "data",
             StreamKind::Meta => "meta",
+            StreamKind::Delta => {
+                unreachable!("this loop only ever iterates Data/Meta; Delta streams are shard-scoped, see delta_log.rs")
+            }
         };
         let dir = pool_root.join("segments").join(sub);
         if !dir.is_dir() {

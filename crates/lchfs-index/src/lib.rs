@@ -9,8 +9,10 @@
 
 use lchfs_format::{ExtentLocation, Hash32, InodeObject};
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::RwLock;
 use thiserror::Error;
 
 /// Abstraction over the persisted index backend. Phase 1 implementation is
@@ -210,16 +212,78 @@ impl ActiveTreeCache {
     }
 }
 
+/// Number of internal buckets `ChunkLocationCache` shards its map across.
+/// Phase E (ARCHITECTURE.md §5): this is on the hot path for every prep-
+/// pool dedup lookup across K committer/prep threads, so a single global
+/// `RwLock<HashMap<..>>` would itself become a contention point exactly
+/// where the sharding design is trying to avoid one. A fixed bucket count
+/// (rather than one lock per logical shard) keeps this independent of
+/// `PoolParams::logical_shard_count` — this cache's job is pure content-
+/// hash lookup, unrelated to inode-ordering shards.
+const CHUNK_LOCATION_CACHE_BUCKETS: usize = 64;
+
+fn bucket_for(hash: Hash32) -> usize {
+    (hash.0[0] as usize) % CHUNK_LOCATION_CACHE_BUCKETS
+}
+
 /// In-memory `content_hash -> {segment_id, offset, len}` cache, the hot
 /// path in front of `IndexStore::get_chunk_location`. ARCHITECTURE.md §4.
-#[derive(Default)]
 pub struct ChunkLocationCache {
-    // TODO(phase-E): HashMap<Hash32, ExtentLocation>, likely with an eviction policy
-    // -- same as ActiveTreeCache above, not yet consumed by Pool.
+    buckets: Vec<RwLock<HashMap<Hash32, ExtentLocation>>>,
+}
+
+impl Default for ChunkLocationCache {
+    fn default() -> Self {
+        Self {
+            buckets: (0..CHUNK_LOCATION_CACHE_BUCKETS)
+                .map(|_| RwLock::new(HashMap::new()))
+                .collect(),
+        }
+    }
 }
 
 impl ChunkLocationCache {
-    pub fn get(&self, _hash: Hash32) -> Option<ExtentLocation> {
-        todo!("lchfs-index: ChunkLocationCache::get")
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn get(&self, hash: Hash32) -> Option<ExtentLocation> {
+        let bucket = self.buckets[bucket_for(hash)]
+            .read()
+            .expect("ChunkLocationCache lock poisoned");
+        bucket.get(&hash).copied()
+    }
+
+    /// Insert or overwrite `hash`'s location. Used both by the inline
+    /// dedup-on-write fast path (a miss followed by a fresh write) and by
+    /// the Coalescing/Dedup daemons (E.11/E.12) repointing a hash at a new
+    /// canonical location — content-addressing means the newer value is
+    /// always for the same bytes, so a plain overwrite is always correct,
+    /// no merge logic needed.
+    pub fn put(&self, hash: Hash32, loc: ExtentLocation) {
+        let mut bucket = self.buckets[bucket_for(hash)]
+            .write()
+            .expect("ChunkLocationCache lock poisoned");
+        bucket.insert(hash, loc);
+    }
+
+    /// Bulk-load every entry, e.g. from `RedbIndex::iter_chunk_locations`
+    /// on the mount-time fast path, or from a full segment scan on the
+    /// cold-rebuild path.
+    pub fn extend(&self, entries: impl IntoIterator<Item = (Hash32, ExtentLocation)>) {
+        for (hash, loc) in entries {
+            self.put(hash, loc);
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.buckets
+            .iter()
+            .map(|b| b.read().expect("ChunkLocationCache lock poisoned").len())
+            .sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }

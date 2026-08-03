@@ -288,7 +288,11 @@ prop_compose! {
 }
 
 fn stream_kind() -> impl Strategy<Value = StreamKind> {
-    prop_oneof![Just(StreamKind::Data), Just(StreamKind::Meta)]
+    prop_oneof![
+        Just(StreamKind::Data),
+        Just(StreamKind::Meta),
+        Just(StreamKind::Delta)
+    ]
 }
 
 fn segment_state() -> impl Strategy<Value = SegmentState> {
