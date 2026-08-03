@@ -220,3 +220,50 @@ fn torn_delta_record_from_simulated_mid_fsync_crash_recovers_to_prior_state() {
     let read_back = pool2.read(ino, 0, first.len() as u32).unwrap();
     assert_eq!(&read_back.as_ref()[..first.len()], first.as_slice());
 }
+
+/// Found via an actual live FUSE mount (a real crash/coalesce cycle, not
+/// just unit tests), not by inspection: a replayed file's InodeObject
+/// gets re-registered into the global index by run_checkpoint's
+/// unconditional "snapshot every inode" pass regardless of dirty status --
+/// but the IndirectHashList *it references* (for chunked content) does
+/// not, since nothing else independently re-touches it. Without marking
+/// replayed inodes dirty at mount time (so the per-file dirty-inode loop
+/// re-derives and re-registers it via put_meta_object on the very next
+/// checkpoint), the recovered root permanently references an
+/// IndirectHashList hash that's only resolvable through the shard's own
+/// delta stream -- invisible to anything that resolves through the global
+/// index, like GC's mark phase, which would abort every single pass
+/// indefinitely.
+#[test]
+fn gc_mark_succeeds_after_checkpoint_following_fsync_only_crash_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = Pool::create(dir.path(), small_params()).unwrap();
+    let ino = pool.create_file(1, "f", 0o644).unwrap();
+    let data = deterministic_bytes(1, 5000);
+    pool.write(ino, 0, &data).unwrap();
+    pool.checkpoint().unwrap();
+
+    let more = deterministic_bytes(2, 3000);
+    let off = data.len() as u64;
+    pool.write(ino, off, &more).unwrap();
+    pool.fsync(ino).unwrap(); // fast path only, no full checkpoint
+    drop(pool); // simulated crash: no clean unmount, no destroy()
+
+    let pool2 = Pool::open(dir.path()).unwrap(); // E.9 replay kicks in
+    // The very next checkpoint (5s later in production; explicit here)
+    // is what's supposed to re-register the replayed content globally.
+    pool2.checkpoint().unwrap();
+    let root = pool2.debug_root_hash();
+    drop(pool2);
+
+    let index = lchfs_index::RedbIndex::open(&dir.path().join("INDEX.redb")).unwrap();
+    let cache = lchfs_index::ChunkLocationCache::new();
+    cache.extend(index.iter_chunk_locations().unwrap());
+    let mut gc = lchfs_store::gc::GcEngine::new(dir.path().to_path_buf(), std::sync::Arc::new(cache));
+    let live = gc.mark(&[root]);
+    assert!(
+        !live.is_empty(),
+        "GC mark must succeed after a checkpoint following crash recovery -- an empty result \
+         means it aborted on an unresolvable reference (see this test's doc comment)"
+    );
+}

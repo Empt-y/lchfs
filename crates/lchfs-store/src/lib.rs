@@ -501,6 +501,21 @@ impl Pool {
         // checkpoint).
         let mut shard_delta_logs = Vec::with_capacity(shard_count as usize);
         let mut file_state_from_replay: HashMap<u64, FileWorkingState> = HashMap::new();
+        // Every replayed inode is marked dirty below (not just those with
+        // ChunkList content): a replayed InodeObject's own hash was only
+        // ever registered in its shard's delta stream, never the global
+        // meta stream/dedup_index. The *InodeObject itself* would get
+        // re-registered regardless by run_checkpoint's unconditional
+        // "snapshot every inode" pass -- but for ChunkList content
+        // specifically, the *referenced* IndirectHashList is never
+        // independently touched by that pass, only by the per-file dirty-
+        // inode loop that re-derives and re-registers it via
+        // put_meta_object. Without this, the very first GC mark pass
+        // after a crash-recovered mount hits an unresolvable hash and
+        // aborts -- found by actually running a live mount through a
+        // crash/recover/coalesce cycle, not by unit tests alone (none of
+        // which exercised replay immediately followed by GC).
+        let mut replayed_inos: HashSet<u64> = HashSet::new();
         for shard_id in 0..shard_count {
             let shard_log = ShardDeltaLog::open(pool_root, shard_id)?;
             let watermark = root
@@ -588,6 +603,7 @@ impl Pool {
                     }
 
                     inodes.insert(entry.ino, inode);
+                    replayed_inos.insert(entry.ino);
                 }
             }
 
@@ -603,7 +619,7 @@ impl Pool {
             dirs,
             parents,
             next_ino,
-            dirty_inodes: HashSet::new(),
+            dirty_inodes: replayed_inos,
             generation: slot.generation,
             snapshot_table_hash: Some(root.snapshot_table_hash),
             root_hash: slot.root_hash,
