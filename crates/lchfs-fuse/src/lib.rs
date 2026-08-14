@@ -91,6 +91,17 @@ fn system_time((secs, nanos): (i64, u32)) -> SystemTime {
     }
 }
 
+fn time_or_now_to_unix(t: fuser::TimeOrNow) -> (i64, u32) {
+    let system_time = match t {
+        fuser::TimeOrNow::SpecificTime(t) => t,
+        fuser::TimeOrNow::Now => SystemTime::now(),
+    };
+    match system_time.duration_since(UNIX_EPOCH) {
+        Ok(d) => (d.as_secs() as i64, d.subsec_nanos()),
+        Err(e) => (-(e.duration().as_secs() as i64), 0),
+    }
+}
+
 fn file_attr(ino: u64, inode: &InodeObject) -> FileAttr {
     FileAttr {
         ino: INodeNo(ino),
@@ -145,12 +156,12 @@ impl Filesystem for LchfsFilesystem {
         &self,
         _req: &Request,
         ino: INodeNo,
-        _mode: Option<u32>,
-        _uid: Option<u32>,
-        _gid: Option<u32>,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
         size: Option<u64>,
-        _atime: Option<fuser::TimeOrNow>,
-        _mtime: Option<fuser::TimeOrNow>,
+        atime: Option<fuser::TimeOrNow>,
+        mtime: Option<fuser::TimeOrNow>,
         _ctime: Option<std::time::SystemTime>,
         _fh: Option<fuser::FileHandle>,
         _crtime: Option<std::time::SystemTime>,
@@ -159,17 +170,19 @@ impl Filesystem for LchfsFilesystem {
         _flags: Option<fuser::BsdFileFlags>,
         reply: ReplyAttr,
     ) {
-        // Only `size` (truncate/zero-extend) is wired to `Pool` -- mode,
-        // uid/gid, and timestamps have no `Pool` support yet (same gap as
-        // the hardcoded root uid/gid noted in lchfs-cli's `mount()`), so
-        // those fields are silently ignored rather than rejected: most
-        // callers (`cp`, `>` redirection) only need size-truncation to
-        // succeed and don't check whether metadata changes stuck.
         if let Some(size) = size
             && let Err(e) = self.pool.set_size(ino.0, size)
         {
             reply.error(errno_for(&e));
             return;
+        }
+        if mode.is_some() || uid.is_some() || gid.is_some() || atime.is_some() || mtime.is_some() {
+            let atime = atime.map(time_or_now_to_unix);
+            let mtime = mtime.map(time_or_now_to_unix);
+            if let Err(e) = self.pool.set_attr(ino.0, mode, uid, gid, atime, mtime) {
+                reply.error(errno_for(&e));
+                return;
+            }
         }
         match self.pool.getattr(ino.0) {
             Ok(inode) => reply.attr(&TTL, &file_attr(ino.0, &inode)),
@@ -289,11 +302,11 @@ impl Filesystem for LchfsFilesystem {
 
     fn create(
         &self,
-        _req: &Request,
+        req: &Request,
         parent: INodeNo,
         name: &OsStr,
         mode: u32,
-        _umask: u32,
+        umask: u32,
         _flags: i32,
         reply: ReplyCreate,
     ) {
@@ -301,7 +314,10 @@ impl Filesystem for LchfsFilesystem {
             reply.error(Errno::EINVAL);
             return;
         };
-        match self.pool.create_file(parent.0, name, mode) {
+        match self
+            .pool
+            .create_file_as(parent.0, name, mode & !umask, req.uid(), req.gid())
+        {
             Ok(ino) => match self.pool.getattr(ino) {
                 Ok(inode) => {
                     let handle = self.handles.lock().open(ino);
@@ -321,18 +337,21 @@ impl Filesystem for LchfsFilesystem {
 
     fn mkdir(
         &self,
-        _req: &Request,
+        req: &Request,
         parent: INodeNo,
         name: &OsStr,
         mode: u32,
-        _umask: u32,
+        umask: u32,
         reply: ReplyEntry,
     ) {
         let Some(name) = name.to_str() else {
             reply.error(Errno::EINVAL);
             return;
         };
-        match self.pool.mkdir(parent.0, name, mode) {
+        match self
+            .pool
+            .mkdir_as(parent.0, name, mode & !umask, req.uid(), req.gid())
+        {
             Ok(ino) => self.entry_reply(ino, reply),
             Err(e) => reply.error(errno_for(&e)),
         }
@@ -362,7 +381,7 @@ impl Filesystem for LchfsFilesystem {
 
     fn symlink(
         &self,
-        _req: &Request,
+        req: &Request,
         parent: INodeNo,
         link_name: &OsStr,
         target: &std::path::Path,
@@ -372,7 +391,10 @@ impl Filesystem for LchfsFilesystem {
             reply.error(Errno::EINVAL);
             return;
         };
-        match self.pool.symlink(parent.0, link_name, target) {
+        match self
+            .pool
+            .symlink_as(parent.0, link_name, target, req.uid(), req.gid())
+        {
             Ok(ino) => self.entry_reply(ino, reply),
             Err(e) => reply.error(errno_for(&e)),
         }

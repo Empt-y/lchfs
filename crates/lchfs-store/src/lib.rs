@@ -775,21 +775,53 @@ impl Pool {
             .ok_or(PoolError::NoSuchInode(ino))
     }
 
+    /// Owned by root (uid/gid 0) -- see `mkdir_as` for FUSE's real-caller-identity
+    /// path. Kept for the many existing tests that don't care about ownership.
     pub fn mkdir(&self, parent_ino: u64, name: &str, mode: u32) -> Result<u64, PoolError> {
-        self.0.create_entry(parent_ino, name, mode, InodeKind::Directory, None)
+        self.mkdir_as(parent_ino, name, mode, 0, 0)
     }
 
+    pub fn mkdir_as(&self, parent_ino: u64, name: &str, mode: u32, uid: u32, gid: u32) -> Result<u64, PoolError> {
+        self.0
+            .create_entry(parent_ino, name, mode, uid, gid, InodeKind::Directory, None)
+    }
+
+    /// Owned by root (uid/gid 0) -- see `create_file_as`.
     pub fn create_file(&self, parent_ino: u64, name: &str, mode: u32) -> Result<u64, PoolError> {
-        self.0.create_entry(parent_ino, name, mode, InodeKind::File, None)
+        self.create_file_as(parent_ino, name, mode, 0, 0)
+    }
+
+    pub fn create_file_as(&self, parent_ino: u64, name: &str, mode: u32, uid: u32, gid: u32) -> Result<u64, PoolError> {
+        self.0
+            .create_entry(parent_ino, name, mode, uid, gid, InodeKind::File, None)
     }
 
     /// Creates a symlink at `parent_ino`/`name` pointing at `target`.
     /// Symlink permissions are conventionally ignored by the kernel and
     /// FUSE's own `symlink` callback doesn't pass a mode, so this always
-    /// creates with `0o777`.
+    /// creates with `0o777`. Owned by root -- see `symlink_as`.
     pub fn symlink(&self, parent_ino: u64, name: &str, target: &str) -> Result<u64, PoolError> {
+        self.symlink_as(parent_ino, name, target, 0, 0)
+    }
+
+    pub fn symlink_as(&self, parent_ino: u64, name: &str, target: &str, uid: u32, gid: u32) -> Result<u64, PoolError> {
         self.0
-            .create_entry(parent_ino, name, 0o777, InodeKind::Symlink, Some(target))
+            .create_entry(parent_ino, name, 0o777, uid, gid, InodeKind::Symlink, Some(target))
+    }
+
+    /// `setattr`'s mode/uid/gid/atime/mtime fields -- each `Some` is applied,
+    /// each `None` leaves that field untouched. `ctime` is always bumped to
+    /// now, matching standard Unix `chmod`/`chown`/`utimes` semantics.
+    pub fn set_attr(
+        &self,
+        ino: u64,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        atime: Option<(i64, u32)>,
+        mtime: Option<(i64, u32)>,
+    ) -> Result<(), PoolError> {
+        self.0.set_attr(ino, mode, uid, gid, atime, mtime)
     }
 
     /// The target string of a symlink inode.
@@ -1638,6 +1670,47 @@ impl PoolShared {
         self.rechunk_and_touch(ino)
     }
 
+    /// `setattr`'s mode/uid/gid/atime/mtime fields (ARCHITECTURE.md §9,
+    /// Phase 2 ownership work). No open-session interaction like `set_size`
+    /// has -- these fields live purely on `InodeObject`, not the working
+    /// content buffer, so there's nothing to materialize/rechunk.
+    fn set_attr(
+        &self,
+        ino: u64,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        atime: Option<(i64, u32)>,
+        mtime: Option<(i64, u32)>,
+    ) -> Result<(), PoolError> {
+        let mut namespace = self.namespace.lock();
+        let inode = namespace
+            .inodes
+            .get_mut(&ino)
+            .ok_or(PoolError::NoSuchInode(ino))?;
+        if let Some(mode) = mode {
+            // Preserve the file-type bits already encoded in `mode`
+            // (InodeKind is tracked separately, but `mode`'s low 12 bits
+            // are the only ones a caller should ever be changing here).
+            inode.mode = (inode.mode & !0o7777) | (mode & 0o7777);
+        }
+        if let Some(uid) = uid {
+            inode.uid = uid;
+        }
+        if let Some(gid) = gid {
+            inode.gid = gid;
+        }
+        if let Some(atime) = atime {
+            inode.atime = atime;
+        }
+        if let Some(mtime) = mtime {
+            inode.mtime = mtime;
+        }
+        inode.ctime = now_unix();
+        namespace.dirty_inodes.insert(ino);
+        Ok(())
+    }
+
     /// Shared tail of `write()`/`set_size()`: re-derives inline-vs-chunked
     /// representation from `file_state[ino]`'s current bytes, updates
     /// size/mtime/ctime, and marks the inode dirty for the next
@@ -1705,11 +1778,14 @@ impl PoolShared {
         Ok(dir.entries.iter().find(|e| e.name == name).map(|e| e.ino))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn create_entry(
         &self,
         parent_ino: u64,
         name: &str,
         mode: u32,
+        uid: u32,
+        gid: u32,
         kind: InodeKind,
         symlink_target: Option<&str>,
     ) -> Result<u64, PoolError> {
@@ -1746,8 +1822,8 @@ impl PoolShared {
             InodeObject {
                 kind,
                 mode,
-                uid: 0,
-                gid: 0,
+                uid,
+                gid,
                 size,
                 nlink,
                 atime: (now_secs, now_nanos),
