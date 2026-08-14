@@ -16,7 +16,7 @@
 use crate::segment::SegmentReader;
 use crate::{SegmentReaders, StreamKind, dag_walk};
 use lchfs_format::{Hash32, SegmentState};
-use lchfs_index::ChunkLocationCache;
+use lchfs_index::{ChunkLocationCache, PendingDedupPins};
 use roaring::RoaringBitmap;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -36,6 +36,7 @@ const GRACE_WINDOW_SEGMENTS: usize = 2;
 pub struct GcEngine {
     pool_root: PathBuf,
     locations: Arc<ChunkLocationCache>,
+    pins: Arc<PendingDedupPins>,
     readers: SegmentReaders,
     liveness_threshold: f64,
 }
@@ -49,10 +50,18 @@ impl GcEngine {
         &self.locations
     }
 
-    pub fn new(pool_root: PathBuf, locations: Arc<ChunkLocationCache>) -> Self {
+    /// Exposed so `CoalesceDaemon` can re-consult the *live* pin set
+    /// itself, right before deleting an old segment -- see
+    /// `PendingDedupPins`'s doc comment and `CoalesceDaemon::repack_segment`.
+    pub fn pins(&self) -> &PendingDedupPins {
+        &self.pins
+    }
+
+    pub fn new(pool_root: PathBuf, locations: Arc<ChunkLocationCache>, pins: Arc<PendingDedupPins>) -> Self {
         Self {
             pool_root,
             locations,
+            pins,
             readers: HashMap::new(),
             liveness_threshold: DEFAULT_LIVENESS_THRESHOLD,
         }
@@ -88,6 +97,21 @@ impl GcEngine {
                 return HashMap::new();
             }
         }
+
+        // Union in every currently-pinned hash's location (see
+        // `PendingDedupPins`'s doc comment): a dedup-hit write can depend
+        // on a location before its own reference to it is DAG-reachable
+        // from any live root. This is a first-line-of-defense snapshot,
+        // not the sole guarantee -- `CoalesceDaemon::repack_segment` also
+        // re-consults the live pin set right before deleting a segment,
+        // to cover pins taken after this snapshot.
+        for hash in self.pins.snapshot() {
+            match self.locations.get(hash) {
+                Some(loc) => dag_walk::mark_location(loc, &mut live),
+                None => tracing::warn!("GC mark: pinned hash {hash:?} not found in index, skipping"),
+            }
+        }
+
         live
     }
 

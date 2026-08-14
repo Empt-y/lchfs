@@ -18,7 +18,7 @@
 
 use lchfs_compress::{Codec, CompressionDecision, ZstdCodec};
 use lchfs_format::{CodecId, ExtentLocation, Hash32};
-use lchfs_index::ChunkLocationCache;
+use lchfs_index::{ChunkLocationCache, PendingDedupPins};
 use std::sync::Arc;
 
 /// A byte range handed to the prep pool after `FastCdcChunker` (lchfs-chunk)
@@ -57,9 +57,16 @@ pub enum PreparedChunk {
 /// "Hashing uncompressed bytes" — compression settings can change over
 /// time, hashing compressed output would break dedup for identical logical
 /// content compressed differently on different occasions).
-pub fn prepare_chunk(raw_bytes: &[u8], dedup_index: &ChunkLocationCache) -> PreparedChunk {
+///
+/// A dedup hit pins `content_hash` in `pins` before returning it -- see
+/// `PendingDedupPins`'s doc comment for why: the caller is about to start
+/// depending on `location` before its own reference to it is checkpointed,
+/// and a concurrent GC/Coalesce pass must not reclaim it out from under
+/// that in-flight write.
+pub fn prepare_chunk(raw_bytes: &[u8], dedup_index: &ChunkLocationCache, pins: &PendingDedupPins) -> PreparedChunk {
     let content_hash = Hash32::of(raw_bytes);
     if let Some(location) = dedup_index.get(content_hash) {
+        pins.pin(content_hash);
         return PreparedChunk::Dedup {
             content_hash,
             location,
@@ -87,16 +94,21 @@ pub fn prepare_chunk(raw_bytes: &[u8], dedup_index: &ChunkLocationCache) -> Prep
 pub struct IngestPreparationPool {
     pool: rayon::ThreadPool,
     dedup_index: Arc<ChunkLocationCache>,
+    dedup_pins: Arc<PendingDedupPins>,
 }
 
 impl IngestPreparationPool {
-    pub fn new(worker_count: usize, dedup_index: Arc<ChunkLocationCache>) -> Self {
+    pub fn new(worker_count: usize, dedup_index: Arc<ChunkLocationCache>, dedup_pins: Arc<PendingDedupPins>) -> Self {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(worker_count.max(1))
             .thread_name(|i| format!("lchfs-prep-{i}"))
             .build()
             .expect("build Ingest Preparation Pool");
-        Self { pool, dedup_index }
+        Self {
+            pool,
+            dedup_index,
+            dedup_pins,
+        }
     }
 
     /// Runs `prepare_chunk` on the prep pool, blocking the calling thread
@@ -109,7 +121,8 @@ impl IngestPreparationPool {
     /// win, not avoiding a blocking wait on its own result.
     pub fn submit(&self, task: PrepTask) -> PreparedChunk {
         let dedup_index = &self.dedup_index;
+        let dedup_pins = &self.dedup_pins;
         self.pool
-            .install(|| prepare_chunk(&task.raw_bytes, dedup_index))
+            .install(|| prepare_chunk(&task.raw_bytes, dedup_index, dedup_pins))
     }
 }

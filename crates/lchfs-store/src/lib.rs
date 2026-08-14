@@ -52,7 +52,7 @@ use lchfs_format::{
     SnapshotTable, StreamKind, SuperblockSlot, SUPERBLOCK_MAGIC, SUPERBLOCK_SLOT_COUNT,
     SUPERBLOCK_SLOT_SIZE, compute_superblock_slot_checksum, finalize_superblock_slot_checksum,
 };
-use lchfs_index::{ChunkLocationCache, IndexError, IndexStore, RedbIndex};
+use lchfs_index::{ChunkLocationCache, IndexError, IndexStore, PendingDedupPins, RedbIndex};
 use parking_lot::{Mutex, RwLock};
 use prep::{IngestPreparationPool, PrepTask, PreparedChunk, prepare_chunk};
 use segment::{SegmentError, SegmentReader, SegmentWriter};
@@ -255,6 +255,11 @@ struct PoolShared {
     /// flat `locations` map served. Sharded internally (lchfs-index); the
     /// hot path in front of `persisted_index` below.
     dedup_index: Arc<ChunkLocationCache>,
+    /// Hashes with an in-flight dedup-hit write not yet captured by a
+    /// published root -- see `PendingDedupPins`'s doc comment. Protects
+    /// `CoalesceDaemon`'s repacks from reclaiming a location a write
+    /// still depends on but hasn't checkpointed yet.
+    dedup_pins: Arc<PendingDedupPins>,
     /// Persisted `INDEX.redb` (Phase C, ARCHITECTURE.md §4): "a
     /// rebuildable cache, never authoritative." `RwLock` since
     /// `get_chunk_location` only needs shared access while `put_*`/
@@ -264,6 +269,13 @@ struct PoolShared {
 
     meta_writer: Mutex<SegmentWriter>,
     next_segment_id: Arc<AtomicU64>,
+    /// Mirrors `Namespace::generation`, updated at the same point
+    /// `run_checkpoint` publishes a new root. A plain shared counter (not
+    /// a `Namespace` handle) so `CoalesceDaemon`/`GcEngine` can cheaply
+    /// detect "a checkpoint happened during this pass" without coupling
+    /// coalesce.rs to `Namespace` -- see `CoalesceDaemon::run_pass`'s doc
+    /// comment for why that specific check exists.
+    published_generation: Arc<AtomicU64>,
 
     committer_pool: CommitterPool,
     prep_pool: IngestPreparationPool,
@@ -331,8 +343,14 @@ impl Pool {
             .collect::<Result<Vec<_>, _>>()?;
 
         let dedup_index = Arc::new(ChunkLocationCache::new());
+        let dedup_pins = Arc::new(PendingDedupPins::new());
         let persisted_index = RedbIndex::create(&index_path(pool_root))?;
-        let prep_pool = IngestPreparationPool::new(committer_thread_count(), Arc::clone(&dedup_index));
+        let prep_pool = IngestPreparationPool::new(
+            committer_thread_count(),
+            Arc::clone(&dedup_index),
+            Arc::clone(&dedup_pins),
+        );
+        let published_generation = Arc::new(AtomicU64::new(0));
 
         let namespace = Namespace {
             inodes,
@@ -354,10 +372,12 @@ impl Pool {
             open_files: Mutex::new(HashMap::new()),
             ino_locks: Mutex::new(HashMap::new()),
             dedup_index: Arc::clone(&dedup_index),
+            dedup_pins: Arc::clone(&dedup_pins),
             persisted_index: RwLock::new(persisted_index),
             readers: Mutex::new(HashMap::new()),
             meta_writer: Mutex::new(meta_writer),
             next_segment_id,
+            published_generation,
             committer_pool,
             prep_pool,
             shard_delta_logs,
@@ -365,6 +385,7 @@ impl Pool {
             coalesce: Mutex::new(coalesce::CoalesceDaemon::new(
                 pool_root.to_path_buf(),
                 Arc::clone(&dedup_index),
+                Arc::clone(&dedup_pins),
             )),
             dedup: Mutex::new(dedup::DedupScanner::new(
                 pool_root.to_path_buf(),
@@ -624,7 +645,13 @@ impl Pool {
 
         let dedup_index = Arc::new(ChunkLocationCache::new());
         dedup_index.extend(locations);
-        let prep_pool = IngestPreparationPool::new(committer_thread_count(), Arc::clone(&dedup_index));
+        let dedup_pins = Arc::new(PendingDedupPins::new());
+        let prep_pool = IngestPreparationPool::new(
+            committer_thread_count(),
+            Arc::clone(&dedup_index),
+            Arc::clone(&dedup_pins),
+        );
+        let published_generation = Arc::new(AtomicU64::new(slot.generation));
 
         let namespace = Namespace {
             inodes,
@@ -646,10 +673,12 @@ impl Pool {
             open_files: Mutex::new(HashMap::new()),
             ino_locks: Mutex::new(HashMap::new()),
             dedup_index: Arc::clone(&dedup_index),
+            dedup_pins: Arc::clone(&dedup_pins),
             persisted_index: RwLock::new(persisted_index),
             readers: Mutex::new(readers),
             meta_writer: Mutex::new(meta_writer),
             next_segment_id,
+            published_generation,
             committer_pool,
             prep_pool,
             shard_delta_logs,
@@ -657,6 +686,7 @@ impl Pool {
             coalesce: Mutex::new(coalesce::CoalesceDaemon::new(
                 pool_root.to_path_buf(),
                 Arc::clone(&dedup_index),
+                Arc::clone(&dedup_pins),
             )),
             dedup: Mutex::new(dedup::DedupScanner::new(
                 pool_root.to_path_buf(),
@@ -829,10 +859,17 @@ impl PoolShared {
     /// same thing, exposed publicly for tests to call synchronously
     /// instead of racing the background timer.
     fn run_gc_and_coalesce_pass(&self) -> Result<(), PoolError> {
-        let live_roots = vec![self.namespace.lock().root_hash];
-        self.coalesce
-            .lock()
-            .run_pass(&live_roots, &self.persisted_index, &self.next_segment_id)?;
+        let (live_roots, generation_at_mark) = {
+            let namespace = self.namespace.lock();
+            (vec![namespace.root_hash], namespace.generation)
+        };
+        self.coalesce.lock().run_pass(
+            &live_roots,
+            generation_at_mark,
+            &self.published_generation,
+            &self.persisted_index,
+            &self.next_segment_id,
+        )?;
         Ok(())
     }
 
@@ -1039,7 +1076,8 @@ impl PoolShared {
     /// create.
     pub fn debug_force_duplicate_chunk(&self, raw_bytes: &[u8]) -> Result<ExtentLocation, PoolError> {
         let throwaway = ChunkLocationCache::new();
-        let prepared = prepare_chunk(raw_bytes, &throwaway);
+        let throwaway_pins = PendingDedupPins::new();
+        let prepared = prepare_chunk(raw_bytes, &throwaway, &throwaway_pins);
         let PreparedChunk::New {
             content_hash,
             codec_id,
@@ -1676,6 +1714,13 @@ impl PoolShared {
                 .collect()
         };
 
+        // Every chunk hash that ends up in a freshly-written IndirectHashList
+        // this pass -- unpinned (see `PendingDedupPins`) once the root that
+        // captures them is published, below. Unconditional: a hash that was
+        // never actually pinned (an ordinary `New`-path chunk) makes `unpin`
+        // a no-op, so there's no need to track dedup-hit origin separately.
+        let mut checkpointed_chunk_hashes: Vec<Hash32> = Vec::new();
+
         // Applied immediately per-file rather than collected into a map to
         // apply later: for File inodes, `ino`'s lock is held from
         // `finalize_incremental_session` through the Namespace write-back
@@ -1777,6 +1822,7 @@ impl PoolShared {
                         let chunks = session_chunks
                             .or_else(|| file_state_snapshot.get(&w.ino).map(|s| s.chunks.clone()))
                             .unwrap_or_default();
+                        checkpointed_chunk_hashes.extend(chunks.iter().map(|c| c.content_hash));
                         let ihl = IndirectHashList { chunks };
                         let (hash, _loc) =
                             self.put_meta_object(ExtentKind::IndirectHashList, &ihl)?;
@@ -1864,6 +1910,22 @@ impl PoolShared {
             namespace.root_hash = root_hash;
             namespace.inodes.len() as u64
         };
+
+        // Bump `published_generation` *before* releasing any pin below --
+        // `CoalesceDaemon::repack_segment`'s final freshness check relies on
+        // this specific order (see its doc comment): as long as a repack
+        // pass observes `published_generation` unchanged from its own
+        // mark-time snapshot, it can conclude no hash was unpinned out from
+        // under it either, since unpinning never happens before this store.
+        self.published_generation.store(generation, Ordering::Release);
+
+        // Every chunk hash freshly captured by the root just published is
+        // now DAG-reachable in its own right -- release its pin (a no-op
+        // for hashes that were never pinned to begin with). See
+        // `PendingDedupPins`'s doc comment.
+        for hash in &checkpointed_chunk_hashes {
+            self.dedup_pins.unpin(*hash);
+        }
 
         let mut slot = SuperblockSlot {
             magic: SUPERBLOCK_MAGIC,

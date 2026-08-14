@@ -16,7 +16,7 @@ use crate::gc::GcEngine;
 use crate::segment::{self, SegmentReader, SegmentWriter};
 use crate::StreamKind;
 use lchfs_format::{ExtentLocation, Hash32};
-use lchfs_index::{ChunkLocationCache, IndexStore, RedbIndex};
+use lchfs_index::{ChunkLocationCache, IndexStore, PendingDedupPins, RedbIndex};
 use parking_lot::RwLock;
 use roaring::RoaringBitmap;
 use std::collections::HashMap;
@@ -35,8 +35,8 @@ pub struct CoalesceDaemon {
 }
 
 impl CoalesceDaemon {
-    pub fn new(pool_root: PathBuf, locations: Arc<ChunkLocationCache>) -> Self {
-        let gc = GcEngine::new(pool_root.clone(), locations);
+    pub fn new(pool_root: PathBuf, locations: Arc<ChunkLocationCache>, pins: Arc<PendingDedupPins>) -> Self {
+        let gc = GcEngine::new(pool_root.clone(), locations, pins);
         Self { pool_root, gc }
     }
 
@@ -47,9 +47,21 @@ impl CoalesceDaemon {
     /// are taken as parameters rather than owned fields: they're
     /// `Pool`-wide shared state this daemon needs momentary access to,
     /// not state that belongs to it.
+    ///
+    /// `generation_at_mark`/`published_generation` close the residual gap
+    /// `PendingDedupPins` alone can't (see `repack_segment`'s doc comment
+    /// on the final generation check): they let a repack notice that a
+    /// checkpoint published a new root *during* this pass, which can mean
+    /// this pass's `live` bitmap is stale in a way no longer covered by any
+    /// pin (the pin could have been taken *and released* entirely within
+    /// this pass's run). Plain shared counters, not a `Namespace` handle,
+    /// to keep this module decoupled from `Namespace` (ARCHITECTURE.md §5a
+    /// et al -- this daemon has never reached into `Namespace` directly).
     pub fn run_pass(
         &mut self,
         live_roots: &[Hash32],
+        generation_at_mark: u64,
+        published_generation: &AtomicU64,
         persisted_index: &RwLock<RedbIndex>,
         next_segment_id: &AtomicU64,
     ) -> io::Result<()> {
@@ -64,7 +76,14 @@ impl CoalesceDaemon {
         }
 
         for segment_id in self.gc.sweep_candidates(&live) {
-            self.repack_segment(segment_id, &live, persisted_index, next_segment_id)?;
+            self.repack_segment(
+                segment_id,
+                &live,
+                generation_at_mark,
+                published_generation,
+                persisted_index,
+                next_segment_id,
+            )?;
         }
         Ok(())
     }
@@ -73,6 +92,8 @@ impl CoalesceDaemon {
         &mut self,
         old_id: u64,
         live: &HashMap<u64, RoaringBitmap>,
+        generation_at_mark: u64,
+        published_generation: &AtomicU64,
         persisted_index: &RwLock<RedbIndex>,
         next_segment_id: &AtomicU64,
     ) -> io::Result<()> {
@@ -82,12 +103,16 @@ impl CoalesceDaemon {
 
         let empty = RoaringBitmap::new();
         let live_bitmap = live.get(&old_id).unwrap_or(&empty);
+        let pins = self.gc.pins();
 
         // Collect every live record's raw (still-compressed, if
         // applicable) bytes *before* creating anything -- a read failure
         // here aborts cleanly without having allocated a segment_id or
-        // touched anything durable.
+        // touched anything durable. `dropped` remembers just the header
+        // (cheap, no payload I/O) for everything the mark-time bitmap
+        // didn't cover, for the pin recheck right below.
         let mut live_records = Vec::new();
+        let mut dropped = Vec::new();
         let mut offset = segment::SEGMENT_HEADER_PAGE_SIZE as u32;
         while let Some((header, next_offset)) = reader.scan_next(offset) {
             if live_bitmap.contains(offset) {
@@ -98,13 +123,37 @@ impl CoalesceDaemon {
                 };
                 let (full_header, raw_payload) = reader.read_record_raw(loc).map_err(to_io_err)?;
                 live_records.push((full_header, raw_payload));
+            } else {
+                dropped.push((offset, header));
             }
             offset = next_offset;
         }
 
+        // Pull in anything currently pinned among what mark() missed: a
+        // dedup-hit write that resolved against this segment's content
+        // *after* mark() ran but hasn't been checkpointed yet (see
+        // `PendingDedupPins`'s doc comment). Not the final word either --
+        // the generation check right before this segment is actually
+        // deleted, below, covers what this recheck itself can still miss.
+        for &(offset, ref header) in &dropped {
+            if pins.is_pinned(header.content_hash) {
+                let loc = ExtentLocation {
+                    segment_id: old_id,
+                    offset,
+                    len: header.record_len,
+                };
+                let (full_header, raw_payload) = reader.read_record_raw(loc).map_err(to_io_err)?;
+                live_records.push((full_header, raw_payload));
+            }
+        }
+
         if live_records.is_empty() {
             // Fully dead segment: nothing to copy forward, no index
-            // update needed -- just tombstone + delete directly.
+            // update needed -- just tombstone + delete directly, gated on
+            // the same freshness check as the normal path below.
+            if published_generation.load(Ordering::Acquire) != generation_at_mark {
+                return Ok(());
+            }
             segment::mark_coalesced(&self.pool_root, old_id, StreamKind::Data)?;
             std::fs::remove_file(segment::segment_path(&self.pool_root, old_id, StreamKind::Data))?;
             return Ok(());
@@ -140,6 +189,20 @@ impl CoalesceDaemon {
         }
         for (hash, loc) in &relocations {
             self.gc_locations().put(*hash, *loc);
+        }
+
+        // Final freshness gate: if a checkpoint published a new root while
+        // this pass was running, this segment's `live` bitmap may now be
+        // stale in a way `PendingDedupPins` alone can't cover -- a pin can
+        // be taken *and* released (once its write is checkpointed) entirely
+        // within one repack's processing window. Bail without touching the
+        // old segment; the next pass marks fresh against the new root and
+        // repacks it correctly. Whatever was relocated above stays valid
+        // regardless -- content genuinely live at mark time stays
+        // referenceable forever, a generation bump never un-lives it -- so
+        // there's nothing to roll back.
+        if published_generation.load(Ordering::Acquire) != generation_at_mark {
+            return Ok(());
         }
 
         segment::mark_coalesced(&self.pool_root, old_id, StreamKind::Data)?;

@@ -259,7 +259,11 @@ fn gc_mark_succeeds_after_checkpoint_following_fsync_only_crash_recovery() {
     let index = lchfs_index::RedbIndex::open(&dir.path().join("INDEX.redb")).unwrap();
     let cache = lchfs_index::ChunkLocationCache::new();
     cache.extend(index.iter_chunk_locations().unwrap());
-    let mut gc = lchfs_store::gc::GcEngine::new(dir.path().to_path_buf(), std::sync::Arc::new(cache));
+    let mut gc = lchfs_store::gc::GcEngine::new(
+        dir.path().to_path_buf(),
+        std::sync::Arc::new(cache),
+        std::sync::Arc::new(lchfs_index::PendingDedupPins::new()),
+    );
     let live = gc.mark(&[root]);
     assert!(
         !live.is_empty(),

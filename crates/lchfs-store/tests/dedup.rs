@@ -114,7 +114,11 @@ fn loser_becomes_reclaimable_by_gc_after_convergence() {
     let cache = lchfs_index::ChunkLocationCache::new();
     cache.extend(index.iter_chunk_locations().unwrap());
     let locations = std::sync::Arc::new(cache);
-    let mut gc = lchfs_store::gc::GcEngine::new(dir.path().to_path_buf(), locations);
+    let mut gc = lchfs_store::gc::GcEngine::new(
+        dir.path().to_path_buf(),
+        locations,
+        std::sync::Arc::new(lchfs_index::PendingDedupPins::new()),
+    );
     let live = gc.mark(&[root]);
 
     let loser_marked_live = live

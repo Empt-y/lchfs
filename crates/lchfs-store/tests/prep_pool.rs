@@ -2,15 +2,19 @@
 //! against a fresh `ChunkLocationCache` — no `Pool`/segment I/O involved.
 
 use lchfs_format::{CodecId, ExtentLocation};
-use lchfs_index::ChunkLocationCache;
+use lchfs_index::{ChunkLocationCache, PendingDedupPins};
 use lchfs_store::prep::{prepare_chunk, IngestPreparationPool, PrepTask, PreparedChunk};
 use std::sync::Arc;
+
+fn no_pins() -> PendingDedupPins {
+    PendingDedupPins::new()
+}
 
 #[test]
 fn miss_produces_new_with_correct_hash() {
     let cache = ChunkLocationCache::new();
     let data = b"some file content that isn't deduped yet";
-    let prepared = prepare_chunk(data, &cache);
+    let prepared = prepare_chunk(data, &cache, &no_pins());
     match prepared {
         PreparedChunk::New {
             content_hash,
@@ -36,7 +40,7 @@ fn hit_short_circuits_to_existing_location() {
     };
     cache.put(hash, existing);
 
-    let prepared = prepare_chunk(data, &cache);
+    let prepared = prepare_chunk(data, &cache, &no_pins());
     match prepared {
         PreparedChunk::Dedup {
             content_hash,
@@ -47,6 +51,45 @@ fn hit_short_circuits_to_existing_location() {
         }
         PreparedChunk::New { .. } => panic!("expected a dedup hit"),
     }
+}
+
+#[test]
+fn hit_pins_the_hash_until_unpinned() {
+    // The whole point of the pin (see `PendingDedupPins`'s doc comment):
+    // a dedup hit means the caller is about to start depending on
+    // `location` before its own reference is checkpointed, so a
+    // concurrent GC/Coalesce pass must be able to see that dependency.
+    let cache = ChunkLocationCache::new();
+    let data = b"content a concurrent write dedups against";
+    let hash = lchfs_format::Hash32::of(data);
+    cache.put(
+        hash,
+        ExtentLocation {
+            segment_id: 1,
+            offset: 0,
+            len: 64,
+        },
+    );
+
+    let pins = PendingDedupPins::new();
+    assert!(!pins.is_pinned(hash));
+    let prepared = prepare_chunk(data, &cache, &pins);
+    assert!(matches!(prepared, PreparedChunk::Dedup { .. }));
+    assert!(pins.is_pinned(hash), "a dedup hit must pin its hash");
+
+    pins.unpin(hash);
+    assert!(!pins.is_pinned(hash));
+}
+
+#[test]
+fn miss_does_not_pin_anything() {
+    let cache = ChunkLocationCache::new();
+    let data = b"brand new content, never seen before";
+    let hash = lchfs_format::Hash32::of(data);
+    let pins = PendingDedupPins::new();
+    let prepared = prepare_chunk(data, &cache, &pins);
+    assert!(matches!(prepared, PreparedChunk::New { .. }));
+    assert!(!pins.is_pinned(hash));
 }
 
 #[test]
@@ -62,7 +105,7 @@ fn incompressible_random_bytes_store_raw() {
         data.push((x & 0xff) as u8);
     }
     let cache = ChunkLocationCache::new();
-    let prepared = prepare_chunk(&data, &cache);
+    let prepared = prepare_chunk(&data, &cache, &no_pins());
     match prepared {
         PreparedChunk::New { codec_id, .. } => assert_eq!(codec_id, CodecId::None),
         PreparedChunk::Dedup { .. } => panic!("fresh cache should never hit"),
@@ -73,7 +116,7 @@ fn incompressible_random_bytes_store_raw() {
 fn highly_compressible_bytes_get_compressed() {
     let data = vec![b'a'; 16384];
     let cache = ChunkLocationCache::new();
-    let prepared = prepare_chunk(&data, &cache);
+    let prepared = prepare_chunk(&data, &cache, &no_pins());
     match prepared {
         PreparedChunk::New {
             codec_id, payload, ..
@@ -88,7 +131,7 @@ fn highly_compressible_bytes_get_compressed() {
 #[test]
 fn pool_submit_runs_off_calling_thread_and_returns_correct_result() {
     let cache = Arc::new(ChunkLocationCache::new());
-    let pool = IngestPreparationPool::new(4, Arc::clone(&cache));
+    let pool = IngestPreparationPool::new(4, Arc::clone(&cache), Arc::new(PendingDedupPins::new()));
 
     let data = b"content prepared via the rayon pool, not the caller's thread";
     let task = PrepTask {
@@ -108,7 +151,11 @@ fn pool_submit_runs_off_calling_thread_and_returns_correct_result() {
 #[test]
 fn pool_concurrent_submits_from_many_threads() {
     let cache = Arc::new(ChunkLocationCache::new());
-    let pool = Arc::new(IngestPreparationPool::new(4, Arc::clone(&cache)));
+    let pool = Arc::new(IngestPreparationPool::new(
+        4,
+        Arc::clone(&cache),
+        Arc::new(PendingDedupPins::new()),
+    ));
 
     let handles: Vec<_> = (0..32u64)
         .map(|i| {

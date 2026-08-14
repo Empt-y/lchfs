@@ -5,10 +5,14 @@
 //! background thread, matching how it's used in coalesce.rs.
 
 use lchfs_format::{Hash32, PoolParams};
-use lchfs_index::{ChunkLocationCache, RedbIndex};
+use lchfs_index::{ChunkLocationCache, PendingDedupPins, RedbIndex};
 use lchfs_store::gc::GcEngine;
 use lchfs_store::Pool;
 use std::sync::Arc;
+
+fn no_pins() -> Arc<PendingDedupPins> {
+    Arc::new(PendingDedupPins::new())
+}
 
 fn small_params() -> PoolParams {
     PoolParams {
@@ -54,7 +58,7 @@ fn mark_covers_root_inomap_and_chunks() {
     let root = pool.debug_root_hash();
     drop(pool);
 
-    let mut gc = GcEngine::new(dir.path().to_path_buf(), load_locations(dir.path()));
+    let mut gc = GcEngine::new(dir.path().to_path_buf(), load_locations(dir.path()), no_pins());
     let live = gc.mark(&[root]);
 
     // At minimum: the meta segment (RootObject/InoMap/InodeObject/
@@ -99,7 +103,7 @@ fn shared_chunk_survives_when_only_one_referencing_root_is_live() {
     drop(pool);
 
     let locations = load_locations(dir.path());
-    let mut gc = GcEngine::new(dir.path().to_path_buf(), Arc::clone(&locations));
+    let mut gc = GcEngine::new(dir.path().to_path_buf(), Arc::clone(&locations), no_pins());
 
     // Marking from gen2 alone: the shared chunk stays live (via B, which
     // still references it in gen2), a_new + unique_to_gen1 live, but
@@ -137,7 +141,7 @@ fn snapshot_table_record_is_always_live() {
     let root = pool.debug_root_hash();
     drop(pool);
 
-    let mut gc = GcEngine::new(dir.path().to_path_buf(), load_locations(dir.path()));
+    let mut gc = GcEngine::new(dir.path().to_path_buf(), load_locations(dir.path()), no_pins());
     let live_from_root = gc.mark(&[root]);
     let total: u64 = live_from_root.values().map(|b| b.len()).sum();
     // Even an empty pool's checkpoint writes RootObject + InoMap +
@@ -155,7 +159,7 @@ fn mark_returns_empty_on_unresolvable_reference_rather_than_partial() {
 
     // A bogus root hash that resolves to nothing -- must fail the whole
     // pass cleanly (empty map), never a partial/misleading result.
-    let mut gc = GcEngine::new(dir.path().to_path_buf(), load_locations(dir.path()));
+    let mut gc = GcEngine::new(dir.path().to_path_buf(), load_locations(dir.path()), no_pins());
     let live = gc.mark(&[Hash32::of(b"not a real root")]);
     assert!(live.is_empty());
 }
@@ -192,7 +196,7 @@ fn sweep_candidates_flags_low_liveness_segment_but_not_a_fresh_pool() {
     drop(pool);
 
     let locations = load_locations(dir.path());
-    let mut gc = GcEngine::new(dir.path().to_path_buf(), Arc::clone(&locations));
+    let mut gc = GcEngine::new(dir.path().to_path_buf(), Arc::clone(&locations), no_pins());
     let live = gc.mark(&[root]);
     let candidates = gc.sweep_candidates(&live);
     assert!(
@@ -207,7 +211,7 @@ fn sweep_candidates_flags_low_liveness_segment_but_not_a_fresh_pool() {
     pool2.checkpoint().unwrap();
     let root2 = pool2.debug_root_hash();
     drop(pool2);
-    let mut gc2 = GcEngine::new(dir2.path().to_path_buf(), load_locations(dir2.path()));
+    let mut gc2 = GcEngine::new(dir2.path().to_path_buf(), load_locations(dir2.path()), no_pins());
     let live2 = gc2.mark(&[root2]);
     let candidates2 = gc2.sweep_candidates(&live2);
     assert!(candidates2.is_empty(), "a fresh pool with no overwrites should have no sweep candidates");
@@ -246,7 +250,7 @@ fn grace_window_protects_most_recently_sealed_segments() {
     drop(pool);
 
     let locations = load_locations(dir.path());
-    let mut gc = GcEngine::new(dir.path().to_path_buf(), locations);
+    let mut gc = GcEngine::new(dir.path().to_path_buf(), locations, no_pins());
     let live = gc.mark(&[root]);
     let candidates = gc.sweep_candidates(&live);
 

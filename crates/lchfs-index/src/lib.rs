@@ -12,7 +12,7 @@ use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinitio
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 use thiserror::Error;
 
 /// Abstraction over the persisted index backend. Phase 1 implementation is
@@ -300,5 +300,77 @@ impl ChunkLocationCache {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+/// Refcounted set of content hashes with an in-flight dedup-hit write that
+/// hasn't yet been captured by a published root.
+///
+/// GC's mark phase (lchfs-store's `gc.rs`/`dag_walk.rs`) only ever finds
+/// content live by walking the *current* root's DAG. A write that resolves
+/// against an existing physical location (a dedup hit: `prep.rs`'s
+/// `PreparedChunk::Dedup`) starts depending on that location immediately,
+/// but the InodeObject/IndirectHashList that will actually *reference* the
+/// hash isn't durable and DAG-reachable until the next checkpoint publishes
+/// a new root. In between, a concurrent Coalescing Daemon pass, walking the
+/// *old* root, would correctly see the hash as unreferenced and could
+/// reclaim its only physical copy out from under the in-flight write --
+/// silent, durable data loss with no crash or error involved.
+///
+/// This registry closes that gap: `prepare_chunk` pins a hash the instant
+/// it resolves a dedup hit; `Pool::run_checkpoint` unpins each hash actually
+/// captured by the root it just published, once that root is durable and
+/// visible (see that function for exactly where). `GcEngine`/`CoalesceDaemon`
+/// treat every currently-pinned hash's location as live, in addition to
+/// whatever the DAG walk itself finds.
+///
+/// Refcounted, not a plain set, because the same hash can be pinned by
+/// multiple concurrent dedup-hit writes (or the same write's multiple
+/// chunks) before any of them are checkpointed -- a hash stays protected
+/// until every pin on it has been released.
+#[derive(Default)]
+pub struct PendingDedupPins {
+    refcounts: Mutex<HashMap<Hash32, u32>>,
+}
+
+impl PendingDedupPins {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn pin(&self, hash: Hash32) {
+        let mut refcounts = self.refcounts.lock().expect("PendingDedupPins lock poisoned");
+        *refcounts.entry(hash).or_insert(0) += 1;
+    }
+
+    /// Safe no-op if `hash` isn't currently pinned -- callers unpin every
+    /// chunk hash referenced by a freshly-checkpointed file unconditionally,
+    /// including ones that were never a dedup hit to begin with.
+    pub fn unpin(&self, hash: Hash32) {
+        let mut refcounts = self.refcounts.lock().expect("PendingDedupPins lock poisoned");
+        if let std::collections::hash_map::Entry::Occupied(mut e) = refcounts.entry(hash) {
+            *e.get_mut() -= 1;
+            if *e.get() == 0 {
+                e.remove();
+            }
+        }
+    }
+
+    pub fn is_pinned(&self, hash: Hash32) -> bool {
+        self.refcounts
+            .lock()
+            .expect("PendingDedupPins lock poisoned")
+            .contains_key(&hash)
+    }
+
+    /// Every currently-pinned hash, for GC's mark phase to union into its
+    /// DAG-walk-derived live set.
+    pub fn snapshot(&self) -> Vec<Hash32> {
+        self.refcounts
+            .lock()
+            .expect("PendingDedupPins lock poisoned")
+            .keys()
+            .copied()
+            .collect()
     }
 }

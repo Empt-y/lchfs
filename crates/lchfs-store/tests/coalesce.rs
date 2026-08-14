@@ -141,6 +141,53 @@ fn coalesce_pass_on_a_fresh_pool_is_a_correct_no_op() {
 }
 
 #[test]
+fn dedup_hit_write_survives_a_coalesce_pass_before_its_own_checkpoint() {
+    // Regression test for the GC/Coalesce-vs-dedup race (see
+    // `PendingDedupPins`'s doc comment in lchfs-index): a write that
+    // resolves a dedup hit against an *already-dead-per-DAG* physical
+    // location, but hasn't been checkpointed yet, must not have that
+    // location reclaimed out from under it by a coalesce pass that runs
+    // in between.
+    let dir = tempfile::tempdir().unwrap();
+    let (pool, _survivors) = setup_low_liveness_pool(dir.path());
+
+    // File 0's *original* content is now dead per the current root (it was
+    // overwritten and checkpointed by `setup_low_liveness_pool`), but its
+    // bytes are still durably sitting in a sealed segment -- exactly the
+    // physical state a stale dedup-index entry can still point at.
+    let orphaned_content = deterministic_bytes(1, 3000);
+
+    // A brand-new file dedups against that orphaned content. This pins its
+    // hash (the fix) but is deliberately *not* checkpointed yet -- the
+    // in-flight window the original bug lost data in.
+    let ino_new = pool.create_file(1, "dedup-hit-before-checkpoint", 0o644).unwrap();
+    pool.write(ino_new, 0, &orphaned_content).unwrap();
+
+    // A coalesce pass now runs against the *old* root (doesn't know about
+    // `ino_new` yet). Pre-fix, this could delete the only physical copy of
+    // `orphaned_content` since nothing in the old root's DAG referenced it.
+    pool.run_gc_and_coalesce_pass().unwrap();
+
+    // Only now does `ino_new`'s reference become durable and DAG-reachable.
+    pool.checkpoint().unwrap();
+
+    // Force resolution through the persisted index and on-disk segments
+    // alone -- `Pool::read` would otherwise happily serve this from
+    // `file_state`'s in-memory cache (populated at `write()` time),
+    // masking the very question this test exists to answer: does the
+    // *physical* copy still exist on disk?
+    drop(pool);
+    let pool = Pool::open(dir.path()).unwrap();
+
+    let read_back = pool.read(ino_new, 0, orphaned_content.len() as u32).unwrap();
+    assert_eq!(
+        read_back.as_ref(),
+        orphaned_content.as_slice(),
+        "a dedup-hit write must survive a coalesce pass that races its own checkpoint"
+    );
+}
+
+#[test]
 fn repeated_coalesce_passes_are_idempotent() {
     let dir = tempfile::tempdir().unwrap();
     let (pool, survivors) = setup_low_liveness_pool(dir.path());

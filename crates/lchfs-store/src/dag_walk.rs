@@ -23,7 +23,10 @@ use roaring::RoaringBitmap;
 use std::collections::HashMap;
 use std::path::Path;
 
-fn mark_location(loc: ExtentLocation, live: &mut HashMap<u64, RoaringBitmap>) {
+/// Marks `loc`'s byte range live in `live`'s per-segment bitmap. Exposed to
+/// `gc.rs` so it can mark a pinned hash's current location live the same
+/// way a DAG-reachable one is marked (see `PendingDedupPins`).
+pub(crate) fn mark_location(loc: ExtentLocation, live: &mut HashMap<u64, RoaringBitmap>) {
     live.entry(loc.segment_id)
         .or_default()
         .insert_range(loc.offset..(loc.offset + loc.len));
