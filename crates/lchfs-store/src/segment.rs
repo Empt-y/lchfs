@@ -172,7 +172,7 @@ impl SegmentWriter {
             .write(true)
             .create(true)
             .truncate(true)
-            .open(&path)?;
+            .open(path)?;
 
         let mut header = SegmentHeader {
             magic: SEGMENT_HEADER_MAGIC,

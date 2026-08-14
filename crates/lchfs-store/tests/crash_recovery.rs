@@ -187,7 +187,7 @@ fn reopening_a_cleanly_checkpointed_pool_needs_no_replay_work() {
 fn torn_delta_record_from_simulated_mid_fsync_crash_recovers_to_prior_state() {
     let params = small_params();
     let dir = tempfile::tempdir().unwrap();
-    let pool = Pool::create(dir.path(), params.clone()).unwrap();
+    let pool = Pool::create(dir.path(), params).unwrap();
     let ino = pool.create_file(1, "f", 0o644).unwrap();
     let shard_id = shard_for_inode(ino, params.logical_shard_count);
 

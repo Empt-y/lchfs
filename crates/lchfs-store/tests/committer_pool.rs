@@ -106,7 +106,7 @@ fn concurrent_producers_to_different_inodes_all_complete() {
                 }
                 for (payload, rx) in receivers {
                     let loc = rx.recv().unwrap().unwrap();
-                    assert_eq!(loc.len as usize > 0, true);
+                    assert!(loc.len as usize > 0);
                     let _ = payload;
                 }
             })

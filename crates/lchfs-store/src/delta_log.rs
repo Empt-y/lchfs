@@ -186,6 +186,7 @@ impl ShardDeltaLog {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&path)?;
         let mut buf = vec![0u8; SHARD_SUPERBLOCK_FILE_SIZE as usize];
         buf[0..4].copy_from_slice(&(encoded.len() as u32).to_le_bytes());
@@ -255,10 +256,10 @@ impl ShardDeltaLog {
                     len: header.record_len,
                 };
                 if header.kind == ExtentKind::DeltaLogEntry {
-                    if let Ok((_h, bytes)) = reader.read_record(loc) {
-                        if let Ok(entry) = lchfs_format::decode::<DeltaLogEntry>(&bytes) {
-                            entries.push(entry);
-                        }
+                    if let Ok((_h, bytes)) = reader.read_record(loc)
+                        && let Ok(entry) = lchfs_format::decode::<DeltaLogEntry>(&bytes)
+                    {
+                        entries.push(entry);
                     }
                 } else {
                     locations.push((header.content_hash, loc));
