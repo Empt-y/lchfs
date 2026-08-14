@@ -5,7 +5,8 @@
 //! an attacker/bug-controlled huge offset or size could attempt an
 //! unbounded in-memory allocation.
 
-use lchfs_format::PoolParams;
+use lchfs_format::{CodecId, ExtentKind, ExtentRecordHeader, Hash32, PoolParams, finalize_header_checksum};
+use lchfs_store::segment::parse_record_header;
 use lchfs_store::{Pool, PoolError};
 use std::io::{Seek, SeekFrom, Write};
 
@@ -55,6 +56,56 @@ fn corrupted_header_len_prefix_is_an_error_not_a_panic() {
         Ok(Ok(_)) => panic!("corrupted header_len prefix should not read back as success"),
         Err(_) => panic!("corrupted header_len prefix must not panic the reading thread"),
     }
+}
+
+/// Direct unit-level coverage of `parse_record_header` -- the standalone
+/// "Extent Record header parser" ARCHITECTURE.md §10 calls out for
+/// fuzzing (see `fuzz/fuzz_targets/extent_header.rs`). These pin down its
+/// never-panic contract against specific hand-picked adversarial inputs
+/// as fast, deterministic regression tests; the fuzz target explores the
+/// same contract far more broadly.
+#[test]
+fn parse_record_header_rejects_malformed_input_without_panicking() {
+    let cases: &[&[u8]] = &[
+        &[],
+        &[0, 0],
+        &[0, 0, 0, 0],           // header_len == 0
+        &[0xff, 0xff, 0xff, 0xff], // header_len == u32::MAX, far beyond the buffer
+        &[1, 0, 0, 0, 0xaa],     // header_len == 1, but garbage bincode content
+        &[4, 0, 0, 0],           // header_len == 4, but buffer ends right there
+    ];
+    for bytes in cases {
+        let result = std::panic::catch_unwind(|| parse_record_header(bytes));
+        assert!(result.is_ok(), "parse_record_header panicked on {bytes:?}");
+        assert!(result.unwrap().is_none(), "expected rejection for {bytes:?}");
+    }
+}
+
+#[test]
+fn parse_record_header_accepts_a_well_formed_header() {
+    let mut header = ExtentRecordHeader {
+        magic: lchfs_format::EXTENT_RECORD_MAGIC,
+        record_len: 0, // patched below, doesn't affect this function
+        content_hash: Hash32::of(b"hello"),
+        kind: ExtentKind::RawChunk,
+        codec_id: CodecId::None,
+        flags: 0,
+        uncompressed_len: 5,
+        compressed_len: 5,
+        backpointers: Vec::new(),
+        header_checksum: 0,
+    };
+    finalize_header_checksum(&mut header);
+    let encoded = lchfs_format::encode(&header).unwrap();
+
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&encoded);
+    buf.extend_from_slice(b"hello"); // trailing payload, ignored by this function
+
+    let (parsed, consumed) = parse_record_header(&buf).expect("well-formed header must parse");
+    assert_eq!(parsed.content_hash, header.content_hash);
+    assert_eq!(consumed, 4 + encoded.len());
 }
 
 #[test]

@@ -1,0 +1,26 @@
+[package]
+name = "lchfs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+# Deliberately its own workspace, not a member of the parent one -- cargo-fuzz's
+# standard pattern: fuzz targets pull in nightly-only sanitizer instrumentation
+# flags that the main crates must never be built with.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.lchfs-store]
+path = "../crates/lchfs-store"
+
+[[bin]]
+name = "extent_header"
+path = "fuzz_targets/extent_header.rs"
+test = false
+doc = false
+bench = false

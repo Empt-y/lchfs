@@ -25,6 +25,54 @@ use std::path::{Path, PathBuf};
 /// encoded size is far smaller, the rest of the page is zero-padded.
 pub const SEGMENT_HEADER_PAGE_SIZE: u64 = 4096;
 
+/// Sanity cap on `header_len` itself, checked *before* the length-prefixed
+/// `bincode` decode below ever runs -- an attacker/corruption-controlled
+/// `header_len` must never be allowed to drive an unbounded allocation on
+/// its own, independent of whatever the decode step's own behavior is.
+/// `ExtentRecordHeader`'s only unbounded field is `backpointers: Vec<Hash32>`
+/// (32 bytes each); 16MiB is already far beyond any header this codebase
+/// ever legitimately writes.
+const MAX_HEADER_LEN: usize = 16 * 1024 * 1024;
+
+/// Parses the `[u32 LE header_len][bincode(ExtentRecordHeader)]` prefix
+/// shared by every Extent Record's framing, from a buffer that starts
+/// exactly at that prefix. Validates magic and header checksum; does
+/// *not* validate `record_len` against any caller-known total buffer size
+/// (`read_raw`/`scan_next` differ on how much of the full record they
+/// have available when they call this, so that check stays with them).
+///
+/// This is the "Extent Record header parser" ARCHITECTURE.md §10 calls
+/// out for fuzzing: `bytes` may be arbitrary/adversarial/truncated in any
+/// way, and this must never panic, only return `None`. Extracted here
+/// (previously inlined, near-identically, in both `read_raw` and
+/// `scan_next`) specifically so it's a small, pure, directly fuzzable
+/// function (see `fuzz/fuzz_targets/extent_header.rs`) rather than only
+/// reachable through real file I/O.
+///
+/// Returns the decoded header and how many bytes it consumed (`4 +
+/// header_len`) on success.
+pub fn parse_record_header(bytes: &[u8]) -> Option<(ExtentRecordHeader, usize)> {
+    if bytes.len() < 4 {
+        return None;
+    }
+    let header_len = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+    if header_len == 0 || header_len > MAX_HEADER_LEN {
+        return None;
+    }
+    let consumed = 4 + header_len;
+    if consumed > bytes.len() {
+        return None;
+    }
+    let header: ExtentRecordHeader = lchfs_format::decode(&bytes[4..consumed]).ok()?;
+    if header.magic != EXTENT_RECORD_MAGIC {
+        return None;
+    }
+    if lchfs_format::compute_header_checksum(&header) != header.header_checksum {
+        return None;
+    }
+    Some((header, consumed))
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SegmentError {
     #[error("I/O error: {0}")]
@@ -360,22 +408,18 @@ impl SegmentReader {
         self.file
             .read_exact_at(&mut record_bytes, loc.offset as u64)?;
 
-        if record_bytes.len() < 4 {
-            return Err(SegmentError::Io(io::Error::new(
+        let (header, consumed) = parse_record_header(&record_bytes).ok_or_else(|| {
+            SegmentError::Io(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "corrupted record: shorter than the length prefix itself",
-            )));
-        }
-        let header_len = u32::from_le_bytes(record_bytes[0..4].try_into().unwrap()) as usize;
-        if 4 + header_len > record_bytes.len() {
-            return Err(SegmentError::Io(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "corrupted record: header_len prefix out of bounds",
-            )));
-        }
-        let header: ExtentRecordHeader = lchfs_format::decode(&record_bytes[4..4 + header_len])
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                "corrupted record: malformed header framing",
+            ))
+        })?;
 
+        // `parse_record_header` already checked magic + header checksum;
+        // `validate_header` re-checks those (cheap, harmless) plus the one
+        // thing it alone can: `record_len` against this specific buffer's
+        // actual length, which `parse_record_header` deliberately leaves
+        // to the caller (see its doc comment).
         validate_header(&header, &record_bytes)?;
 
         let payload_len = if header.codec_id == CodecId::None {
@@ -383,7 +427,7 @@ impl SegmentReader {
         } else {
             header.compressed_len as usize
         };
-        let payload_start = 4 + header_len;
+        let payload_start = consumed;
         let payload_end = payload_start
             .checked_add(payload_len)
             .filter(|&end| end <= record_bytes.len())
@@ -482,23 +526,20 @@ impl SegmentReader {
     /// record after it from the rebuilt index — the opposite of what
     /// mount-time recovery is supposed to do.
     pub fn scan_next(&self, offset: u32) -> Option<(ExtentRecordHeader, u32)> {
+        // Peek just the length prefix first, sanity-capped, before sizing
+        // the second read that actually covers the header -- an
+        // attacker/corruption-controlled `header_len` must never drive an
+        // oversized read (or, via `parse_record_header`, an oversized
+        // decode allocation) before anything has validated it.
         let mut len_buf = [0u8; 4];
         self.file.read_exact_at(&mut len_buf, offset as u64).ok()?;
-        let header_len = u32::from_le_bytes(len_buf);
-        if header_len == 0 || header_len > 16 * 1024 * 1024 {
+        let header_len = u32::from_le_bytes(len_buf) as usize;
+        if header_len == 0 || header_len > MAX_HEADER_LEN {
             return None;
         }
-        let mut header_buf = vec![0u8; header_len as usize];
-        self.file
-            .read_exact_at(&mut header_buf, offset as u64 + 4)
-            .ok()?;
-        let header: ExtentRecordHeader = lchfs_format::decode(&header_buf).ok()?;
-        if header.magic != EXTENT_RECORD_MAGIC {
-            return None;
-        }
-        if lchfs_format::compute_header_checksum(&header) != header.header_checksum {
-            return None;
-        }
+        let mut buf = vec![0u8; 4 + header_len];
+        self.file.read_exact_at(&mut buf, offset as u64).ok()?;
+        let (header, _consumed) = parse_record_header(&buf)?;
         if header.record_len == 0 || header.record_len > 512 * 1024 * 1024 {
             return None;
         }
