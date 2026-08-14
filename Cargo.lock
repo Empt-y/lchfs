@@ -489,6 +489,8 @@ dependencies = [
  "lchfs-format",
  "lchfs-index",
  "lchfs-store",
+ "serde",
+ "tempfile",
  "thiserror",
 ]
 

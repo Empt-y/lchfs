@@ -11,3 +11,7 @@ lchfs-index = { workspace = true }
 lchfs-format = { workspace = true }
 lchfs-crypto = { workspace = true }
 thiserror = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

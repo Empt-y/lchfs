@@ -79,9 +79,35 @@ fn mount(pool: &std::path::Path, mountpoint: &std::path::Path) -> anyhow::Result
     Ok(())
 }
 
-fn fsck(_pool: &std::path::Path, _verify_index: bool, _rebuild_index: bool) -> anyhow::Result<()> {
-    // TODO(phase-F): open Pool read-only, collect live roots, call lchfs_fsck::check
-    todo!("lchfs-cli: fsck")
+fn fsck(pool: &std::path::Path, verify_index: bool, rebuild_index: bool) -> anyhow::Result<()> {
+    // No `Pool::open` here: fsck deliberately reads the pool directory
+    // directly (see lchfs-fsck's module doc comment) rather than going
+    // through the live engine -- opening a `Pool` would also run mount-
+    // time crash recovery and spawn its background checkpoint/coalesce/
+    // dedup threads, neither of which this one-shot diagnostic needs.
+    if rebuild_index {
+        lchfs_fsck::rebuild_index(pool)?;
+        println!("INDEX.redb rebuilt.");
+    }
+
+    let live_roots = lchfs_fsck::collect_live_roots(pool)?;
+    let report = if verify_index {
+        lchfs_fsck::verify_index(pool, &live_roots)
+    } else {
+        lchfs_fsck::check(pool, &live_roots)
+    };
+
+    println!("Objects visited: {}", report.objects_visited);
+    if report.is_clean() {
+        println!("No errors found.");
+        Ok(())
+    } else {
+        eprintln!("{} error(s) found:", report.errors.len());
+        for e in &report.errors {
+            eprintln!("  - {e}");
+        }
+        anyhow::bail!("fsck found {} error(s)", report.errors.len());
+    }
 }
 
 fn snapshot(_action: SnapshotAction) -> anyhow::Result<()> {
@@ -89,7 +115,32 @@ fn snapshot(_action: SnapshotAction) -> anyhow::Result<()> {
     todo!("lchfs-cli: snapshot")
 }
 
-fn stats(_pool: &std::path::Path) -> anyhow::Result<()> {
-    // TODO(phase-G): read denormalized SuperblockStats + live index/segment info
-    todo!("lchfs-cli: stats")
+fn stats(pool: &std::path::Path) -> anyhow::Result<()> {
+    use lchfs_index::IndexStore;
+
+    let slot = lchfs_fsck::read_superblock(pool)?;
+    println!("generation: {}", slot.generation);
+    println!("root_hash: {:?}", slot.root_hash);
+    // SuperblockStats is denormalized/informational only (never used for
+    // correctness decisions -- see lchfs-format's own doc comment on it),
+    // so these three are only as fresh as the last checkpoint.
+    println!("live_bytes (denormalized, as of last checkpoint): {}", slot.stats.live_bytes);
+    println!("object_count (denormalized, as of last checkpoint): {}", slot.stats.object_count);
+    println!("segment_count (denormalized, as of last checkpoint): {}", slot.stats.segment_count);
+
+    let count_segments = |sub: &str| {
+        std::fs::read_dir(pool.join("segments").join(sub))
+            .map(|d| d.count())
+            .unwrap_or(0)
+    };
+    println!("data segments on disk: {}", count_segments("data"));
+    println!("meta segments on disk: {}", count_segments("meta"));
+
+    if let Ok(index) = lchfs_index::RedbIndex::open(&pool.join("INDEX.redb")) {
+        let entries = index.iter_chunk_locations().map(|v| v.len()).unwrap_or(0);
+        println!("index entries: {entries}");
+        println!("index generation: {}", index.generation());
+    }
+
+    Ok(())
 }
