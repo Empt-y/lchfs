@@ -3,13 +3,13 @@
 //! of its own -- every operation should be a direct translation of a FUSE
 //! callback into a `Pool` method call.
 //!
-//! ARCHITECTURE.md §9 lists the Phase 1 POSIX/FUSE surface. Phase D's
-//! milestone (ARCHITECTURE.md §12) is real `cp`/`ls`/`cat` working against
-//! the still-single-threaded Phase B store, so only the subset `Pool`
-//! actually implements is wired up here: lookup, getattr, opendir/readdir,
-//! open/read/write/release, create, mkdir, flush/fsync. unlink, rmdir,
-//! rename, symlink, readlink, link, setattr, statfs stay ENOSYS (fuser's
-//! default) until `Pool` grows those operations.
+//! ARCHITECTURE.md §9 lists the Phase 1 POSIX/FUSE surface. `Pool` now
+//! implements the full list: lookup, getattr, setattr (size only),
+//! opendir/readdir, open/read/write/release, create, mkdir, flush/fsync,
+//! unlink, rmdir, rename, symlink, readlink, link, statfs. `RENAME_EXCHANGE`
+//! (atomic two-way swap) isn't implemented -- rejected with `EINVAL` rather
+//! than silently misbehaving; xattrs/flock/ioctl/fallocate stay deferred
+//! per ARCHITECTURE.md §9's explicit Phase 2+ list.
 
 pub mod handles;
 pub mod inodes;
@@ -19,7 +19,8 @@ pub use inodes::InodeAllocator;
 
 use fuser::{
     Errno, FileAttr, FileType, Filesystem, Generation, INodeNo, ReplyAttr, ReplyCreate,
-    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
+    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite,
+    Request,
 };
 use lchfs_format::{InodeKind, InodeObject};
 use lchfs_store::{Pool, PoolError};
@@ -67,6 +68,10 @@ fn errno_for(err: &PoolError) -> Errno {
         PoolError::Io(_) | PoolError::Format(_) | PoolError::IntegrityFailure(_) => Errno::EIO,
         PoolError::Index(_) => Errno::EIO,
         PoolError::TooLarge(_) => Errno::EFBIG,
+        PoolError::IsADirectory(_) => Errno::EISDIR,
+        PoolError::NotEmpty(_) => Errno::ENOTEMPTY,
+        PoolError::NotASymlink(_) => Errno::EINVAL,
+        PoolError::InvalidArgument(_) => Errno::EINVAL,
     }
 }
 
@@ -329,6 +334,116 @@ impl Filesystem for LchfsFilesystem {
         };
         match self.pool.mkdir(parent.0, name, mode) {
             Ok(ino) => self.entry_reply(ino, reply),
+            Err(e) => reply.error(errno_for(&e)),
+        }
+    }
+
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let Some(name) = name.to_str() else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        match self.pool.unlink(parent.0, name) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(errno_for(&e)),
+        }
+    }
+
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let Some(name) = name.to_str() else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        match self.pool.rmdir(parent.0, name) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(errno_for(&e)),
+        }
+    }
+
+    fn symlink(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        link_name: &OsStr,
+        target: &std::path::Path,
+        reply: ReplyEntry,
+    ) {
+        let (Some(link_name), Some(target)) = (link_name.to_str(), target.to_str()) else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        match self.pool.symlink(parent.0, link_name, target) {
+            Ok(ino) => self.entry_reply(ino, reply),
+            Err(e) => reply.error(errno_for(&e)),
+        }
+    }
+
+    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+        match self.pool.readlink(ino.0) {
+            Ok(target) => reply.data(target.as_bytes()),
+            Err(e) => reply.error(errno_for(&e)),
+        }
+    }
+
+    fn link(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        newparent: INodeNo,
+        newname: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        let Some(newname) = newname.to_str() else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        match self.pool.link(ino.0, newparent.0, newname) {
+            Ok(()) => self.entry_reply(ino.0, reply),
+            Err(e) => reply.error(errno_for(&e)),
+        }
+    }
+
+    fn rename(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        newparent: INodeNo,
+        newname: &OsStr,
+        flags: fuser::RenameFlags,
+        reply: ReplyEmpty,
+    ) {
+        let (Some(name), Some(newname)) = (name.to_str(), newname.to_str()) else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        // `RENAME_EXCHANGE` (atomic two-way swap) isn't implemented -- an
+        // ordinary replace-rename would silently do the wrong thing (drop
+        // the destination instead of swapping), so this must be rejected
+        // rather than approximated.
+        if flags.contains(fuser::RenameFlags::RENAME_EXCHANGE) {
+            reply.error(Errno::EINVAL);
+            return;
+        }
+        let no_replace = flags.contains(fuser::RenameFlags::RENAME_NOREPLACE);
+        match self.pool.rename(parent.0, name, newparent.0, newname, no_replace) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(errno_for(&e)),
+        }
+    }
+
+    fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
+        match self.pool.statfs() {
+            Ok(stats) => reply.statfs(
+                stats.blocks_total,
+                stats.blocks_free,
+                stats.blocks_available,
+                stats.files_total,
+                stats.files_free,
+                stats.block_size,
+                stats.name_max,
+                stats.fragment_size,
+            ),
             Err(e) => reply.error(errno_for(&e)),
         }
     }

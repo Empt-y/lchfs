@@ -530,6 +530,7 @@ dependencies = [
  "lchfs-crypto",
  "lchfs-format",
  "lchfs-index",
+ "nix",
  "parking_lot",
  "rayon",
  "roaring",

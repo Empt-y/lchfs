@@ -85,6 +85,28 @@ pub enum PoolError {
     Index(#[from] IndexError),
     #[error("requested file size {0} exceeds the maximum ({MAX_FILE_SIZE})")]
     TooLarge(u64),
+    #[error("is a directory: {0}")]
+    IsADirectory(u64),
+    #[error("directory not empty: {0}")]
+    NotEmpty(u64),
+    #[error("not a symlink: {0}")]
+    NotASymlink(u64),
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
+}
+
+/// Filesystem-wide usage stats for `statfs` (ARCHITECTURE.md §9). See
+/// `PoolShared::statfs`'s doc comment for how each field is derived.
+#[derive(Debug, Clone, Copy)]
+pub struct PoolStats {
+    pub block_size: u32,
+    pub fragment_size: u32,
+    pub blocks_total: u64,
+    pub blocks_free: u64,
+    pub blocks_available: u64,
+    pub files_total: u64,
+    pub files_free: u64,
+    pub name_max: u32,
 }
 
 /// Hard cap on file size while `write()`'s fallback path and `set_size()`
@@ -754,11 +776,67 @@ impl Pool {
     }
 
     pub fn mkdir(&self, parent_ino: u64, name: &str, mode: u32) -> Result<u64, PoolError> {
-        self.0.create_entry(parent_ino, name, mode, InodeKind::Directory)
+        self.0.create_entry(parent_ino, name, mode, InodeKind::Directory, None)
     }
 
     pub fn create_file(&self, parent_ino: u64, name: &str, mode: u32) -> Result<u64, PoolError> {
-        self.0.create_entry(parent_ino, name, mode, InodeKind::File)
+        self.0.create_entry(parent_ino, name, mode, InodeKind::File, None)
+    }
+
+    /// Creates a symlink at `parent_ino`/`name` pointing at `target`.
+    /// Symlink permissions are conventionally ignored by the kernel and
+    /// FUSE's own `symlink` callback doesn't pass a mode, so this always
+    /// creates with `0o777`.
+    pub fn symlink(&self, parent_ino: u64, name: &str, target: &str) -> Result<u64, PoolError> {
+        self.0
+            .create_entry(parent_ino, name, 0o777, InodeKind::Symlink, Some(target))
+    }
+
+    /// The target string of a symlink inode.
+    pub fn readlink(&self, ino: u64) -> Result<String, PoolError> {
+        let namespace = self.0.namespace.lock();
+        let inode = namespace.inodes.get(&ino).ok_or(PoolError::NoSuchInode(ino))?;
+        match &inode.content {
+            ContentRef::SymlinkTarget(target) => Ok(target.clone()),
+            _ => Err(PoolError::NotASymlink(ino)),
+        }
+    }
+
+    /// Removes a non-directory `DirEntry`. `ENOTDIR`-equivalent
+    /// (`PoolError::NotADirectory`) if `parent_ino` isn't a directory,
+    /// `PoolError::IsADirectory` if `name` is one (use `rmdir`).
+    pub fn unlink(&self, parent_ino: u64, name: &str) -> Result<(), PoolError> {
+        self.0.unlink(parent_ino, name)
+    }
+
+    /// Removes an empty directory's `DirEntry`. `PoolError::NotEmpty` if
+    /// it has any children.
+    pub fn rmdir(&self, parent_ino: u64, name: &str) -> Result<(), PoolError> {
+        self.0.rmdir(parent_ino, name)
+    }
+
+    /// `link` (hardlink): a second `DirEntry` for `ino`, no data I/O.
+    pub fn link(&self, ino: u64, new_parent_ino: u64, new_name: &str) -> Result<(), PoolError> {
+        self.0.link(ino, new_parent_ino, new_name)
+    }
+
+    /// `rename`, same-directory or cross-directory. `no_replace` rejects
+    /// (rather than atomically replacing) an existing destination --
+    /// FUSE's `RENAME_NOREPLACE`.
+    pub fn rename(
+        &self,
+        parent_ino: u64,
+        name: &str,
+        new_parent_ino: u64,
+        new_name: &str,
+        no_replace: bool,
+    ) -> Result<(), PoolError> {
+        self.0.rename(parent_ino, name, new_parent_ino, new_name, no_replace)
+    }
+
+    /// Filesystem-wide usage stats (`statfs`).
+    pub fn statfs(&self) -> Result<PoolStats, PoolError> {
+        self.0.statfs()
     }
 
     /// The fast per-shard fsync path (ARCHITECTURE.md §3, "Subtree
@@ -1307,7 +1385,18 @@ impl PoolShared {
 
         let (now_secs, now_nanos) = now_unix();
         let mut namespace = self.namespace.lock();
-        let inode = namespace.inodes.get_mut(&ino).unwrap();
+        // Not `.unwrap()`: `write()`'s own existence check happens before
+        // `ino_lock` is acquired (see its doc comment), so a concurrent
+        // `unlink`/`rmdir` that drops this ino to nlink 0 in that window
+        // can reach here with it already gone. A clean error is the right
+        // outcome for "wrote to a file that got deleted out from under
+        // you" -- this engine doesn't implement POSIX unlink-while-open
+        // semantics (content stays readable via existing handles until
+        // release), so there's no more graceful answer available yet.
+        let inode = namespace
+            .inodes
+            .get_mut(&ino)
+            .ok_or(PoolError::NoSuchInode(ino))?;
         inode.size = new_size;
         inode.mtime = (now_secs, now_nanos);
         inode.ctime = (now_secs, now_nanos);
@@ -1482,7 +1571,11 @@ impl PoolShared {
 
         let (now_secs, now_nanos) = now_unix();
         let mut namespace = self.namespace.lock();
-        let inode = namespace.inodes.get_mut(&ino).unwrap();
+        // Not `.unwrap()` -- see the matching comment in `write_incremental`.
+        let inode = namespace
+            .inodes
+            .get_mut(&ino)
+            .ok_or(PoolError::NoSuchInode(ino))?;
         inode.size = new_size;
         inode.mtime = (now_secs, now_nanos);
         inode.ctime = (now_secs, now_nanos);
@@ -1505,6 +1598,7 @@ impl PoolShared {
         name: &str,
         mode: u32,
         kind: InodeKind,
+        symlink_target: Option<&str>,
     ) -> Result<u64, PoolError> {
         let mut namespace = self.namespace.lock();
         if !namespace.dirs.contains_key(&parent_ino) {
@@ -1525,10 +1619,14 @@ impl PoolShared {
         namespace.next_ino += 1;
 
         let (now_secs, now_nanos) = now_unix();
-        let (content, nlink) = match kind {
-            InodeKind::Directory => (ContentRef::DirEntries(Hash32([0; 32])), 2),
-            InodeKind::File => (ContentRef::Inline(Vec::new()), 1),
-            InodeKind::Symlink => (ContentRef::SymlinkTarget(String::new()), 1),
+        let (content, nlink, size) = match kind {
+            InodeKind::Directory => (ContentRef::DirEntries(Hash32([0; 32])), 2, 0),
+            InodeKind::File => (ContentRef::Inline(Vec::new()), 1, 0),
+            InodeKind::Symlink => {
+                let target = symlink_target.unwrap_or_default().to_string();
+                let size = target.len() as u64;
+                (ContentRef::SymlinkTarget(target), 1, size)
+            }
         };
         namespace.inodes.insert(
             ino,
@@ -1537,7 +1635,7 @@ impl PoolShared {
                 mode,
                 uid: 0,
                 gid: 0,
-                size: 0,
+                size,
                 nlink,
                 atime: (now_secs, now_nanos),
                 mtime: (now_secs, now_nanos),
@@ -1563,6 +1661,318 @@ impl PoolShared {
         namespace.dirty_inodes.insert(parent_ino);
         namespace.dirty_inodes.insert(ino);
         Ok(ino)
+    }
+
+    /// Decrements `ino`'s `nlink`; if it reaches 0, removes it from the
+    /// namespace entirely (`inodes`/`parents`/`dirty_inodes` -- `dirs` too,
+    /// though only directories are ever present there) so the next
+    /// checkpoint's InoMap no longer includes it. From that point on,
+    /// ordinary GC (ARCHITECTURE.md §6) reclaims its content once nothing
+    /// else references it -- every DAG reference is by content hash, so a
+    /// deleted inode's own InodeObject/IndirectHashList records simply stop
+    /// being walked, no special-casing needed.
+    ///
+    /// For files only -- `unlink`/`rename`'s overwrite path use this;
+    /// directories are always fully removed directly by their callers
+    /// (`rmdir`, and rename's directory-overwrite branch) rather than going
+    /// through refcounting, since a directory can only ever have exactly
+    /// one referencing DirEntry in this tree (no hardlinked directories).
+    ///
+    /// Deliberately does *not* purge any `file_state`/`open_files` entry
+    /// for `ino` (mirroring `ino_locks`'s own "lazily populated, never
+    /// pruned" simplification, see its doc comment) -- an in-flight
+    /// reader/writer that already hydrated this ino's working state keeps
+    /// working against it exactly as before. This engine doesn't implement
+    /// full POSIX unlink-while-open semantics (content stays readable via
+    /// existing handles until `release()`); leaving the cache alone is what
+    /// makes that partial behavior work at all, rather than failing
+    /// in-flight operations immediately.
+    fn release_inode_ref(&self, namespace: &mut Namespace, ino: u64) {
+        let Some(inode) = namespace.inodes.get_mut(&ino) else {
+            return;
+        };
+        inode.nlink = inode.nlink.saturating_sub(1);
+        if inode.nlink > 0 {
+            namespace.dirty_inodes.insert(ino);
+            return;
+        }
+        namespace.inodes.remove(&ino);
+        namespace.dirs.remove(&ino);
+        namespace.parents.remove(&ino);
+        namespace.dirty_inodes.remove(&ino);
+    }
+
+    /// Fully removes a directory inode -- always unconditional, never
+    /// refcounted (see `release_inode_ref`'s doc comment for why). Callers
+    /// (`rmdir`, rename's directory-overwrite branch) are responsible for
+    /// having already verified it's empty and detached from its parent's
+    /// entries.
+    fn remove_directory_inode(&self, namespace: &mut Namespace, ino: u64) {
+        namespace.inodes.remove(&ino);
+        namespace.dirs.remove(&ino);
+        namespace.parents.remove(&ino);
+        namespace.dirty_inodes.remove(&ino);
+    }
+
+    fn unlink(&self, parent_ino: u64, name: &str) -> Result<(), PoolError> {
+        let mut namespace = self.namespace.lock();
+        let dir = namespace
+            .dirs
+            .get(&parent_ino)
+            .ok_or(PoolError::NotADirectory(parent_ino))?;
+        let entry = dir
+            .entries
+            .iter()
+            .find(|e| e.name == name)
+            .cloned()
+            .ok_or_else(|| PoolError::NotFound(name.to_string()))?;
+        if entry.kind == InodeKind::Directory {
+            return Err(PoolError::IsADirectory(entry.ino));
+        }
+        namespace
+            .dirs
+            .get_mut(&parent_ino)
+            .unwrap()
+            .entries
+            .retain(|e| e.name != name);
+        namespace.dirty_inodes.insert(parent_ino);
+        self.release_inode_ref(&mut namespace, entry.ino);
+        Ok(())
+    }
+
+    fn rmdir(&self, parent_ino: u64, name: &str) -> Result<(), PoolError> {
+        let mut namespace = self.namespace.lock();
+        let dir = namespace
+            .dirs
+            .get(&parent_ino)
+            .ok_or(PoolError::NotADirectory(parent_ino))?;
+        let entry = dir
+            .entries
+            .iter()
+            .find(|e| e.name == name)
+            .cloned()
+            .ok_or_else(|| PoolError::NotFound(name.to_string()))?;
+        if entry.kind != InodeKind::Directory {
+            return Err(PoolError::NotADirectory(entry.ino));
+        }
+        let target_empty = namespace
+            .dirs
+            .get(&entry.ino)
+            .ok_or(PoolError::NoSuchInode(entry.ino))?
+            .entries
+            .is_empty();
+        if !target_empty {
+            return Err(PoolError::NotEmpty(entry.ino));
+        }
+        namespace
+            .dirs
+            .get_mut(&parent_ino)
+            .unwrap()
+            .entries
+            .retain(|e| e.name != name);
+        namespace.dirty_inodes.insert(parent_ino);
+        self.remove_directory_inode(&mut namespace, entry.ino);
+        Ok(())
+    }
+
+    /// `link` (hardlink, ARCHITECTURE.md §9): a second `DirEntry` pointing
+    /// at the same `ino` -- no new content_hash, no data I/O, just an
+    /// `nlink` bump and a metadata rewrite. Directories can't be
+    /// hardlinked (POSIX `EPERM`): this tree's `parents`/GC-reachability
+    /// model assumes each directory has exactly one referencing DirEntry.
+    fn link(&self, ino: u64, new_parent_ino: u64, new_name: &str) -> Result<(), PoolError> {
+        let mut namespace = self.namespace.lock();
+        let kind = namespace
+            .inodes
+            .get(&ino)
+            .map(|i| i.kind)
+            .ok_or(PoolError::NoSuchInode(ino))?;
+        if kind == InodeKind::Directory {
+            return Err(PoolError::IsADirectory(ino));
+        }
+        if !namespace.dirs.contains_key(&new_parent_ino) {
+            return Err(PoolError::NotADirectory(new_parent_ino));
+        }
+        if namespace
+            .dirs
+            .get(&new_parent_ino)
+            .unwrap()
+            .entries
+            .iter()
+            .any(|e| e.name == new_name)
+        {
+            return Err(PoolError::AlreadyExists(new_name.to_string()));
+        }
+
+        namespace.inodes.get_mut(&ino).unwrap().nlink += 1;
+        let dir = namespace.dirs.get_mut(&new_parent_ino).unwrap();
+        dir.entries.push(DirEntry {
+            name: new_name.to_string(),
+            ino,
+            kind,
+        });
+        dir.entries.sort_by(|a, b| a.name.cmp(&b.name));
+
+        namespace.dirty_inodes.insert(new_parent_ino);
+        namespace.dirty_inodes.insert(ino);
+        Ok(())
+    }
+
+    /// `rename` (ARCHITECTURE.md §9): "metadata-only DAG rewrite up to the
+    /// common ancestor directory, no data copy" -- the moved inode's own
+    /// content is never touched, only the two `DirectoryObject`s (one, if
+    /// same-directory). `no_replace` is FUSE's `RENAME_NOREPLACE` flag;
+    /// `RENAME_EXCHANGE` (atomic two-way swap) isn't implemented -- callers
+    /// reject it before reaching here (see lchfs-fuse's `rename`).
+    fn rename(
+        &self,
+        parent_ino: u64,
+        name: &str,
+        new_parent_ino: u64,
+        new_name: &str,
+        no_replace: bool,
+    ) -> Result<(), PoolError> {
+        let mut namespace = self.namespace.lock();
+        if !namespace.dirs.contains_key(&parent_ino) {
+            return Err(PoolError::NotADirectory(parent_ino));
+        }
+        if !namespace.dirs.contains_key(&new_parent_ino) {
+            return Err(PoolError::NotADirectory(new_parent_ino));
+        }
+
+        let src_entry = namespace
+            .dirs
+            .get(&parent_ino)
+            .unwrap()
+            .entries
+            .iter()
+            .find(|e| e.name == name)
+            .cloned()
+            .ok_or_else(|| PoolError::NotFound(name.to_string()))?;
+
+        // Renaming an entry onto its own name is a defined no-op, not an
+        // error -- and must be handled before the cycle guard below, which
+        // would otherwise (correctly, but unhelpfully) reject "moving" a
+        // directory into itself.
+        if parent_ino == new_parent_ino && name == new_name {
+            return Ok(());
+        }
+
+        // A directory can never be moved into its own subtree -- walk from
+        // the destination back up to the root looking for the directory
+        // being moved. Bounded by inode count as a defensive guard against
+        // an ever-somehow-cyclic `parents` map, not expected to matter in
+        // practice.
+        if src_entry.kind == InodeKind::Directory {
+            let mut walk = new_parent_ino;
+            let bound = namespace.inodes.len() as u64 + 1;
+            for _ in 0..bound {
+                if walk == src_entry.ino {
+                    return Err(PoolError::InvalidArgument(
+                        "cannot move a directory into its own subtree".to_string(),
+                    ));
+                }
+                if walk == ROOT_DIR_INO {
+                    break;
+                }
+                walk = *namespace.parents.get(&walk).unwrap_or(&ROOT_DIR_INO);
+            }
+        }
+
+        let dst_existing = namespace
+            .dirs
+            .get(&new_parent_ino)
+            .unwrap()
+            .entries
+            .iter()
+            .find(|e| e.name == new_name)
+            .cloned();
+        if let Some(existing) = &dst_existing {
+            if no_replace {
+                return Err(PoolError::AlreadyExists(new_name.to_string()));
+            }
+            match (src_entry.kind, existing.kind) {
+                (InodeKind::Directory, InodeKind::Directory) => {
+                    let target_empty = namespace
+                        .dirs
+                        .get(&existing.ino)
+                        .map(|d| d.entries.is_empty())
+                        .unwrap_or(true);
+                    if !target_empty {
+                        return Err(PoolError::NotEmpty(existing.ino));
+                    }
+                }
+                // oldpath is a directory, newpath exists and isn't -- POSIX ENOTDIR.
+                (InodeKind::Directory, _) => return Err(PoolError::NotADirectory(existing.ino)),
+                // oldpath isn't a directory, newpath exists and is -- POSIX EISDIR.
+                (_, InodeKind::Directory) => return Err(PoolError::IsADirectory(existing.ino)),
+                _ => {}
+            }
+        }
+
+        namespace
+            .dirs
+            .get_mut(&parent_ino)
+            .unwrap()
+            .entries
+            .retain(|e| e.name != name);
+
+        if let Some(existing) = &dst_existing {
+            namespace
+                .dirs
+                .get_mut(&new_parent_ino)
+                .unwrap()
+                .entries
+                .retain(|e| e.name != new_name);
+            if existing.kind == InodeKind::Directory {
+                self.remove_directory_inode(&mut namespace, existing.ino);
+            } else {
+                self.release_inode_ref(&mut namespace, existing.ino);
+            }
+        }
+
+        let dir = namespace.dirs.get_mut(&new_parent_ino).unwrap();
+        dir.entries.push(DirEntry {
+            name: new_name.to_string(),
+            ino: src_entry.ino,
+            kind: src_entry.kind,
+        });
+        dir.entries.sort_by(|a, b| a.name.cmp(&b.name));
+        namespace.parents.insert(src_entry.ino, new_parent_ino);
+
+        let (now_secs, now_nanos) = now_unix();
+        if let Some(inode) = namespace.inodes.get_mut(&src_entry.ino) {
+            inode.ctime = (now_secs, now_nanos);
+        }
+
+        namespace.dirty_inodes.insert(parent_ino);
+        namespace.dirty_inodes.insert(new_parent_ino);
+        namespace.dirty_inodes.insert(src_entry.ino);
+        Ok(())
+    }
+
+    /// Filesystem-wide usage stats for `statfs` (ARCHITECTURE.md §9).
+    /// Block-level numbers come straight from the underlying filesystem at
+    /// `pool_root` (`nix::sys::statvfs`) -- a pool has no fixed capacity of
+    /// its own, it just grows on-disk, so the host filesystem's free space
+    /// *is* the meaningful "how much more can I write" answer. Inode counts
+    /// come from `Pool` itself: `files` is the live inode count, `ffree` a
+    /// generous constant since `next_ino` is a monotonic in-memory counter
+    /// with no real ceiling, not a fixed-size table.
+    fn statfs(&self) -> Result<PoolStats, PoolError> {
+        let vfs = nix::sys::statvfs::statvfs(self.pool_root.as_path())
+            .map_err(|e| PoolError::Io(std::io::Error::from(e)))?;
+        let files_total = self.namespace.lock().inodes.len() as u64;
+        Ok(PoolStats {
+            block_size: vfs.block_size() as u32,
+            fragment_size: vfs.fragment_size() as u32,
+            blocks_total: vfs.blocks(),
+            blocks_free: vfs.blocks_free(),
+            blocks_available: vfs.blocks_available(),
+            files_total,
+            files_free: u32::MAX as u64,
+            name_max: 255,
+        })
     }
 
     /// The fast per-shard fsync path (ARCHITECTURE.md §3, "Subtree
