@@ -14,7 +14,7 @@ jobs:
     name: build, test, clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # fuser (lchfs-fuse) links against libfuse3 via pkg-config at build time.
       - name: Install system dependencies
