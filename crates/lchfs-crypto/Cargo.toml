@@ -10,3 +10,10 @@ blake3 = { workspace = true }
 crc32fast = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "hashing"
+harness = false

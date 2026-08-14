@@ -10,3 +10,8 @@ zstd = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "compression"
+harness = false
