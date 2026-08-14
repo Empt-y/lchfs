@@ -700,6 +700,7 @@ dependencies = [
  "lchfs-compress",
  "lchfs-crypto",
  "lchfs-format",
+ "lchfs-fsck",
  "lchfs-index",
  "nix",
  "parking_lot",

@@ -110,9 +110,32 @@ fn fsck(pool: &std::path::Path, verify_index: bool, rebuild_index: bool) -> anyh
     }
 }
 
-fn snapshot(_action: SnapshotAction) -> anyhow::Result<()> {
-    // TODO(phase-G): SnapshotTable create/list/delete via Pool
-    todo!("lchfs-cli: snapshot")
+fn snapshot(action: SnapshotAction) -> anyhow::Result<()> {
+    match action {
+        SnapshotAction::Create { pool, name } => {
+            let pool = lchfs_store::Pool::open(&pool)?;
+            pool.create_snapshot(&name)?;
+            println!("Created snapshot '{name}'.");
+            Ok(())
+        }
+        SnapshotAction::List { pool } => {
+            let pool = lchfs_store::Pool::open(&pool)?;
+            let snapshots = pool.list_snapshots()?;
+            if snapshots.is_empty() {
+                println!("No snapshots.");
+            }
+            for entry in snapshots {
+                println!("{}\troot={:?}\tepoch={}\tcreated_at_unix_nanos={}", entry.name, entry.root_hash, entry.epoch, entry.created_at_unix_nanos);
+            }
+            Ok(())
+        }
+        SnapshotAction::Delete { pool, name } => {
+            let pool = lchfs_store::Pool::open(&pool)?;
+            pool.delete_snapshot(&name)?;
+            println!("Deleted snapshot '{name}'.");
+            Ok(())
+        }
+    }
 }
 
 fn stats(pool: &std::path::Path) -> anyhow::Result<()> {

@@ -49,7 +49,7 @@ use lchfs_chunk::{ChunkBoundary, Chunker, FastCdcChunker};
 use lchfs_format::{
     ChunkRef, CodecId, ContentRef, DirEntry, DirectoryObject, ExtentKind, ExtentLocation, Hash32,
     InoMap, InoMapEntry, InodeKind, InodeObject, IndirectHashList, PoolParams, RootObject,
-    SnapshotTable, StreamKind, SuperblockSlot, SUPERBLOCK_MAGIC, SUPERBLOCK_SLOT_COUNT,
+    SnapshotEntry, SnapshotTable, StreamKind, SuperblockSlot, SUPERBLOCK_MAGIC, SUPERBLOCK_SLOT_COUNT,
     SUPERBLOCK_SLOT_SIZE, compute_superblock_slot_checksum, finalize_superblock_slot_checksum,
 };
 use lchfs_index::{ChunkLocationCache, IndexError, IndexStore, PendingDedupPins, RedbIndex};
@@ -883,6 +883,25 @@ impl Pool {
     pub fn debug_force_duplicate_chunk(&self, raw_bytes: &[u8]) -> Result<ExtentLocation, PoolError> {
         self.0.debug_force_duplicate_chunk(raw_bytes)
     }
+
+    /// Retains the current state as a named snapshot (ARCHITECTURE.md §6).
+    /// `PoolError::AlreadyExists` if `name` is already taken.
+    pub fn create_snapshot(&self, name: &str) -> Result<(), PoolError> {
+        self.0.create_snapshot(name)
+    }
+
+    /// Removes a named snapshot. `PoolError::NotFound` if it doesn't
+    /// exist. Its exclusively-referenced content becomes reclaimable by
+    /// ordinary GC from the next `run_gc_and_coalesce_pass` on -- no
+    /// separate cleanup happens here (ARCHITECTURE.md §6).
+    pub fn delete_snapshot(&self, name: &str) -> Result<(), PoolError> {
+        self.0.delete_snapshot(name)
+    }
+
+    /// Every currently-retained snapshot.
+    pub fn list_snapshots(&self) -> Result<Vec<SnapshotEntry>, PoolError> {
+        self.0.list_snapshots()
+    }
 }
 
 impl Drop for Pool {
@@ -937,10 +956,31 @@ impl PoolShared {
     /// same thing, exposed publicly for tests to call synchronously
     /// instead of racing the background timer.
     fn run_gc_and_coalesce_pass(&self) -> Result<(), PoolError> {
-        let (live_roots, generation_at_mark) = {
+        let (mut live_roots, generation_at_mark) = {
             let namespace = self.namespace.lock();
             (vec![namespace.root_hash], namespace.generation)
         };
+        // ARCHITECTURE.md §6: "Live roots = {current superblock root_hash}
+        // ∪ {every SnapshotTable entry's root_hash} ∪ {snapshot_table_hash}".
+        // The current root_hash alone (above) already covers the third set
+        // member -- walking it marks its own `snapshot_table_hash` record
+        // live (see dag_walk.rs's `walk_reachable`) -- but a bare
+        // SnapshotTable record deliberately does *not* recurse into its
+        // entries' own roots (same doc comment: "its entries' roots are
+        // separately present in the caller's live_roots list"), so every
+        // retained snapshot's root must be added here explicitly, or its
+        // exclusively-referenced content would be silently swept the next
+        // time this pass runs -- the entire point of retaining a snapshot
+        // is that GC leaves its content alone.
+        //
+        // A resolution failure here must abort the whole pass, not
+        // silently proceed with an incomplete live-roots list (which would
+        // read "couldn't find the snapshot table" as "no snapshots exist,"
+        // exactly the false-negative `GcEngine::mark`'s own doc comment
+        // warns a partial live-set would create).
+        let snapshot_table = self.current_snapshot_table()?;
+        live_roots.extend(snapshot_table.entries.iter().map(|e| e.root_hash));
+
         self.coalesce.lock().run_pass(
             &live_roots,
             generation_at_mark,
@@ -955,6 +995,79 @@ impl PoolShared {
     /// (below) is the same thing, exposed publicly for tests.
     fn run_dedup_pass(&self) -> Result<Vec<dedup::DedupMerge>, PoolError> {
         Ok(self.dedup.lock().run_pass(&self.persisted_index)?)
+    }
+
+    /// Resolves and decodes the current `SnapshotTable`. `None` (no table
+    /// has ever been created) decodes as empty rather than erroring --
+    /// matches `run_checkpoint`'s own lazy-create-on-first-checkpoint
+    /// behavior, so this is always meaningful to call, even on a pool
+    /// that's never had a snapshot.
+    fn current_snapshot_table(&self) -> Result<SnapshotTable, PoolError> {
+        let hash = self.namespace.lock().snapshot_table_hash;
+        match hash {
+            None => Ok(SnapshotTable::default()),
+            Some(hash) => {
+                let bytes = self.read_meta_object_bytes(hash)?;
+                lchfs_format::decode(&bytes).map_err(|e| PoolError::Format(e.to_string()))
+            }
+        }
+    }
+
+    /// Durably writes `table` as the new `SnapshotTable` and publishes it
+    /// via a checkpoint -- shared tail for `create_snapshot`/`delete_snapshot`.
+    fn publish_snapshot_table(&self, table: &SnapshotTable) -> Result<(), PoolError> {
+        let (hash, _loc) = self.put_meta_object(ExtentKind::SnapshotTable, table)?;
+        self.namespace.lock().snapshot_table_hash = Some(hash);
+        self.run_checkpoint()
+    }
+
+    /// Retains the current state as a named snapshot (ARCHITECTURE.md §6:
+    /// "retaining one = adding a `SnapshotTable` entry, an ordinary
+    /// content-addressed write"). Two checkpoints, deliberately: the first
+    /// makes whatever's about to be retained durable and gives it a stable
+    /// `root_hash` to record; the second durably publishes the updated
+    /// `SnapshotTable` itself, so `create_snapshot` returning `Ok` means
+    /// the retention has *itself* survived a crash, not just the content
+    /// it points at.
+    fn create_snapshot(&self, name: &str) -> Result<(), PoolError> {
+        self.run_checkpoint()?;
+        let (root_to_retain, epoch) = {
+            let namespace = self.namespace.lock();
+            (namespace.root_hash, namespace.generation)
+        };
+
+        let mut table = self.current_snapshot_table()?;
+        if table.entries.iter().any(|e| e.name == name) {
+            return Err(PoolError::AlreadyExists(name.to_string()));
+        }
+        let (now_secs, now_nanos) = now_unix();
+        table.entries.push(SnapshotEntry {
+            name: name.to_string(),
+            root_hash: root_to_retain,
+            created_at_unix_nanos: now_secs * 1_000_000_000 + now_nanos as i64,
+            epoch,
+        });
+
+        self.publish_snapshot_table(&table)
+    }
+
+    /// Removes a named snapshot's `SnapshotTable` entry. Per ARCHITECTURE.md
+    /// §6: "no separate 'snapshot delete' logic" -- content exclusively
+    /// referenced by the removed entry simply stops being included in
+    /// `run_gc_and_coalesce_pass`'s live-roots list from here on, and
+    /// becomes reclaimable on the next ordinary mark-sweep.
+    fn delete_snapshot(&self, name: &str) -> Result<(), PoolError> {
+        let mut table = self.current_snapshot_table()?;
+        let before = table.entries.len();
+        table.entries.retain(|e| e.name != name);
+        if table.entries.len() == before {
+            return Err(PoolError::NotFound(name.to_string()));
+        }
+        self.publish_snapshot_table(&table)
+    }
+
+    fn list_snapshots(&self) -> Result<Vec<SnapshotEntry>, PoolError> {
+        Ok(self.current_snapshot_table()?.entries)
     }
 
     fn read(&self, ino: u64, offset: u64, len: u32) -> Result<Bytes, PoolError> {

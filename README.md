@@ -4,7 +4,7 @@ A from-scratch filesystem built around content-addressed, log-structured storage
 
 ## Status
 
-Phases A–E are done: the engine mounts via FUSE3, supports the full Phase 1 POSIX surface (§9 of `ARCHITECTURE.md`) — read/write/mkdir/unlink/rmdir/rename/symlink/link/statfs — with concurrent multi-shard ingress, background GC/coalesce/dedup daemons, and crash recovery. Phase F (verification tooling) is in progress: `lchfs-fsck` and `lchfs-testkit` are real, and a fuzz target now covers the Extent Record header parser; `criterion` benchmarks aren't set up yet.
+Phases A–G are all done, per `ARCHITECTURE.md` §12's own scoping. The engine mounts via FUSE3, supports the full Phase 1 POSIX surface (§9) — read/write/mkdir/unlink/rmdir/rename/symlink/link/statfs — with concurrent multi-shard ingress, background GC/coalesce/dedup daemons, and crash recovery. `lchfs-fsck`/`lchfs-testkit` are real, a fuzz target covers the Extent Record header parser, `criterion` benchmarks cover chunking/hashing/compression/concurrent-writer throughput, and snapshot create/list/delete works with GC correctly protecting a retained snapshot's exclusive content (a real gap fixed along the way: `run_gc_and_coalesce_pass` only ever included the *current* root before this). `Vdev`/`StorageBackend`'s extension points for future replication were already correctly shaped since Phase 1 and remain deliberately stubbed, not implemented — real N-way replication is future work with no scheduled phase.
 
 ## Build
 
@@ -21,8 +21,8 @@ Implementation order (§12 of `ARCHITECTURE.md`) — all crates are already scaf
 - [x] **Phase C** — `lchfs-index` (redb-backed): inline dedup-on-write
 - [x] **Phase D** — `lchfs-fuse` + `lchfs-cli mount`: first real `cp`/`ls`/`cat` end-to-end
 - [x] **Phase E** — concurrency hardening: M logical shards, work-stealing committer pool, per-shard delta logs, coalescing daemon, dedup scanner, GC
-- [ ] **Phase F** — `lchfs-fsck` ✅, `lchfs-testkit` ✅, fuzzing ✅ (Extent Record header parser), crash-injection harness ✅ (superblock-scoped), `criterion` benchmarks ⬜
-- [ ] **Phase G** — snapshots, multi-root GC validation, `Vdev`/`StorageBackend` extension points
+- [x] **Phase F** — `lchfs-fsck`, `lchfs-testkit`, fuzzing (Extent Record header parser), crash-injection harness (superblock-scoped), `criterion` benchmarks
+- [x] **Phase G** — snapshots (create/list/delete + the GC live-roots fix that makes them actually protect content), multi-root GC validation, `Vdev`/`StorageBackend` extension points (already correctly shaped since Phase 1; real replication itself stays out of scope)
 
 ## Fuzzing
 
