@@ -21,13 +21,38 @@ pub enum FsOp {
     CrashAndRemount,
 }
 
-/// A `proptest::strategy::Strategy` producing arbitrary `FsOp` sequences.
-/// TODO(phase-F): implement via `proptest::prop_oneof!` over a bounded
-/// namespace of paths so generated sequences actually exercise shared
-/// state (renames onto existing files, etc.) rather than never colliding.
+/// A small, fixed namespace of paths -- deliberately *not* fully random
+/// strings, so generated op sequences actually collide with and build on
+/// each other (a rename onto an existing name, a write into a directory
+/// another op just created, ...) rather than almost never touching the
+/// same path twice. Includes both top-level and nested paths so `mkdir`
+/// followed by an operation *inside* that directory is a realistic,
+/// frequent occurrence.
+const PATH_NAMESPACE: &[&str] = &["/a", "/b", "/c", "/dir1", "/dir1/x", "/dir1/y", "/dir2", "/dir2/z"];
+
+fn arb_path() -> impl proptest::strategy::Strategy<Value = PathBuf> {
+    use proptest::strategy::Strategy;
+    proptest::sample::select(PATH_NAMESPACE).prop_map(PathBuf::from)
+}
+
+fn arb_data() -> impl proptest::strategy::Strategy<Value = Vec<u8>> {
+    proptest::collection::vec(proptest::prelude::any::<u8>(), 0..64)
+}
+
+/// A `proptest::strategy::Strategy` producing arbitrary `FsOp`s, drawn
+/// from `PATH_NAMESPACE` per this module's doc comment.
 pub fn arb_fs_op() -> impl proptest::strategy::Strategy<Value = FsOp> {
     use proptest::prelude::*;
-    // Placeholder single-case strategy; real generator composes prop_oneof!
-    // over all FsOp variants per the doc comment above.
-    Just(FsOp::CrashAndRemount)
+    prop_oneof![
+        (arb_path(), 0u64..256, arb_data())
+            .prop_map(|(path, offset, data)| FsOp::Write { path, offset, data }),
+        (arb_path(), 0u64..256).prop_map(|(path, len)| FsOp::Truncate { path, len }),
+        arb_path().prop_map(|path| FsOp::Mkdir { path }),
+        (arb_path(), arb_path()).prop_map(|(from, to)| FsOp::Rename { from, to }),
+        arb_path().prop_map(|path| FsOp::Unlink { path }),
+        (arb_path(), arb_path()).prop_map(|(path, target)| FsOp::Link { path, target }),
+        (arb_path(), arb_path()).prop_map(|(path, target)| FsOp::Symlink { path, target }),
+        arb_path().prop_map(|path| FsOp::Fsync { path }),
+        Just(FsOp::CrashAndRemount),
+    ]
 }

@@ -2021,6 +2021,23 @@ impl PoolShared {
                 .is_some_and(|i| i.size > self.pool_params.inline_threshold as u64)
         };
 
+        // Both branches below fall back to `file_state` when there's no
+        // active session (the common case: fsync called without an
+        // in-flight incremental-append session, e.g. right after a fresh
+        // `Pool::open` before this ino has been read or written this
+        // session). Without hydrating first, a not-yet-populated
+        // `file_state` entry silently defaults to *empty* via
+        // `unwrap_or_default()` below -- which then gets committed as
+        // this file's new content, discarding whatever was actually
+        // there. `hydrate_file_state` is a no-op if already populated,
+        // so this is always safe to call. Found via property-testing
+        // (lchfs-testkit's model-equivalence harness): fsync-ing a small,
+        // just-reopened file with no preceding read/write truncated it to
+        // empty.
+        if session_chunks.is_none() {
+            self.hydrate_file_state(ino)?;
+        }
+
         let mut records = Vec::new();
         let content_ref = if !is_chunked {
             let bytes = self

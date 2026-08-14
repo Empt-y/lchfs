@@ -547,6 +547,7 @@ name = "lchfs-testkit"
 version = "0.1.0"
 dependencies = [
  "lchfs-format",
+ "lchfs-fsck",
  "lchfs-store",
  "proptest",
  "tempfile",

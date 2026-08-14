@@ -11,3 +11,6 @@ lchfs-format = { workspace = true }
 lchfs-store = { workspace = true }
 proptest = { workspace = true }
 tempfile = { workspace = true }
+
+[dev-dependencies]
+lchfs-fsck = { workspace = true }

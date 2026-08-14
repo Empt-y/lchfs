@@ -122,6 +122,49 @@ fn fsync_followed_by_checkpoint_and_reopen_recovers_correctly() {
 }
 
 #[test]
+fn fsync_on_a_reopened_inline_file_does_not_lose_content() {
+    // Regression test (found via lchfs-testkit's model-equivalence
+    // property test): fsync()'s inline-content branch used to read
+    // straight from `file_state` without first ensuring it was hydrated.
+    // `file_state` is a pure in-memory cache, empty again after every
+    // `Pool::open` -- fsync-ing a small file with no preceding read/write
+    // *this session* silently committed an empty ContentRef::Inline,
+    // discarding the file's actual (already-checkpointed) content.
+    let dir = tempfile::tempdir().unwrap();
+    let pool = Pool::create(dir.path(), small_params()).unwrap();
+    let ino = pool.create_file(1, "f", 0o644).unwrap();
+    pool.write(ino, 0, b"small").unwrap(); // well under inline_threshold
+    pool.checkpoint().unwrap();
+    drop(pool);
+
+    let pool2 = Pool::open(dir.path()).unwrap();
+    // No read()/write() on `ino` since reopening -- file_state is empty.
+    pool2.fsync(ino).unwrap();
+
+    let read_back = pool2.read(ino, 0, 5).unwrap();
+    assert_eq!(read_back.as_ref(), b"small", "fsync must not discard content it never re-read");
+}
+
+#[test]
+fn fsync_on_a_reopened_chunked_file_does_not_lose_content() {
+    // Same bug, chunked-content branch: `IndirectHashList { chunks }`
+    // defaulted to empty via the identical unhydrated-`file_state` gap.
+    let dir = tempfile::tempdir().unwrap();
+    let pool = Pool::create(dir.path(), small_params()).unwrap();
+    let ino = pool.create_file(1, "f", 0o644).unwrap();
+    let data = deterministic_bytes(9, 5000); // well over inline_threshold
+    pool.write(ino, 0, &data).unwrap();
+    pool.checkpoint().unwrap();
+    drop(pool);
+
+    let pool2 = Pool::open(dir.path()).unwrap();
+    pool2.fsync(ino).unwrap();
+
+    let read_back = pool2.read(ino, 0, data.len() as u32).unwrap();
+    assert_eq!(read_back.as_ref(), data.as_slice(), "fsync must not discard content it never re-read");
+}
+
+#[test]
 fn fsync_on_directory_falls_back_to_checkpoint_without_error() {
     let dir = tempfile::tempdir().unwrap();
     let pool = Pool::create(dir.path(), small_params()).unwrap();

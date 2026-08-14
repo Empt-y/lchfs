@@ -7,5 +7,5 @@ pub mod ops;
 pub mod reference_model;
 
 pub use crash_backend::CrashInjectingBackend;
-pub use ops::FsOp;
-pub use reference_model::ReferenceModel;
+pub use ops::{arb_fs_op, FsOp};
+pub use reference_model::{ModelError, ReferenceModel};
