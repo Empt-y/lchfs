@@ -3,7 +3,12 @@
 //! timer calls, exposed so tests can call it synchronously).
 
 use lchfs_format::PoolParams;
+use lchfs_index::{ChunkLocationCache, PendingDedupPins, RedbIndex};
+use lchfs_store::coalesce::CoalesceDaemon;
 use lchfs_store::Pool;
+use parking_lot::RwLock;
+use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 
 fn small_params() -> PoolParams {
     PoolParams {
@@ -185,6 +190,81 @@ fn dedup_hit_write_survives_a_coalesce_pass_before_its_own_checkpoint() {
         orphaned_content.as_slice(),
         "a dedup-hit write must survive a coalesce pass that races its own checkpoint"
     );
+}
+
+#[test]
+fn generation_change_mid_pass_blocks_deletion_even_without_a_pin() {
+    // Direct test of the freshness gate in `CoalesceDaemon::repack_segment`
+    // (see its doc comment): even with *no* pin at all protecting anything,
+    // a repack pass must not delete a segment if a checkpoint published a
+    // new root after this pass's own mark() ran -- its `live` bitmap could
+    // be stale in a way `PendingDedupPins` alone can't cover (a pin taken
+    // *and* released, i.e. checkpointed, entirely within one pass's
+    // processing window -- not reproducible deterministically through real
+    // threads, since it depends on exact timing). Driven directly against
+    // `CoalesceDaemon` (bypassing `Pool::run_gc_and_coalesce_pass`, which
+    // always reads the *current* generation) so the mismatch this test
+    // needs can be manufactured deterministically instead.
+    let dir = tempfile::tempdir().unwrap();
+    let (pool, survivors) = setup_low_liveness_pool(dir.path());
+    let root = pool.debug_root_hash();
+    drop(pool);
+
+    let index = RedbIndex::open(&dir.path().join("INDEX.redb")).unwrap();
+    let cache = ChunkLocationCache::new();
+    cache.extend(index.iter_chunk_locations().unwrap());
+    let locations = Arc::new(cache);
+    let persisted_index = RwLock::new(index);
+    // Comfortably past every segment id `setup_low_liveness_pool` could
+    // have allocated -- collision would only matter if it clashed with an
+    // existing segment file, which this is far too high to do.
+    let next_segment_id = AtomicU64::new(1_000_000);
+
+    let mut daemon = CoalesceDaemon::new(
+        dir.path().to_path_buf(),
+        Arc::clone(&locations),
+        Arc::new(PendingDedupPins::new()),
+    );
+
+    let data_dir = dir.path().join("segments/data");
+    let before: std::collections::HashSet<_> = std::fs::read_dir(&data_dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.file_name()))
+        .collect();
+
+    // `generation_at_mark` (0) deliberately doesn't match
+    // `published_generation`'s value (1) below -- simulating "a checkpoint
+    // completed after this pass's mark() ran, before it finished."
+    let published_generation = AtomicU64::new(1);
+    daemon
+        .run_pass(&[root], 0, &published_generation, &persisted_index, &next_segment_id)
+        .unwrap();
+
+    let after: std::collections::HashSet<_> = std::fs::read_dir(&data_dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.file_name()))
+        .collect();
+    // Every pre-pass segment must still be present -- the gate blocks
+    // *deletion*, not the copy-forward work itself: whatever was
+    // genuinely live per this pass's (stale) mark is still correctly
+    // relocated into a fresh segment and the index repointed at it (see
+    // `repack_segment`'s doc comment on why that doesn't need rolling
+    // back), so `after` legitimately gains new segments too.
+    assert!(
+        before.is_subset(&after),
+        "a stale generation must block every segment deletion this pass, even though \
+         the same setup deletes several when generations match (see \
+         post_repack_reads_are_byte_identical_and_old_segment_is_gone); \
+         before={before:?} after={after:?}"
+    );
+
+    // And nothing was corrupted along the way -- every survivor still
+    // reads back correctly through a fresh mount.
+    let pool2 = Pool::open(dir.path()).unwrap();
+    for (ino, expected) in &survivors {
+        let read_back = pool2.read(*ino, 0, expected.len() as u32).unwrap();
+        assert_eq!(read_back.as_ref(), expected.as_slice());
+    }
 }
 
 #[test]

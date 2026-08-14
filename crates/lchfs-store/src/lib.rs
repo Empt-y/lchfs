@@ -1272,10 +1272,24 @@ impl PoolShared {
             }
         }
 
-        let mut new_refs = Vec::with_capacity(prepared.len());
+        let mut new_refs: Vec<ChunkRef> = Vec::with_capacity(prepared.len());
         for (rel_offset, bytes) in &prepared {
             let logical_offset = base_offset + rel_offset;
-            let (hash, _loc) = self.commit_chunk(ino, logical_offset, bytes)?;
+            let (hash, _loc) = match self.commit_chunk(ino, logical_offset, bytes) {
+                Ok(v) => v,
+                Err(e) => {
+                    // `new_refs` is about to be discarded -- any dedup-hit
+                    // pin already taken for an earlier chunk in this batch
+                    // (see `PendingDedupPins`'s doc comment) would otherwise
+                    // never be released, since it'll never reach
+                    // `checkpointed_chunk_hashes` now. No-op for any hash
+                    // that was never pinned (every `New`-path chunk here).
+                    for r in &new_refs {
+                        self.dedup_pins.unpin(r.content_hash);
+                    }
+                    return Err(e);
+                }
+            };
             new_refs.push(ChunkRef {
                 content_hash: hash,
                 logical_offset,
@@ -1317,12 +1331,27 @@ impl PoolShared {
         if let Some(b) = state.chunker.finish() {
             let bytes: Vec<u8> = state.pending_bytes.drain(0..b.len as usize).collect();
             let logical_offset = state.base_offset + b.offset;
-            let (hash, _loc) = self.commit_chunk(ino, logical_offset, &bytes)?;
-            state.chunks.push(ChunkRef {
-                content_hash: hash,
-                logical_offset,
-                len: b.len,
-            });
+            match self.commit_chunk(ino, logical_offset, &bytes) {
+                Ok((hash, _loc)) => {
+                    state.chunks.push(ChunkRef {
+                        content_hash: hash,
+                        logical_offset,
+                        len: b.len,
+                    });
+                }
+                Err(e) => {
+                    // The whole session -- `state` was already removed
+                    // from `open_files` above -- is being discarded here,
+                    // including any dedup-hit pins already in
+                    // `state.chunks` from earlier `write_incremental` calls
+                    // in this same session (see `PendingDedupPins`'s doc
+                    // comment). No-op for any hash that was never pinned.
+                    for r in &state.chunks {
+                        self.dedup_pins.unpin(r.content_hash);
+                    }
+                    return Err(e);
+                }
+            }
         }
         // `file_state[ino]`, if present, was populated by an *earlier*
         // fallback-path write and only covers content up to that point --
@@ -1427,10 +1456,20 @@ impl PoolShared {
             if let Some(last) = chunker.finish() {
                 boundaries.push(last);
             }
-            let mut refs = Vec::with_capacity(boundaries.len());
+            let mut refs: Vec<ChunkRef> = Vec::with_capacity(boundaries.len());
             for b in boundaries {
                 let bytes = &content_snapshot[b.offset as usize..(b.offset + b.len as u64) as usize];
-                let (hash, _loc) = self.commit_chunk(ino, b.offset, bytes)?;
+                let (hash, _loc) = match self.commit_chunk(ino, b.offset, bytes) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // `refs` is about to be discarded -- see the matching
+                        // comment in `write_incremental`.
+                        for r in &refs {
+                            self.dedup_pins.unpin(r.content_hash);
+                        }
+                        return Err(e);
+                    }
+                };
                 refs.push(ChunkRef {
                     content_hash: hash,
                     logical_offset: b.offset,

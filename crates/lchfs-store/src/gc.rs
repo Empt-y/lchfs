@@ -103,8 +103,21 @@ impl GcEngine {
         // on a location before its own reference to it is DAG-reachable
         // from any live root. This is a first-line-of-defense snapshot,
         // not the sole guarantee -- `CoalesceDaemon::repack_segment` also
-        // re-consults the live pin set right before deleting a segment,
-        // to cover pins taken after this snapshot.
+        // re-consults the live pin set directly (bypassing this snapshot
+        // entirely) right before deleting a segment, to cover both pins
+        // taken after this snapshot *and* the case immediately below.
+        //
+        // Deliberately fails open here, unlike a DAG-walk resolution
+        // failure above: `pin()` is only ever called right after a
+        // successful `dedup_index.get()` hit, and locations are never
+        // removed from the index, so this should never actually miss --
+        // but if it somehow did, skipping it doesn't create a false "safe
+        // to reclaim" signal the way an incomplete DAG walk would (that
+        // failure mode is what justifies aborting the whole pass above).
+        // It just forgoes this one pre-marking optimization for that hash;
+        // `repack_segment`'s own per-record recheck, keyed directly off
+        // the hash it's about to consider dropping rather than through
+        // this snapshot's resolution, still protects it independently.
         for hash in self.pins.snapshot() {
             match self.locations.get(hash) {
                 Some(loc) => dag_walk::mark_location(loc, &mut live),
