@@ -1,40 +1,46 @@
 # LCHFS — Log-Structured Cryptographic Hash File System
 
-A from-scratch filesystem built around content-addressed, log-structured storage: every chunk's BLAKE3 hash doubles as its Merkle DAG pointer, its integrity check, and its dedup key. See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the full design — on-disk format, write/read paths, concurrency model, crash recovery, and the reasoning behind every decision.
+A FUSE3 filesystem where every chunk of every file is content-addressed: its BLAKE3 hash is simultaneously its pointer in a Merkle DAG, its integrity check, and its dedup key. Nothing is ever overwritten in place — writes append to log-structured segments, and a small ring of self-checksummed superblocks tracks the current root, so the filesystem needs no journal and no replay to recover from a crash.
 
-## Status
+## How it works
 
-Phases A–G are all done, per `ARCHITECTURE.md` §12's own scoping. The engine mounts via FUSE3, supports the full Phase 1 POSIX surface (§9) — read/write/mkdir/unlink/rmdir/rename/symlink/link/statfs — with concurrent multi-shard ingress, background GC/coalesce/dedup daemons, and crash recovery. `lchfs-fsck`/`lchfs-testkit` are real, a fuzz target covers the Extent Record header parser, `criterion` benchmarks cover chunking/hashing/compression/concurrent-writer throughput, and snapshot create/list/delete works with GC correctly protecting a retained snapshot's exclusive content (a real gap fixed along the way: `run_gc_and_coalesce_pass` only ever included the *current* root before this). `Vdev`/`StorageBackend`'s extension points for future replication were already correctly shaped since Phase 1 and remain deliberately stubbed, not implemented — real N-way replication is future work with no scheduled phase.
+- **Write**: incoming bytes are split into content-defined chunks (FastCDC), each chunk is hashed with BLAKE3, checked against a dedup index, optionally compressed, and appended to a log segment. Parent objects (inode → directory → root) are rebuilt bottom-up and fsync'd in dependency order, so a crash can never leave a parent pointing at unwritten data.
+- **Read**: a directory entry resolves to an inode number, which resolves through an index to the file's current object hash, which resolves to a chunk list; each chunk is read, decompressed, and its hash re-verified against the DAG before being returned.
+- **Concurrency**: writes are routed by inode ID into one of many independent logical shards (each with its own ring buffer and log), serviced by a small pool of worker threads that steal work from busy shards. No global lock is ever taken on the write path.
+- **Space reclamation**: a background mark-and-sweep walks every live root (current tree + all retained snapshots) and copies forward only the chunks still referenced, repacking sparse segments as it goes. Because relocation never changes a chunk's hash, nothing else in the DAG has to be rewritten when GC moves data.
+
+## What's different from ext4 / NTFS / ZFS
+
+| | LCHFS |
+|---|---|
+| **Allocation** | Log-structured, append-only — no in-place block allocator |
+| **Concurrency** | Lockless, sharded by inode across independent ingress rings — no global VFS/allocation lock |
+| **Integrity** | Cryptographic hash (BLAKE3) is the addressing scheme itself, not a bolted-on checksum — a chunk simply *is* its hash |
+| **Dedup** | Free side effect of content-addressing, not a separate scan-and-merge pass |
+| **Snapshots** | A snapshot is one entry in a table pointing at an existing root — no copy, no special-cased deletion path |
+| **Hardlinks** | Free — two directory entries pointing at the same inode number, zero data touched |
+
+## Nerd stats
+
+| | |
+|---|---|
+| Hash function | BLAKE3-256 (32-byte digest), doubles as the DAG pointer, integrity check, and dedup key |
+| Chunking | FastCDC, content-defined boundaries — avg 64 KiB / min 16 KiB / max 256 KiB (tunable per pool) |
+| Inline threshold | Files ≤ 512 B live directly in the inode object, no chunking or dedup (default, tunable) |
+| Chunk address fan-out | 64K chunk refs per `IndirectHashList`, double-indirect beyond that → ~4.3 billion (2³²) addressable chunks per file |
+| **Max file size** | **~256 TiB** at default chunk size, up to **1 PiB** at max chunk size — set by the double-indirect fan-out cap above |
+| **Max pool/drive size** | No format-imposed ceiling — segment and offset fields are 64-bit; bounded only by the backing storage |
+| Segment size | 128 MiB (data) / 16 MiB (metadata) default, configurable at pool creation |
+| Superblock | 64 KiB ring, 16 × 4 KiB slots, atomically rotated — recovery = highest-generation CRC-valid slot, no journal |
+| Logical write shards | 256–1024 (configurable), deliberately far exceeds core count for even load spread |
+| Compression | Adaptive zstd — samples ~10% of each chunk, compresses the full chunk only if the sample shows ≥10% reduction |
+| Checkpoint interval | Every 5s by default, or on `fsync()`, ring backpressure, or unmount |
+| Crash recovery | Zero-replay base case; bounded, idempotent per-shard delta-log replay when the fast `fsync()` path has been used |
 
 ## Build
 
 ```sh
 cargo build
-```
-
-## Roadmap
-
-Implementation order (§12 of `ARCHITECTURE.md`) — all crates are already scaffolded; this is build sequence, not scope:
-
-- [x] **Phase A** — `lchfs-crypto`, `lchfs-format`: on-disk schema + round-trip proptests
-- [x] **Phase B** — `lchfs-store` (single-threaded): segment writer, superblock rotation, basic checkpoint
-- [x] **Phase C** — `lchfs-index` (redb-backed): inline dedup-on-write
-- [x] **Phase D** — `lchfs-fuse` + `lchfs-cli mount`: first real `cp`/`ls`/`cat` end-to-end
-- [x] **Phase E** — concurrency hardening: M logical shards, work-stealing committer pool, per-shard delta logs, coalescing daemon, dedup scanner, GC
-- [x] **Phase F** — `lchfs-fsck`, `lchfs-testkit`, fuzzing (Extent Record header parser), crash-injection harness (superblock-scoped), `criterion` benchmarks
-- [x] **Phase G** — snapshots (create/list/delete + the GC live-roots fix that makes them actually protect content), multi-root GC validation, `Vdev`/`StorageBackend` extension points (already correctly shaped since Phase 1; real replication itself stays out of scope)
-
-## Fuzzing
-
-`fuzz/` is a separate, self-contained cargo-fuzz project (its own `[workspace]`, not a member of the main one — fuzz targets need nightly-only sanitizer instrumentation the main crates must never be built with). It targets `lchfs_store::segment::parse_record_header`, the Extent Record header parser ARCHITECTURE.md §10 calls out: it must never panic on adversarial bytes, only return `None`.
-
-Requires a nightly toolchain and `cargo-fuzz`, independent of whatever toolchain builds the main workspace (this repo's CI/dev toolchain is stable-only). Via `rustup` (kept separate from a distro-packaged stable toolchain — doesn't need to be, and shouldn't become, your default):
-
-```sh
-rustup toolchain install nightly
-cargo install cargo-fuzz
-cargo +nightly fuzz run extent_header           # runs until you Ctrl-C
-cargo +nightly fuzz run extent_header -- -max_total_time=60   # bounded run
 ```
 
 ## Layout
