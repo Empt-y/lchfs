@@ -1179,6 +1179,7 @@ impl PoolShared {
         Ok(self.current_snapshot_table()?.entries)
     }
 
+    #[allow(clippy::needless_lifetimes)]
     fn read(&self, ino: u64, offset: u64, len: u32) -> Result<Bytes, PoolError> {
         let kind = {
             let namespace = self.namespace.lock();
@@ -1204,21 +1205,105 @@ impl PoolShared {
             .lock()
             .get(&ino)
             .map(|s| (s.chunks.clone(), s.pending_bytes.clone()));
-        let content = if let Some((chunks, pending)) = session_snapshot {
+        if let Some((chunks, pending)) = session_snapshot {
             let mut buf = Vec::new();
             for chunk in &chunks {
                 buf.extend_from_slice(&self.read_chunk_bytes(chunk.content_hash)?);
             }
             buf.extend_from_slice(&pending);
-            buf
-        } else {
-            self.hydrate_file_state(ino)?;
-            self.file_state.lock()[&ino].contents.clone()
-        };
+            return Ok(slice_of(&buf, offset, len));
+        }
 
-        let start = (offset as usize).min(content.len());
-        let end = (start + len as usize).min(content.len());
-        Ok(Bytes::copy_from_slice(&content[start..end]))
+        // A hydrated `file_state` is the authority whenever it exists: it
+        // holds bytes a fallback-path write may not have checkpointed yet.
+        // It is already fully in memory, so slicing it costs nothing extra.
+        if let Some(state) = self.file_state.lock().get(&ino) {
+            return Ok(slice_of(&state.contents, offset, len));
+        }
+
+        // Otherwise resolve the range against the persisted content without
+        // materializing the whole file -- ARCHITECTURE.md §4's documented
+        // read path ("fetch IndirectHashList -> binary-search covering
+        // chunks -> per chunk: index lookup -> read -> decompress ->
+        // mandatory hash verify -> assemble"). Deliberately does *not*
+        // populate `file_state`: doing so would reintroduce the whole-file
+        // materialization this exists to avoid.
+        let (content_ref, size) = {
+            let namespace = self.namespace.lock();
+            let inode = namespace.inodes.get(&ino).ok_or(PoolError::NoSuchInode(ino))?;
+            (inode.content.clone(), inode.size)
+        };
+        match content_ref {
+            ContentRef::Inline(bytes) => Ok(slice_of(&bytes, offset, len)),
+            ContentRef::ChunkList(hash) => {
+                let ihl_bytes = self.read_meta_object_bytes(hash)?;
+                let ihl: IndirectHashList = lchfs_format::decode(&ihl_bytes)
+                    .map_err(|e| PoolError::Format(e.to_string()))?;
+                self.read_range_from_chunks(&ihl.chunks, size, offset, len)
+            }
+            ContentRef::DirEntries(_) | ContentRef::SymlinkTarget(_) => Ok(Bytes::new()),
+        }
+    }
+
+    /// Assembles `[offset, offset+len)` from only the chunks overlapping it.
+    ///
+    /// `chunks` is sorted by `logical_offset` (an invariant `lchfs-fsck`
+    /// checks), so the first relevant chunk is found by binary search rather
+    /// than a scan -- the difference between O(log n) and O(n) chunk-list
+    /// walks on a large file, and the reason a read of one block of an 8 GiB
+    /// file no longer touches every chunk in it.
+    ///
+    /// Any byte in range not covered by a chunk reads as zero. No writer
+    /// produces such a gap today, but treating it as zero rather than an
+    /// error is both the POSIX sparse-file semantic and what the upcoming
+    /// hole representation needs.
+    fn read_range_from_chunks(
+        &self,
+        chunks: &[ChunkRef],
+        size: u64,
+        offset: u64,
+        len: u32,
+    ) -> Result<Bytes, PoolError> {
+        let start = offset.min(size);
+        let end = start.saturating_add(len as u64).min(size);
+        if start >= end {
+            return Ok(Bytes::new());
+        }
+        let mut out = vec![0u8; (end - start) as usize];
+
+        // First chunk that could overlap: the last one starting at or before
+        // `start` (it may extend into the range), else the first after it.
+        let mut idx = chunks.partition_point(|c| c.logical_offset <= start);
+        idx = idx.saturating_sub(1);
+
+        for chunk in &chunks[idx.min(chunks.len())..] {
+            if chunk.logical_offset >= end {
+                break;
+            }
+            let chunk_end = chunk.logical_offset.saturating_add(chunk.len as u64);
+            if chunk_end <= start {
+                continue;
+            }
+            let bytes = self.read_chunk_bytes(chunk.content_hash)?;
+            // Trust the record's own length, not the ChunkRef's: the read
+            // above already verified the payload against its content hash,
+            // so a disagreement means a corrupt chunk list rather than
+            // corrupt data, and copying past the buffer would panic.
+            let avail = bytes.len().min(chunk.len as usize);
+            let copy_from = start.max(chunk.logical_offset);
+            let copy_to = end.min(chunk_end);
+            if copy_from >= copy_to {
+                continue;
+            }
+            let src_lo = (copy_from - chunk.logical_offset) as usize;
+            let src_hi = ((copy_to - chunk.logical_offset) as usize).min(avail);
+            if src_lo >= src_hi {
+                continue;
+            }
+            let dst_lo = (copy_from - start) as usize;
+            out[dst_lo..dst_lo + (src_hi - src_lo)].copy_from_slice(&bytes[src_lo..src_hi]);
+        }
+        Ok(Bytes::from(out))
     }
 
     /// The file's current chunk list, for seeding a new incremental-append
@@ -2937,6 +3022,14 @@ fn acquire_pool_lock(pool_root: &Path) -> Result<Flock<std::fs::File>, PoolError
         }
         Err((_, errno)) => Err(PoolError::Io(std::io::Error::from(errno))),
     }
+}
+
+/// Clamped `[offset, offset+len)` slice of an in-memory buffer, returning
+/// short (or empty) at EOF exactly as `read(2)` does.
+fn slice_of(buf: &[u8], offset: u64, len: u32) -> Bytes {
+    let start = (offset as usize).min(buf.len());
+    let end = start.saturating_add(len as usize).min(buf.len());
+    Bytes::copy_from_slice(&buf[start..end])
 }
 
 /// An opaque, RAII hold on a pool's `LOCK` file, released on drop. Keeps
