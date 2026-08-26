@@ -11,9 +11,11 @@
 //! with `EINVAL` rather than silently misbehaving.
 //!
 //! Of §9's Phase 2+ list, implemented here: xattrs
-//! (getxattr/setxattr/listxattr/removexattr), POSIX ACLs (see `acl`), and
-//! fallocate (punch-hole/zero-range/allocate). flock/byte-range locking,
-//! ioctl and mmap write-back consistency stay deferred.
+//! (getxattr/setxattr/listxattr/removexattr), POSIX ACLs (see `acl`),
+//! fallocate (punch-hole/zero-range/allocate), and mmap write-back
+//! consistency (`FUSE_WRITEBACK_CACHE`, negotiated in `init`).
+//! flock/byte-range locking and ioctl were considered and declined -- see
+//! ARCHITECTURE.md §14.2/§14.3 for why.
 
 pub mod acl;
 pub mod handles;
@@ -207,7 +209,28 @@ impl Filesystem for LchfsFilesystem {
     /// files come out narrower than on any other filesystem. With this set
     /// the raw mode arrives and `acl::inherit` decides between umask and ACL,
     /// mirroring the kernel's own `posix_acl_create`.
+    ///
+    /// `FUSE_WRITEBACK_CACHE` is requested separately below rather than in
+    /// the same call, so that a kernel lacking one capability does not cost
+    /// us the other -- `add_capabilities` rejects the whole set on any
+    /// unsupported bit.
     fn init(&mut self, _req: &Request, config: &mut fuser::KernelConfig) -> std::io::Result<()> {
+        // See ARCHITECTURE.md §13.2. The page cache becoming authoritative
+        // for dirty pages does not threaten the epoch model: a checkpoint
+        // commits whatever content the store holds when it runs, and
+        // sharding by inode_id still serializes one file's writes through
+        // one shard in arrival order. What it buys is mmap writes and small
+        // buffered writes coalescing in the page cache instead of taking a
+        // FUSE round-trip each.
+        if let Err(unsupported) =
+            config.add_capabilities(fuser::InitFlags::FUSE_WRITEBACK_CACHE)
+        {
+            tracing::warn!(
+                ?unsupported,
+                "kernel does not support FUSE_WRITEBACK_CACHE; writes stay write-through"
+            );
+        }
+
         let wanted = fuser::InitFlags::FUSE_POSIX_ACL | fuser::InitFlags::FUSE_DONT_MASK;
         if let Err(unsupported) = config.add_capabilities(wanted) {
             tracing::warn!(
