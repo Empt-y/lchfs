@@ -109,6 +109,21 @@ pub enum PoolError {
     NoSuchXattr(String),
 }
 
+/// `fallocate(2)`'s modes, decoded from the raw `FALLOC_FL_*` bitmask by
+/// `lchfs-fuse` so protocol-level encodings stay out of the engine
+/// (ARCHITECTURE.md §5a).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FallocateMode {
+    /// Plain allocation. `keep_size` mirrors `FALLOC_FL_KEEP_SIZE`.
+    Allocate { keep_size: bool },
+    /// `FALLOC_FL_PUNCH_HOLE`: deallocate the range, reading as zeros
+    /// afterwards. Always leaves the file size unchanged.
+    PunchHole,
+    /// `FALLOC_FL_ZERO_RANGE`: the range reads as zeros afterwards; may
+    /// extend the file unless `keep_size`.
+    ZeroRange { keep_size: bool },
+}
+
 /// `setxattr`'s create/replace semantics (`XATTR_CREATE`/`XATTR_REPLACE`).
 /// A plain enum rather than the raw libc flag bits so `lchfs-store` stays
 /// free of protocol-level encodings (ARCHITECTURE.md §5a).
@@ -793,6 +808,28 @@ impl Pool {
         self.0.set_size(ino, new_size)
     }
 
+    /// `fallocate(2)` (ARCHITECTURE.md §9's Phase 2 list).
+    ///
+    /// Punch-hole and zero-range are fully implemented: the range is
+    /// deallocated, reads return zeros, and no extents are stored for it.
+    ///
+    /// **`Allocate` is a size change only, deliberately.** Real
+    /// preallocation promises a later write into the range cannot fail with
+    /// `ENOSPC`, and this engine has no block-reservation or space-accounting
+    /// concept to make that promise with -- a pool's capacity is just the
+    /// host filesystem's free space (§8's Phase 1 scope). So `Allocate`
+    /// extends the file when asked and otherwise does nothing, rather than
+    /// writing zeros that would consume the very space it claims to reserve.
+    pub fn fallocate(
+        &self,
+        ino: u64,
+        offset: u64,
+        len: u64,
+        mode: FallocateMode,
+    ) -> Result<(), PoolError> {
+        self.0.fallocate(ino, offset, len, mode)
+    }
+
     pub fn lookup(&self, parent_ino: u64, name: &str) -> Result<Option<u64>, PoolError> {
         self.0.lookup(parent_ino, name)
     }
@@ -1350,13 +1387,10 @@ impl PoolShared {
         if self.file_state.lock().contains_key(&ino) {
             return Ok(());
         }
-        let content_ref = {
+        let (content_ref, size) = {
             let namespace = self.namespace.lock();
-            namespace
-                .inodes
-                .get(&ino)
-                .map(|i| i.content.clone())
-                .ok_or(PoolError::NoSuchInode(ino))?
+            let inode = namespace.inodes.get(&ino).ok_or(PoolError::NoSuchInode(ino))?;
+            (inode.content.clone(), inode.size)
         };
         let (contents, chunks) = match content_ref {
             ContentRef::Inline(bytes) => (bytes, Vec::new()),
@@ -1364,10 +1398,19 @@ impl PoolShared {
                 let ihl_bytes = self.read_meta_object_bytes(hash)?;
                 let ihl: IndirectHashList =
                     lchfs_format::decode(&ihl_bytes).map_err(|e| PoolError::Format(e.to_string()))?;
-                let mut buf = Vec::new();
+                // Place each chunk at its own `logical_offset` rather than
+                // concatenating: a sparse file's chunk list has gaps where
+                // its holes are, and concatenation would slide every chunk
+                // after a hole down to the wrong offset. The buffer starts
+                // zeroed, so holes materialize as zeros for free.
+                let mut buf = vec![0u8; size as usize];
                 for chunk in &ihl.chunks {
                     let chunk_bytes = self.read_chunk_bytes(chunk.content_hash)?;
-                    buf.extend_from_slice(&chunk_bytes);
+                    let start = chunk.logical_offset as usize;
+                    let end = (start + chunk_bytes.len()).min(buf.len());
+                    if start < end {
+                        buf[start..end].copy_from_slice(&chunk_bytes[..end - start]);
+                    }
                 }
                 (buf, ihl.chunks)
             }
@@ -1832,6 +1875,78 @@ impl PoolShared {
         self.rechunk_and_touch(ino)
     }
 
+    /// `fallocate(2)` (ARCHITECTURE.md §9's Phase 2 "fallocate
+    /// punch-hole/zero-range"). Shares `set_size`'s discipline: take the
+    /// per-inode lock, materialize any open session, then operate on the
+    /// working buffer and rechunk.
+    ///
+    /// Punch-hole and zero-range both come down to zeroing the range;
+    /// `rechunk_and_touch` then drops the resulting all-zero chunks, so the
+    /// range genuinely disappears from the chunk list rather than becoming a
+    /// run of zero extents.
+    fn fallocate(
+        &self,
+        ino: u64,
+        offset: u64,
+        len: u64,
+        mode: FallocateMode,
+    ) -> Result<(), PoolError> {
+        let kind = {
+            let namespace = self.namespace.lock();
+            namespace.inodes.get(&ino).map(|i| i.kind).ok_or(PoolError::NoSuchInode(ino))?
+        };
+        if kind != InodeKind::File {
+            return Err(PoolError::Format(format!("ino {ino} is not a regular file")));
+        }
+        if len == 0 {
+            return Err(PoolError::InvalidArgument("fallocate length must be non-zero".into()));
+        }
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| PoolError::InvalidArgument("fallocate range overflows".into()))?;
+        if end > MAX_FILE_SIZE {
+            return Err(PoolError::TooLarge(end));
+        }
+
+        let ino_lock = self.lock_for_ino(ino);
+        let _guard = ino_lock.lock();
+        self.materialize_session_into_file_state(ino)?;
+        self.hydrate_file_state(ino)?;
+
+        {
+            let mut file_state = self.file_state.lock();
+            let state = file_state.get_mut(&ino).ok_or(PoolError::NoSuchInode(ino))?;
+            let grows = end > state.contents.len() as u64;
+            match mode {
+                // Without a block-reservation concept there is nothing to
+                // reserve, so plain allocation is only ever a size change --
+                // and with KEEP_SIZE, nothing at all. See the honest caveat
+                // in `Pool::fallocate`'s doc comment.
+                FallocateMode::Allocate { keep_size } => {
+                    if grows && !keep_size {
+                        state.contents.resize(end as usize, 0);
+                    }
+                }
+                FallocateMode::PunchHole => {
+                    // Never changes size, so a punch past EOF affects only
+                    // the part of the range that exists.
+                    let lo = (offset as usize).min(state.contents.len());
+                    let hi = (end as usize).min(state.contents.len());
+                    state.contents[lo..hi].fill(0);
+                }
+                FallocateMode::ZeroRange { keep_size } => {
+                    if grows && !keep_size {
+                        state.contents.resize(end as usize, 0);
+                    }
+                    let lo = (offset as usize).min(state.contents.len());
+                    let hi = (end as usize).min(state.contents.len());
+                    state.contents[lo..hi].fill(0);
+                }
+            }
+        }
+        self.rechunk_and_touch(ino)
+    }
+
     /// `setattr`'s mode/uid/gid/atime/mtime fields (ARCHITECTURE.md §9,
     /// Phase 2 ownership work). No open-session interaction like `set_size`
     /// has -- these fields live purely on `InodeObject`, not the working
@@ -1980,6 +2095,24 @@ impl PoolShared {
             let mut refs: Vec<ChunkRef> = Vec::with_capacity(boundaries.len());
             for b in boundaries {
                 let bytes = &content_snapshot[b.offset as usize..(b.offset + b.len as u64) as usize];
+                // An all-zero chunk is stored as a hole -- simply absent from
+                // the chunk list. `read` returns zeros for any range no chunk
+                // covers, so this is observationally identical to storing it,
+                // and it is what makes a punched hole (which zeroes the range
+                // and then lands here) genuinely sparse on disk rather than a
+                // run of zero chunks. Content-addressing already collapses
+                // those to one physical extent, but not their ChunkRef
+                // entries: a large hole would otherwise cost thousands of
+                // list entries and push against IndirectHashList's 64K-entry
+                // cap for no benefit.
+                //
+                // Bounded by `chunk_min_size` so a handful of incidental zero
+                // bytes doesn't fragment the list into tiny spans.
+                if b.len >= self.pool_params.chunk_min_size
+                    && bytes.iter().all(|&byte| byte == 0)
+                {
+                    continue;
+                }
                 let (hash, _loc) = match self.commit_chunk(ino, b.offset, bytes) {
                     Ok(v) => v,
                     Err(e) => {

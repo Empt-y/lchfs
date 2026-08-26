@@ -10,9 +10,10 @@
 //! `RENAME_EXCHANGE` (atomic two-way swap) isn't implemented -- rejected
 //! with `EINVAL` rather than silently misbehaving.
 //!
-//! Of §9's Phase 2+ list, xattrs are implemented here
-//! (getxattr/setxattr/listxattr/removexattr); flock/ioctl/fallocate stay
-//! deferred.
+//! Of §9's Phase 2+ list, implemented here: xattrs
+//! (getxattr/setxattr/listxattr/removexattr), POSIX ACLs (see `acl`), and
+//! fallocate (punch-hole/zero-range/allocate). flock/byte-range locking,
+//! ioctl and mmap write-back consistency stay deferred.
 
 pub mod acl;
 pub mod handles;
@@ -27,7 +28,7 @@ use fuser::{
     ReplyXattr, Request,
 };
 use lchfs_format::{InodeKind, InodeObject};
-use lchfs_store::{Pool, PoolError, XattrSetFlags};
+use lchfs_store::{FallocateMode, Pool, PoolError, XattrSetFlags};
 use parking_lot::Mutex;
 use std::ffi::OsStr;
 use std::sync::Arc;
@@ -272,6 +273,49 @@ impl Filesystem for LchfsFilesystem {
         }
         match self.pool.getattr(ino.0) {
             Ok(inode) => reply.attr(&TTL, &file_attr(ino.0, &inode)),
+            Err(e) => reply.error(errno_for(&e)),
+        }
+    }
+
+    fn fallocate(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: fuser::FileHandle,
+        offset: u64,
+        length: u64,
+        mode: i32,
+        reply: ReplyEmpty,
+    ) {
+        // Raw FALLOC_FL_* bits are decoded here, not in lchfs-store, so the
+        // engine's API stays free of protocol encodings (§5a).
+        const KEEP_SIZE: i32 = 0x01;
+        const PUNCH_HOLE: i32 = 0x02;
+        const ZERO_RANGE: i32 = 0x10;
+
+        let keep_size = mode & KEEP_SIZE != 0;
+        let mode = match mode & !KEEP_SIZE {
+            0 => FallocateMode::Allocate { keep_size },
+            PUNCH_HOLE => {
+                // fallocate(2): PUNCH_HOLE must be used with KEEP_SIZE.
+                if !keep_size {
+                    reply.error(Errno::EINVAL);
+                    return;
+                }
+                FallocateMode::PunchHole
+            }
+            ZERO_RANGE => FallocateMode::ZeroRange { keep_size },
+            // COLLAPSE_RANGE, INSERT_RANGE, UNSHARE_RANGE and anything else:
+            // EOPNOTSUPP is the documented answer for a mode a filesystem
+            // does not implement, and is what callers probe for.
+            _ => {
+                reply.error(Errno::EOPNOTSUPP);
+                return;
+            }
+        };
+
+        match self.pool.fallocate(ino.0, offset, length, mode) {
+            Ok(()) => reply.ok(),
             Err(e) => reply.error(errno_for(&e)),
         }
     }

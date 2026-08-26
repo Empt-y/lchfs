@@ -35,4 +35,14 @@ pub use superblock::{
 /// On-disk format version, stored in every superblock slot. Bump on any
 /// breaking schema change; `lchfs-fsck`/mount-time checks refuse to proceed
 /// on an unrecognized version rather than guessing.
-pub const FORMAT_VERSION: u32 = 1;
+///
+/// - v1: original format.
+/// - v2: sparse files. No *type* changed -- an `IndirectHashList` is still
+///   `Vec<ChunkRef>` and decodes identically -- but a gap between chunks is
+///   now meaningful, denoting a hole that reads as zeros. A v1 reader
+///   concatenates chunks rather than placing them at their `logical_offset`,
+///   so it would silently shift every byte after a hole; hence a version
+///   bump, so such a reader refuses the pool instead. A v2 reader handles v1
+///   pools correctly with no migration, since a v1 chunk list simply has no
+///   gaps.
+pub const FORMAT_VERSION: u32 = 2;

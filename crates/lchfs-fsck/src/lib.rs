@@ -350,8 +350,17 @@ impl Walker {
                         .errors
                         .push(FsckError::UnsortedOrOverlappingChunkList { ino });
                 }
+                // Sparse files (format v2) leave gaps in the chunk list where
+                // their holes are, so the chunk lengths sum to *at most* the
+                // declared size rather than exactly it. What must still hold
+                // is that no chunk describes bytes past the end of the file --
+                // that would be genuine corruption, not sparseness.
                 let actual: u64 = ihl.chunks.iter().map(|c: &ChunkRef| c.len as u64).sum();
-                if actual != inode.size {
+                let past_eof = ihl
+                    .chunks
+                    .last()
+                    .is_some_and(|c| c.logical_offset + c.len as u64 > inode.size);
+                if actual > inode.size || past_eof {
                     self.report.errors.push(FsckError::SizeMismatch { ino, declared: inode.size, actual });
                 }
                 for chunk in &ihl.chunks {
