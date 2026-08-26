@@ -327,13 +327,17 @@ impl Pool {
 
         let mut inodes = HashMap::new();
         let (now_secs, now_nanos) = now_unix();
+        // The root inode is owned by whoever runs `create`, not hardcoded to
+        // uid/gid 0 -- with `DefaultPermissions` enabled at mount time, a
+        // root owned by uid 0 would lock a non-root mounting user out of
+        // writing to their own pool's root directory.
         inodes.insert(
             ROOT_DIR_INO,
             InodeObject {
                 kind: InodeKind::Directory,
                 mode: 0o755,
-                uid: 0,
-                gid: 0,
+                uid: nix::unistd::getuid().as_raw(),
+                gid: nix::unistd::getgid().as_raw(),
                 size: 0,
                 nlink: 2,
                 atime: (now_secs, now_nanos),

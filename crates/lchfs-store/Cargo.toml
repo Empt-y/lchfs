@@ -20,12 +20,13 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 blake3 = { workspace = true }
 serde = { workspace = true }
-nix = { workspace = true, features = ["fs"] }
+nix = { workspace = true, features = ["fs", "user"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 criterion = { workspace = true }
 lchfs-fsck = { workspace = true }
+nix = { workspace = true, features = ["user"] }
 
 [[bench]]
 name = "concurrent_writes"

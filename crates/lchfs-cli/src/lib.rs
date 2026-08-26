@@ -64,17 +64,18 @@ fn create_pool(path: &std::path::Path) -> anyhow::Result<()> {
 fn mount(pool: &std::path::Path, mountpoint: &std::path::Path) -> anyhow::Result<()> {
     let pool = std::sync::Arc::new(lchfs_store::Pool::open(pool)?);
     let fs = lchfs_fuse::LchfsFilesystem::new(pool);
-    // No `DefaultPermissions`: `Pool` hardcodes uid/gid 0 on the root
-    // inode (ARCHITECTURE.md's `setattr`/chown support is still
-    // unimplemented, so there's no way to change that), and the kernel
-    // enforcing normal permission bits against that would lock out every
-    // non-root mounting user. Deferring entirely to the filesystem layer
-    // (which performs no checks yet) matches Phase B's not-yet-modeled
-    // permissions story instead of accidentally denying everyone.
+    // `DefaultPermissions`: the kernel enforces normal read/write/traverse
+    // permission checks against each inode's reported mode/uid/gid (lchfs
+    // itself never checked these). Safe now that `Pool::create` owns the
+    // root inode as the creating user rather than hardcoding uid/gid 0 --
+    // see that method's doc comment.
     let mut config = fuser::Config::default();
     config
         .mount_options
         .push(fuser::MountOption::FSName("lchfs".to_string()));
+    config
+        .mount_options
+        .push(fuser::MountOption::DefaultPermissions);
     fuser::mount(fs, mountpoint, &config)?;
     Ok(())
 }
