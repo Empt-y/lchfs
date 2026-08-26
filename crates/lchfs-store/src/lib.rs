@@ -93,6 +93,10 @@ pub enum PoolError {
     NotASymlink(u64),
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+    #[error(
+        "pool was written with on-disk format version {found}, but this build only supports up to {supported} -- upgrade lchfs to open it"
+    )]
+    UnsupportedFormatVersion { found: u32, supported: u32 },
 }
 
 /// Filesystem-wide usage stats for `statfs` (ARCHITECTURE.md §9). See
@@ -2775,6 +2779,17 @@ fn read_superblock(backend: &FileBackend) -> Result<Option<SuperblockSlot>, Pool
         }
         if compute_superblock_slot_checksum(&slot) != slot.header_checksum {
             continue;
+        }
+        // Only trust `format_version` once magic and CRC have vouched for the
+        // slot -- and then treat a too-new one as fatal rather than skipping
+        // it. Skipping would silently fall back to an older, still-valid slot
+        // written before the upgrade, i.e. mount a stale epoch and present it
+        // as current: a far worse failure than refusing to open.
+        if slot.format_version > lchfs_format::FORMAT_VERSION {
+            return Err(PoolError::UnsupportedFormatVersion {
+                found: slot.format_version,
+                supported: lchfs_format::FORMAT_VERSION,
+            });
         }
         if best.as_ref().is_none_or(|b| slot.generation > b.generation) {
             best = Some(slot);

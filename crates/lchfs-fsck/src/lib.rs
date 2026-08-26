@@ -53,6 +53,10 @@ pub enum FsckError {
     UnreadableObject { hash: Hash32, detail: String },
     #[error("no valid superblock slot found at {0}")]
     NoValidSuperblock(String),
+    #[error(
+        "pool was written with on-disk format version {found}, but this build only supports up to {supported} -- upgrade lchfs to check it"
+    )]
+    UnsupportedFormatVersion { found: u32, supported: u32 },
     #[error("I/O error: {0}")]
     Io(String),
 }
@@ -136,6 +140,16 @@ pub fn read_superblock(pool_root: &Path) -> Result<SuperblockSlot, FsckError> {
         }
         if compute_superblock_slot_checksum(&slot) != slot.header_checksum {
             continue;
+        }
+        // Mirrors lchfs-store's own read_superblock: only trust the version
+        // once magic and CRC vouch for the slot, then fail hard rather than
+        // skipping to an older slot and diagnosing a stale epoch as if it
+        // were current.
+        if slot.format_version > lchfs_format::FORMAT_VERSION {
+            return Err(FsckError::UnsupportedFormatVersion {
+                found: slot.format_version,
+                supported: lchfs_format::FORMAT_VERSION,
+            });
         }
         if best.as_ref().is_none_or(|b| slot.generation > b.generation) {
             best = Some(slot);
