@@ -57,6 +57,8 @@ use parking_lot::{Mutex, RwLock};
 use prep::{IngestPreparationPool, PrepTask, PreparedChunk, prepare_chunk};
 use segment::{SegmentError, SegmentReader, SegmentWriter};
 use std::collections::{HashMap, HashSet};
+use nix::errno::Errno;
+use nix::fcntl::{Flock, FlockArg};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -97,6 +99,8 @@ pub enum PoolError {
         "pool was written with on-disk format version {found}, but this build only supports up to {supported} -- upgrade lchfs to open it"
     )]
     UnsupportedFormatVersion { found: u32, supported: u32 },
+    #[error("pool at {0} is already open in another process")]
+    PoolLocked(String),
 }
 
 /// Filesystem-wide usage stats for `statfs` (ARCHITECTURE.md §9). See
@@ -262,6 +266,13 @@ struct PoolShared {
     pool_root: PathBuf,
     pool_params: PoolParams,
     superblock_backend: FileBackend,
+    /// Advisory single-writer guard on `<pool_root>/LOCK` (ARCHITECTURE.md
+    /// §1's pool layout). Never read -- held purely for its lifetime, and
+    /// released by `Flock`'s `Drop` when the `Pool` goes away. `flock(2)` is
+    /// also released by the kernel if the process dies, so a killed mount
+    /// leaves no stale lock to clean up, matching §7's "inert, no active
+    /// cleanup required for correctness" philosophy.
+    _pool_lock: Flock<std::fs::File>,
 
     namespace: Mutex<Namespace>,
     file_state: Mutex<HashMap<u64, FileWorkingState>>,
@@ -324,6 +335,7 @@ impl Pool {
     /// checkpoint so the empty pool is immediately mountable.
     pub fn create(pool_root: &Path, params: PoolParams) -> Result<Self, PoolError> {
         std::fs::create_dir_all(pool_root)?;
+        let pool_lock = acquire_pool_lock(pool_root)?;
         let superblock_backend = FileBackend::open(pool_root)?;
         if read_superblock(&superblock_backend)?.is_some() {
             return Err(PoolError::AlreadyExists(pool_root.display().to_string()));
@@ -397,6 +409,7 @@ impl Pool {
             pool_root: pool_root.to_path_buf(),
             pool_params: params,
             superblock_backend,
+            _pool_lock: pool_lock,
             namespace: Mutex::new(namespace),
             file_state: Mutex::new(HashMap::new()),
             open_files: Mutex::new(HashMap::new()),
@@ -438,6 +451,7 @@ impl Pool {
     /// in E.9; this is still the single-tier global-only recovery Phase B
     /// had.)
     pub fn open(pool_root: &Path) -> Result<Self, PoolError> {
+        let pool_lock = acquire_pool_lock(pool_root)?;
         let superblock_backend = FileBackend::open(pool_root)?;
         let slot = read_superblock(&superblock_backend)?.ok_or_else(|| {
             PoolError::Format(format!(
@@ -698,6 +712,7 @@ impl Pool {
             pool_root: pool_root.to_path_buf(),
             pool_params: root.pool_params,
             superblock_backend,
+            _pool_lock: pool_lock,
             namespace: Mutex::new(namespace),
             file_state: Mutex::new(file_state_from_replay),
             open_files: Mutex::new(HashMap::new()),
@@ -2752,6 +2767,50 @@ fn owner_shard_rescan(
         scan_one_segment(reader, segment_id, locations)?;
     }
     Ok(())
+}
+
+/// Takes the exclusive advisory lock on `<pool_root>/LOCK` (ARCHITECTURE.md
+/// §1's pool layout), which every live `Pool` holds for its whole lifetime.
+///
+/// Non-blocking on purpose: a second opener should fail immediately with a
+/// clear message rather than hang waiting on a mount that may run for days.
+///
+/// `flock(2)` locks are held by the open file description, so two `Pool`s in
+/// one process conflict just as two processes do -- which is what makes the
+/// CLI safe, since `stats`/`snapshot`/`fsck --rebuild-index` each open their
+/// own `Pool` and could previously race a live mount.
+///
+/// Exposed publicly as [`PoolLockGuard`] via [`lock_pool`] so out-of-process
+/// writers that deliberately never open a `Pool` -- notably `lchfs-fsck`'s
+/// `rebuild_index`, which rewrites (and may delete and recreate)
+/// `INDEX.redb` -- can take the same guard instead of racing a live mount.
+fn acquire_pool_lock(pool_root: &Path) -> Result<Flock<std::fs::File>, PoolError> {
+    let path = pool_root.join("LOCK");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)?;
+    match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+        Ok(guard) => Ok(guard),
+        Err((_, Errno::EWOULDBLOCK)) => {
+            Err(PoolError::PoolLocked(pool_root.display().to_string()))
+        }
+        Err((_, errno)) => Err(PoolError::Io(std::io::Error::from(errno))),
+    }
+}
+
+/// An opaque, RAII hold on a pool's `LOCK` file, released on drop. Keeps
+/// `nix`'s `Flock` out of this crate's public API.
+#[derive(Debug)]
+pub struct PoolLockGuard(#[allow(dead_code)] Flock<std::fs::File>);
+
+/// Takes the same exclusive pool lock a live `Pool` holds, for callers that
+/// mutate a pool's on-disk state without opening one. Fails immediately with
+/// [`PoolError::PoolLocked`] if a `Pool` (or another such caller) holds it.
+pub fn lock_pool(pool_root: &Path) -> Result<PoolLockGuard, PoolError> {
+    acquire_pool_lock(pool_root).map(PoolLockGuard)
 }
 
 /// Reads all 16 superblock slots, keeps the CRC-valid ones, returns the

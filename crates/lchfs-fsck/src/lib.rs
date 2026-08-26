@@ -57,6 +57,8 @@ pub enum FsckError {
         "pool was written with on-disk format version {found}, but this build only supports up to {supported} -- upgrade lchfs to check it"
     )]
     UnsupportedFormatVersion { found: u32, supported: u32 },
+    #[error("cannot rebuild the index while the pool is in use: {0}")]
+    PoolLocked(String),
     #[error("I/O error: {0}")]
     Io(String),
 }
@@ -447,6 +449,13 @@ pub fn verify_index(pool_root: &Path, live_roots: &[Hash32]) -> FsckReport {
 /// at the current superblock's generation so the next `Pool::open` can
 /// take the fast (index-trusting) mount path.
 pub fn rebuild_index(pool_root: &Path) -> Result<(), FsckError> {
+    // Unlike the read-only checks, this rewrites INDEX.redb (and may delete
+    // and recreate it), so it must not run against a live mount. Read-only
+    // fsck deliberately takes no lock: the append-only, fsync-ordered format
+    // (§3) means anything already durable stays self-consistent even while a
+    // mount is writing.
+    let _lock = lchfs_store::lock_pool(pool_root)
+        .map_err(|e| FsckError::PoolLocked(format!("{e}")))?;
     let locations = scan_all_segments(pool_root)?;
     let generation = read_superblock(pool_root)?.generation;
 
