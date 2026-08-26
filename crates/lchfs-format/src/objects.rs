@@ -3,8 +3,9 @@
 //! `kind` matches (see extent.rs::ExtentKind) — this module defines their
 //! decoded, in-memory shape only; encoding is bincode via lchfs-store.
 
-use crate::Hash32;
+use crate::{DecodeError, EncodeError, Hash32};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// The root of a point-in-time filesystem tree. A superblock's `root_hash`
 /// points at one of these. ARCHITECTURE.md §1.
@@ -73,17 +74,54 @@ pub struct InodeObject {
     pub atime: (i64, u32),
     pub mtime: (i64, u32),
     pub ctime: (i64, u32),
-    /// Reserved, unpopulated in Phase 1 (ARCHITECTURE.md §9: xattrs are
-    /// explicitly deferred) — the field exists now so no format migration
-    /// is needed when xattr support lands.
+    /// `None` when the inode has no extended attributes at all, which is
+    /// the overwhelmingly common case and keeps those InodeObjects exactly
+    /// the size they were before xattrs existed.
     pub xattrs: Option<XattrBlob>,
     pub content: ContentRef,
     pub generation: u64,
 }
 
-/// Placeholder for reserved-but-unimplemented xattr storage.
+/// An inode's extended attributes, stored as an opaque byte blob whose
+/// contents are a bincode-encoded `BTreeMap<String, Vec<u8>>`.
+///
+/// The blob stays a bare `Vec<u8>` on the wire deliberately: the field was
+/// reserved with that exact shape in Phase 1, so giving it real contents
+/// needs no format-version bump and no migration -- an inode written before
+/// xattrs existed simply has `None` here and still decodes byte-for-byte.
+///
+/// `BTreeMap` rather than `HashMap` so iteration order is deterministic,
+/// matching the sorted-for-deterministic-hashing convention `DirectoryObject`
+/// and `InoMap` already follow: the same set of attributes must always
+/// produce the same bytes, or an InodeObject's content hash would change
+/// spuriously between checkpoints and defeat dedup.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct XattrBlob(pub Vec<u8>);
+
+impl XattrBlob {
+    /// Encodes an attribute map. Returns `None` for an empty map so callers
+    /// can store `InodeObject.xattrs: None` rather than a blob encoding
+    /// emptiness -- keeping "no xattrs" a single canonical representation.
+    pub fn from_map(map: &BTreeMap<String, Vec<u8>>) -> Result<Option<Self>, EncodeError> {
+        if map.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(Self(crate::encode(map)?)))
+    }
+
+    pub fn to_map(&self) -> Result<BTreeMap<String, Vec<u8>>, DecodeError> {
+        crate::decode(&self.0)
+    }
+
+    /// The attribute map for an `Option<XattrBlob>`, treating `None` as
+    /// empty -- the shape almost every caller actually wants.
+    pub fn map_of(slot: &Option<Self>) -> Result<BTreeMap<String, Vec<u8>>, DecodeError> {
+        match slot {
+            Some(blob) => blob.to_map(),
+            None => Ok(BTreeMap::new()),
+        }
+    }
+}
 
 /// How an InodeObject's content is stored. ARCHITECTURE.md §1: files below
 /// `PoolParams::inline_threshold` embed directly (deliberately not

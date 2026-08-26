@@ -50,7 +50,8 @@ use lchfs_format::{
     ChunkRef, CodecId, ContentRef, DirEntry, DirectoryObject, ExtentKind, ExtentLocation, Hash32,
     InoMap, InoMapEntry, InodeKind, InodeObject, IndirectHashList, PoolParams, RootObject,
     SnapshotEntry, SnapshotTable, StreamKind, SuperblockSlot, SUPERBLOCK_MAGIC, SUPERBLOCK_SLOT_COUNT,
-    SUPERBLOCK_SLOT_SIZE, compute_superblock_slot_checksum, finalize_superblock_slot_checksum,
+    SUPERBLOCK_SLOT_SIZE, XattrBlob, compute_superblock_slot_checksum,
+    finalize_superblock_slot_checksum,
 };
 use lchfs_index::{ChunkLocationCache, IndexError, IndexStore, PendingDedupPins, RedbIndex};
 use parking_lot::{Mutex, RwLock};
@@ -101,6 +102,24 @@ pub enum PoolError {
     UnsupportedFormatVersion { found: u32, supported: u32 },
     #[error("pool at {0} is already open in another process")]
     PoolLocked(String),
+    /// Distinct from `NotFound`, which means a path/name lookup failed:
+    /// this maps to `ENODATA`, the errno `xattr(7)` specifies for a missing
+    /// attribute, whereas `NotFound` maps to `ENOENT`.
+    #[error("no such extended attribute: {0}")]
+    NoSuchXattr(String),
+}
+
+/// `setxattr`'s create/replace semantics (`XATTR_CREATE`/`XATTR_REPLACE`).
+/// A plain enum rather than the raw libc flag bits so `lchfs-store` stays
+/// free of protocol-level encodings (ARCHITECTURE.md §5a).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XattrSetFlags {
+    /// Create or overwrite, whichever applies.
+    None,
+    /// Fail with `AlreadyExists` if the attribute is already present.
+    Create,
+    /// Fail with `NoSuchXattr` if the attribute is not already present.
+    Replace,
 }
 
 /// Filesystem-wide usage stats for `statfs` (ARCHITECTURE.md §9). See
@@ -126,6 +145,15 @@ pub struct PoolStats {
 /// returns EFBIG instead of attempting a multi-terabyte allocation that
 /// can OOM-kill the whole mount daemon.
 const MAX_FILE_SIZE: u64 = 8 * 1024 * 1024 * 1024; // 8 GiB
+
+/// Extended-attribute limits, chosen to match what Linux filesystems
+/// conventionally allow (`XATTR_NAME_MAX`/`XATTR_SIZE_MAX`) so callers see
+/// familiar behaviour. The total cap matters most here: xattrs live inside
+/// `InodeObject`, so every checkpoint that rewrites the inode rewrites all
+/// of them, and an unbounded set would make that arbitrarily expensive.
+const MAX_XATTR_NAME_LEN: usize = 255;
+const MAX_XATTR_VALUE_LEN: usize = 64 * 1024;
+const MAX_XATTR_TOTAL_LEN: usize = 64 * 1024;
 
 impl From<SegmentError> for PoolError {
     fn from(e: SegmentError) -> Self {
@@ -845,6 +873,32 @@ impl Pool {
         mtime: Option<(i64, u32)>,
     ) -> Result<(), PoolError> {
         self.0.set_attr(ino, mode, uid, gid, atime, mtime)
+    }
+
+    /// Extended attributes (ARCHITECTURE.md §9's Phase 2 list). Stored
+    /// inside `InodeObject`, so they participate in ordinary checkpointing,
+    /// dedup and GC with no special-casing.
+    pub fn get_xattr(&self, ino: u64, name: &str) -> Result<Vec<u8>, PoolError> {
+        self.0.get_xattr(ino, name)
+    }
+
+    /// Attribute names only, sorted (`BTreeMap` iteration order).
+    pub fn list_xattrs(&self, ino: u64) -> Result<Vec<String>, PoolError> {
+        self.0.list_xattrs(ino)
+    }
+
+    pub fn set_xattr(
+        &self,
+        ino: u64,
+        name: &str,
+        value: &[u8],
+        flags: XattrSetFlags,
+    ) -> Result<(), PoolError> {
+        self.0.set_xattr(ino, name, value, flags)
+    }
+
+    pub fn remove_xattr(&self, ino: u64, name: &str) -> Result<(), PoolError> {
+        self.0.remove_xattr(ino, name)
     }
 
     /// The target string of a symlink inode.
@@ -1729,6 +1783,90 @@ impl PoolShared {
         if let Some(mtime) = mtime {
             inode.mtime = mtime;
         }
+        inode.ctime = now_unix();
+        namespace.dirty_inodes.insert(ino);
+        Ok(())
+    }
+
+    /// Extended attributes live inside `InodeObject`, so all four operations
+    /// are the same shape as `set_attr`: mutate under the namespace lock and
+    /// mark the inode dirty, letting the ordinary checkpoint path persist it.
+    /// No content/session interaction -- xattrs never touch file bytes.
+    fn get_xattr(&self, ino: u64, name: &str) -> Result<Vec<u8>, PoolError> {
+        let namespace = self.namespace.lock();
+        let inode = namespace.inodes.get(&ino).ok_or(PoolError::NoSuchInode(ino))?;
+        let map = XattrBlob::map_of(&inode.xattrs).map_err(|e| PoolError::Format(e.to_string()))?;
+        map.get(name).cloned().ok_or_else(|| PoolError::NoSuchXattr(name.to_string()))
+    }
+
+    fn list_xattrs(&self, ino: u64) -> Result<Vec<String>, PoolError> {
+        let namespace = self.namespace.lock();
+        let inode = namespace.inodes.get(&ino).ok_or(PoolError::NoSuchInode(ino))?;
+        let map = XattrBlob::map_of(&inode.xattrs).map_err(|e| PoolError::Format(e.to_string()))?;
+        Ok(map.into_keys().collect())
+    }
+
+    fn set_xattr(
+        &self,
+        ino: u64,
+        name: &str,
+        value: &[u8],
+        flags: XattrSetFlags,
+    ) -> Result<(), PoolError> {
+        if name.is_empty() {
+            return Err(PoolError::InvalidArgument("empty xattr name".to_string()));
+        }
+        if name.len() > MAX_XATTR_NAME_LEN {
+            return Err(PoolError::TooLarge(name.len() as u64));
+        }
+        if value.len() > MAX_XATTR_VALUE_LEN {
+            return Err(PoolError::TooLarge(value.len() as u64));
+        }
+
+        let mut namespace = self.namespace.lock();
+        let inode = namespace.inodes.get_mut(&ino).ok_or(PoolError::NoSuchInode(ino))?;
+        let mut map =
+            XattrBlob::map_of(&inode.xattrs).map_err(|e| PoolError::Format(e.to_string()))?;
+        let exists = map.contains_key(name);
+        match flags {
+            XattrSetFlags::Create if exists => {
+                return Err(PoolError::AlreadyExists(name.to_string()));
+            }
+            XattrSetFlags::Replace if !exists => {
+                return Err(PoolError::NoSuchXattr(name.to_string()));
+            }
+            _ => {}
+        }
+        map.insert(name.to_string(), value.to_vec());
+
+        // Cap the whole set, not just the one attribute: many small
+        // attributes would otherwise bloat an InodeObject (and therefore
+        // every checkpoint that rewrites it) without any single one
+        // tripping the per-value limit.
+        let encoded = XattrBlob::from_map(&map).map_err(|e| PoolError::Format(e.to_string()))?;
+        if let Some(blob) = &encoded
+            && blob.0.len() > MAX_XATTR_TOTAL_LEN
+        {
+            return Err(PoolError::TooLarge(blob.0.len() as u64));
+        }
+        inode.xattrs = encoded;
+        inode.ctime = now_unix();
+        namespace.dirty_inodes.insert(ino);
+        Ok(())
+    }
+
+    fn remove_xattr(&self, ino: u64, name: &str) -> Result<(), PoolError> {
+        let mut namespace = self.namespace.lock();
+        let inode = namespace.inodes.get_mut(&ino).ok_or(PoolError::NoSuchInode(ino))?;
+        let mut map =
+            XattrBlob::map_of(&inode.xattrs).map_err(|e| PoolError::Format(e.to_string()))?;
+        if map.remove(name).is_none() {
+            return Err(PoolError::NoSuchXattr(name.to_string()));
+        }
+        // from_map collapses an emptied map back to None, so removing the
+        // last attribute restores the inode to its pre-xattr encoding rather
+        // than leaving a blob that encodes emptiness.
+        inode.xattrs = XattrBlob::from_map(&map).map_err(|e| PoolError::Format(e.to_string()))?;
         inode.ctime = now_unix();
         namespace.dirty_inodes.insert(ino);
         Ok(())

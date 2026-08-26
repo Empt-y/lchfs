@@ -4,12 +4,15 @@
 //! callback into a `Pool` method call.
 //!
 //! ARCHITECTURE.md §9 lists the Phase 1 POSIX/FUSE surface. `Pool` now
-//! implements the full list: lookup, getattr, setattr (size only),
-//! opendir/readdir, open/read/write/release, create, mkdir, flush/fsync,
-//! unlink, rmdir, rename, symlink, readlink, link, statfs. `RENAME_EXCHANGE`
-//! (atomic two-way swap) isn't implemented -- rejected with `EINVAL` rather
-//! than silently misbehaving; xattrs/flock/ioctl/fallocate stay deferred
-//! per ARCHITECTURE.md §9's explicit Phase 2+ list.
+//! implements the full list: lookup, getattr, setattr (mode/uid/gid/size/
+//! times), opendir/readdir, open/read/write/release, create, mkdir,
+//! flush/fsync, unlink, rmdir, rename, symlink, readlink, link, statfs.
+//! `RENAME_EXCHANGE` (atomic two-way swap) isn't implemented -- rejected
+//! with `EINVAL` rather than silently misbehaving.
+//!
+//! Of §9's Phase 2+ list, xattrs are implemented here
+//! (getxattr/setxattr/listxattr/removexattr); flock/ioctl/fallocate stay
+//! deferred.
 
 pub mod handles;
 pub mod inodes;
@@ -20,10 +23,10 @@ pub use inodes::InodeAllocator;
 use fuser::{
     Errno, FileAttr, FileType, Filesystem, Generation, INodeNo, ReplyAttr, ReplyCreate,
     ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite,
-    Request,
+    ReplyXattr, Request,
 };
 use lchfs_format::{InodeKind, InodeObject};
-use lchfs_store::{Pool, PoolError};
+use lchfs_store::{Pool, PoolError, XattrSetFlags};
 use parking_lot::Mutex;
 use std::ffi::OsStr;
 use std::sync::Arc;
@@ -71,12 +74,29 @@ fn errno_for(err: &PoolError) -> Errno {
         PoolError::IsADirectory(_) => Errno::EISDIR,
         PoolError::NotEmpty(_) => Errno::ENOTEMPTY,
         PoolError::NotASymlink(_) => Errno::EINVAL,
+        // ENODATA, not ENOENT: xattr(7) distinguishes "this attribute isn't
+        // set" from "this file doesn't exist", and getfattr/setfacl rely on
+        // the difference.
+        PoolError::NoSuchXattr(_) => Errno::ENODATA,
         PoolError::InvalidArgument(_) => Errno::EINVAL,
         // Both only reachable via Pool::open/create, which happen before the
         // mount is serving callbacks -- mapped for exhaustiveness, not
         // because a live FUSE request can produce either.
         PoolError::UnsupportedFormatVersion { .. } => Errno::EINVAL,
         PoolError::PoolLocked(_) => Errno::EBUSY,
+    }
+}
+
+/// The `getxattr`/`listxattr` size protocol, identical for both: a `size` of
+/// 0 is a probe asking how many bytes the caller should allocate; otherwise
+/// the value is returned if it fits, and `ERANGE` if it does not.
+fn reply_xattr_bytes(reply: ReplyXattr, bytes: &[u8], size: u32) {
+    if size == 0 {
+        reply.size(bytes.len() as u32);
+    } else if (bytes.len() as u32) <= size {
+        reply.data(bytes);
+    } else {
+        reply.error(Errno::ERANGE);
     }
 }
 
@@ -191,6 +211,77 @@ impl Filesystem for LchfsFilesystem {
         }
         match self.pool.getattr(ino.0) {
             Ok(inode) => reply.attr(&TTL, &file_attr(ino.0, &inode)),
+            Err(e) => reply.error(errno_for(&e)),
+        }
+    }
+
+    fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
+        let Some(name) = name.to_str() else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        match self.pool.get_xattr(ino.0, name) {
+            Ok(value) => reply_xattr_bytes(reply, &value, size),
+            Err(e) => reply.error(errno_for(&e)),
+        }
+    }
+
+    fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
+        match self.pool.list_xattrs(ino.0) {
+            // The wire format is the NUL-terminated names concatenated, so
+            // every name including the last carries a trailing NUL.
+            Ok(names) => {
+                let mut buf = Vec::new();
+                for name in names {
+                    buf.extend_from_slice(name.as_bytes());
+                    buf.push(0);
+                }
+                reply_xattr_bytes(reply, &buf, size)
+            }
+            Err(e) => reply.error(errno_for(&e)),
+        }
+    }
+
+    fn setxattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        name: &OsStr,
+        value: &[u8],
+        flags: i32,
+        _position: u32,
+        reply: ReplyEmpty,
+    ) {
+        let Some(name) = name.to_str() else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        // XATTR_CREATE and XATTR_REPLACE are mutually exclusive per
+        // setxattr(2); both set is EINVAL rather than a silent precedence.
+        let create = flags & nix::libc::XATTR_CREATE != 0;
+        let replace = flags & nix::libc::XATTR_REPLACE != 0;
+        let flags = match (create, replace) {
+            (true, true) => {
+                reply.error(Errno::EINVAL);
+                return;
+            }
+            (true, false) => XattrSetFlags::Create,
+            (false, true) => XattrSetFlags::Replace,
+            (false, false) => XattrSetFlags::None,
+        };
+        match self.pool.set_xattr(ino.0, name, value, flags) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(errno_for(&e)),
+        }
+    }
+
+    fn removexattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let Some(name) = name.to_str() else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        match self.pool.remove_xattr(ino.0, name) {
+            Ok(()) => reply.ok(),
             Err(e) => reply.error(errno_for(&e)),
         }
     }

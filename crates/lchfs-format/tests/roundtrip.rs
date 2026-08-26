@@ -430,3 +430,53 @@ proptest! {
         prop_assert!(is_out_of_bounds);
     }
 }
+
+// `XattrBlob`'s bytes are themselves a bincode-encoded attribute map, so the
+// raw-blob roundtrip above only proves the outer wrapper survives. These
+// cover the inner map encoding the store actually relies on.
+proptest! {
+    #[test]
+    fn xattr_map_roundtrips(
+        entries in pvec((".*", pvec(any::<u8>(), 0..64)), 0..8)
+    ) {
+        let map: std::collections::BTreeMap<String, Vec<u8>> = entries.into_iter().collect();
+        match XattrBlob::from_map(&map).unwrap() {
+            // An empty map deliberately encodes as absent, so "no xattrs"
+            // has exactly one representation and can't perturb an inode's
+            // content hash.
+            None => prop_assert!(map.is_empty()),
+            Some(blob) => {
+                prop_assert!(!map.is_empty());
+                prop_assert_eq!(blob.to_map().unwrap(), map);
+            }
+        }
+    }
+
+    /// The same set of attributes must always produce identical bytes,
+    /// whatever order they were inserted in -- otherwise an InodeObject's
+    /// content hash would vary spuriously and defeat dedup.
+    #[test]
+    fn xattr_encoding_is_insertion_order_independent(
+        entries in pvec(("[a-z]{1,8}", pvec(any::<u8>(), 0..16)), 1..8)
+    ) {
+        // Deduplicate first, then re-insert the *same* pairs in reverse:
+        // comparing the raw generated list instead would differ legitimately
+        // whenever it repeats a key, since last-write-wins picks a different
+        // value in each direction.
+        let forward: std::collections::BTreeMap<String, Vec<u8>> =
+            entries.into_iter().collect();
+        let reversed: std::collections::BTreeMap<String, Vec<u8>> =
+            forward.iter().rev().map(|(k, v)| (k.clone(), v.clone())).collect();
+        prop_assert_eq!(
+            XattrBlob::from_map(&forward).unwrap(),
+            XattrBlob::from_map(&reversed).unwrap()
+        );
+    }
+}
+
+/// `map_of` treats an absent blob as an empty map, which is the shape every
+/// caller in `lchfs-store` relies on.
+#[test]
+fn map_of_treats_none_as_empty() {
+    assert!(XattrBlob::map_of(&None).unwrap().is_empty());
+}
