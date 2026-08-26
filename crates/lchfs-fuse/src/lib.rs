@@ -14,6 +14,7 @@
 //! (getxattr/setxattr/listxattr/removexattr); flock/ioctl/fallocate stay
 //! deferred.
 
+pub mod acl;
 pub mod handles;
 pub mod inodes;
 
@@ -154,9 +155,69 @@ impl LchfsFilesystem {
             Err(e) => reply.error(errno_for(&e)),
         }
     }
+
+    /// What mode a new child of `parent` should be created with, honouring
+    /// any default ACL. Negotiating `FUSE_POSIX_ACL` moves both umask
+    /// application and default-ACL inheritance from the kernel to us, so
+    /// every create path has to go through here rather than applying the
+    /// umask directly.
+    fn inherited_for_new_child(&self, parent: u64, mode: u32, umask: u32, is_dir: bool) -> acl::Inherited {
+        let parent_default = self.pool.get_xattr(parent, acl::DEFAULT_XATTR).ok();
+        acl::inherit(parent_default.as_deref(), mode, umask, is_dir)
+    }
+
+    /// Applies the inherited ACLs to a freshly created inode. Best-effort by
+    /// design: the object already exists and its mode is already correct, so
+    /// failing to attach an ACL is worth a warning but not worth failing the
+    /// create and leaving a half-made entry behind.
+    fn apply_inherited_acls(&self, ino: u64, inherited: &acl::Inherited) {
+        for (name, value) in [
+            (acl::ACCESS_XATTR, inherited.access.as_ref()),
+            (acl::DEFAULT_XATTR, inherited.default.as_ref()),
+        ] {
+            if let Some(value) = value
+                && let Err(e) = self.pool.set_xattr(ino, name, value, XattrSetFlags::None)
+            {
+                tracing::warn!(ino, name, error = %e, "failed to apply inherited ACL");
+            }
+        }
+    }
 }
 
 impl Filesystem for LchfsFilesystem {
+    /// Negotiates POSIX ACL support. ACLs need no filesystem logic of their
+    /// own here: they are the `system.posix_acl_access`/`_default` xattrs,
+    /// already stored by the generic xattr path, and with this capability
+    /// the kernel does the ACL-aware permission checking and keeps the
+    /// mode's group bits in sync with the ACL mask -- exactly the division
+    /// of labour `DefaultPermissions` already uses for plain mode bits, and
+    /// what §5a's "no filesystem logic in the adapter" mandates.
+    ///
+    /// Soft capability: an older kernel that does not support it leaves
+    /// ordinary mode-bit enforcement working, so warn rather than fail the
+    /// mount.
+    ///
+    /// `FUSE_DONT_MASK` must be requested alongside it, and is not implied:
+    /// the kernel applies the umask to `mode` before sending create/mkdir
+    /// unless it is set, which would hand us an already-masked mode. That
+    /// breaks default-ACL inheritance specifically, because a default ACL is
+    /// supposed to *suppress* the umask -- with the mode pre-masked there is
+    /// no way to recover the bits the ACL should have kept, and inherited
+    /// files come out narrower than on any other filesystem. With this set
+    /// the raw mode arrives and `acl::inherit` decides between umask and ACL,
+    /// mirroring the kernel's own `posix_acl_create`.
+    fn init(&mut self, _req: &Request, config: &mut fuser::KernelConfig) -> std::io::Result<()> {
+        let wanted = fuser::InitFlags::FUSE_POSIX_ACL | fuser::InitFlags::FUSE_DONT_MASK;
+        if let Err(unsupported) = config.add_capabilities(wanted) {
+            tracing::warn!(
+                ?unsupported,
+                "kernel does not support POSIX ACL capabilities; ACLs and default-ACL \
+                 inheritance unavailable, plain mode-bit enforcement is unaffected"
+            );
+        }
+        Ok(())
+    }
+
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let Some(name) = name.to_str() else {
             reply.error(Errno::EINVAL);
@@ -410,23 +471,27 @@ impl Filesystem for LchfsFilesystem {
             reply.error(Errno::EINVAL);
             return;
         };
+        let inherited = self.inherited_for_new_child(parent.0, mode, umask, false);
         match self
             .pool
-            .create_file_as(parent.0, name, mode & !umask, req.uid(), req.gid())
+            .create_file_as(parent.0, name, inherited.mode, req.uid(), req.gid())
         {
-            Ok(ino) => match self.pool.getattr(ino) {
-                Ok(inode) => {
-                    let handle = self.handles.lock().open(ino);
-                    reply.created(
-                        &TTL,
-                        &file_attr(ino, &inode),
-                        GENERATION,
-                        fuser::FileHandle(handle.0),
-                        fuser::FopenFlags::empty(),
-                    );
+            Ok(ino) => {
+                self.apply_inherited_acls(ino, &inherited);
+                match self.pool.getattr(ino) {
+                    Ok(inode) => {
+                        let handle = self.handles.lock().open(ino);
+                        reply.created(
+                            &TTL,
+                            &file_attr(ino, &inode),
+                            GENERATION,
+                            fuser::FileHandle(handle.0),
+                            fuser::FopenFlags::empty(),
+                        );
+                    }
+                    Err(e) => reply.error(errno_for(&e)),
                 }
-                Err(e) => reply.error(errno_for(&e)),
-            },
+            }
             Err(e) => reply.error(errno_for(&e)),
         }
     }
@@ -444,11 +509,15 @@ impl Filesystem for LchfsFilesystem {
             reply.error(Errno::EINVAL);
             return;
         };
+        let inherited = self.inherited_for_new_child(parent.0, mode, umask, true);
         match self
             .pool
-            .mkdir_as(parent.0, name, mode & !umask, req.uid(), req.gid())
+            .mkdir_as(parent.0, name, inherited.mode, req.uid(), req.gid())
         {
-            Ok(ino) => self.entry_reply(ino, reply),
+            Ok(ino) => {
+                self.apply_inherited_acls(ino, &inherited);
+                self.entry_reply(ino, reply)
+            }
             Err(e) => reply.error(errno_for(&e)),
         }
     }
