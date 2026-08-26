@@ -385,3 +385,109 @@ fn a_v1_pool_still_opens_and_reads_under_v2() {
     // And partial reads, which is where offset placement would go wrong.
     assert_eq!(&pool.read(ino, 9_876, 4_321).unwrap()[..], &content[9_876..14_197]);
 }
+
+/// Appending to a sparse file seeds an incremental-append session from the
+/// existing (gapped) chunk list. Three separate code paths concatenate
+/// session chunks rather than placing them by offset, on the assumption that
+/// a session's chunks are contiguous -- this checks that assumption actually
+/// holds once holes exist, rather than trusting it.
+#[test]
+fn appending_to_a_sparse_file_preserves_the_hole() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = Pool::create(dir.path(), small_params()).unwrap();
+    let ino = pool.create_file(1, "f", 0o644).unwrap();
+    let content = deterministic_bytes(41, 30_000);
+    pool.write(ino, 0, &content).unwrap();
+    pool.fallocate(ino, 8_000, 10_000, FallocateMode::PunchHole).unwrap();
+    pool.checkpoint().unwrap();
+    drop(pool);
+
+    // Reopen so nothing is cached, then append at EOF -- the sequential
+    // fast path's trigger condition.
+    let pool = Pool::open(dir.path()).unwrap();
+    let ino = pool.lookup(1, "f").unwrap().unwrap();
+    let tail = deterministic_bytes(43, 5_000);
+    pool.write(ino, 30_000, &tail).unwrap();
+    pool.checkpoint().unwrap();
+
+    let mut expected = content.clone();
+    expected[8_000..18_000].fill(0);
+    expected.extend_from_slice(&tail);
+
+    assert_eq!(pool.getattr(ino).unwrap().size, 35_000);
+    assert_eq!(&pool.read(ino, 0, 35_000).unwrap()[..], &expected[..]);
+}
+
+/// Same shape, but with the append made durable by fsync and recovered
+/// through delta-log replay rather than a checkpoint.
+#[test]
+fn appending_to_a_sparse_file_then_fsync_survives_a_crash() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = Pool::create(dir.path(), small_params()).unwrap();
+    let ino = pool.create_file(1, "f", 0o644).unwrap();
+    let content = deterministic_bytes(47, 30_000);
+    pool.write(ino, 0, &content).unwrap();
+    pool.fallocate(ino, 8_000, 10_000, FallocateMode::PunchHole).unwrap();
+    pool.checkpoint().unwrap();
+
+    let tail = deterministic_bytes(53, 5_000);
+    pool.write(ino, 30_000, &tail).unwrap();
+    pool.fsync(ino).unwrap();
+    drop(pool);
+
+    let pool = Pool::open(dir.path()).unwrap();
+    let ino = pool.lookup(1, "f").unwrap().unwrap();
+    let mut expected = content.clone();
+    expected[8_000..18_000].fill(0);
+    expected.extend_from_slice(&tail);
+    assert_eq!(&pool.read(ino, 0, 35_000).unwrap()[..], &expected[..]);
+}
+
+/// Reads a sparse file at several points in an append's lifecycle. A live
+/// session is seeded from the existing (gapped) chunk list, and several code
+/// paths concatenate session chunks, so each stage is checked separately
+/// rather than only after a checkpoint.
+#[test]
+fn reads_are_correct_at_every_stage_of_appending_to_a_sparse_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = Pool::create(dir.path(), small_params()).unwrap();
+    let ino = pool.create_file(1, "f", 0o644).unwrap();
+    let content = deterministic_bytes(59, 30_000);
+    pool.write(ino, 0, &content).unwrap();
+    pool.fallocate(ino, 8_000, 10_000, FallocateMode::PunchHole).unwrap();
+    pool.checkpoint().unwrap();
+    drop(pool);
+
+    let pool = Pool::open(dir.path()).unwrap();
+    let ino = pool.lookup(1, "f").unwrap().unwrap();
+
+    let mut expected = content.clone();
+    expected[8_000..18_000].fill(0);
+
+    // Stage 1: fresh reopen, nothing cached, pure persisted-chunk path.
+    assert_eq!(&pool.read(ino, 0, 30_000).unwrap()[..], &expected[..], "stage 1: after reopen");
+
+    // Stage 2: append at EOF, which seeds a session from the gapped list.
+    let tail = deterministic_bytes(61, 5_000);
+    pool.write(ino, 30_000, &tail).unwrap();
+    expected.extend_from_slice(&tail);
+    assert_eq!(
+        &pool.read(ino, 0, 35_000).unwrap()[..],
+        &expected[..],
+        "stage 2: with a live append session over a sparse file"
+    );
+
+    // Stage 3: fsync finalizes the session down the fast path.
+    pool.fsync(ino).unwrap();
+    assert_eq!(&pool.read(ino, 0, 35_000).unwrap()[..], &expected[..], "stage 3: after fsync");
+
+    // Stage 4: full checkpoint.
+    pool.checkpoint().unwrap();
+    assert_eq!(&pool.read(ino, 0, 35_000).unwrap()[..], &expected[..], "stage 4: after checkpoint");
+
+    // Stage 5: clean reopen.
+    drop(pool);
+    let pool = Pool::open(dir.path()).unwrap();
+    let ino = pool.lookup(1, "f").unwrap().unwrap();
+    assert_eq!(&pool.read(ino, 0, 35_000).unwrap()[..], &expected[..], "stage 5: after reopen");
+}

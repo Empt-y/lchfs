@@ -696,7 +696,19 @@ impl Pool {
                         let (_h, ihl_bytes) = ihl_reader.read_record(*ihl_loc)?;
                         let ihl: IndirectHashList = lchfs_format::decode(&ihl_bytes)
                             .map_err(|e| PoolError::Format(e.to_string()))?;
-                        let mut contents = Vec::new();
+                        // Place each chunk at its own `logical_offset`, for
+                        // the same reason `hydrate_file_state` does: a
+                        // sparse file's chunk list has gaps where its holes
+                        // are, and concatenating would slide every chunk
+                        // after a hole down to the wrong offset. The buffer
+                        // starts zeroed, so holes come back as zeros.
+                        //
+                        // This is a second, independent materialization of
+                        // the same data as `hydrate_file_state` -- it exists
+                        // because a replayed inode's IndirectHashList lives
+                        // only in its shard's delta stream. Any change to how
+                        // a chunk list maps to bytes has to be made in both.
+                        let mut contents = vec![0u8; inode.size as usize];
                         for chunk in &ihl.chunks {
                             let chunk_loc = locations.get(&chunk.content_hash).ok_or_else(|| {
                                 PoolError::Format(format!(
@@ -711,7 +723,11 @@ impl Pool {
                                 StreamKind::Data,
                             )?;
                             let (_h, bytes) = reader.read_record(*chunk_loc)?;
-                            contents.extend_from_slice(&bytes);
+                            let start = chunk.logical_offset as usize;
+                            let end = (start + bytes.len()).min(contents.len());
+                            if start < end {
+                                contents[start..end].copy_from_slice(&bytes[..end - start]);
+                            }
                         }
                         file_state_from_replay.insert(
                             entry.ino,
@@ -1243,11 +1259,7 @@ impl PoolShared {
             .get(&ino)
             .map(|s| (s.chunks.clone(), s.pending_bytes.clone()));
         if let Some((chunks, pending)) = session_snapshot {
-            let mut buf = Vec::new();
-            for chunk in &chunks {
-                buf.extend_from_slice(&self.read_chunk_bytes(chunk.content_hash)?);
-            }
-            buf.extend_from_slice(&pending);
+            let buf = self.assemble_session_contents(ino, &chunks, &pending)?;
             return Ok(slice_of(&buf, offset, len));
         }
 
@@ -1280,6 +1292,55 @@ impl PoolShared {
             }
             ContentRef::DirEntries(_) | ContentRef::SymlinkTarget(_) => Ok(Bytes::new()),
         }
+    }
+
+    /// A session's current whole-file bytes: its chunks placed at their own
+    /// `logical_offset`, plus the not-yet-chunked `pending` tail.
+    ///
+    /// A session is seeded from the file's existing chunk list (see
+    /// `write`'s `fresh_session_eligible` branch), so once holes exist that
+    /// list can have gaps -- concatenating would slide everything after a
+    /// hole to the wrong offset. The three places that previously
+    /// concatenated session chunks all route through here instead, so this
+    /// stays fixed in one spot rather than three.
+    fn assemble_session_contents(
+        &self,
+        ino: u64,
+        chunks: &[ChunkRef],
+        pending: &[u8],
+    ) -> Result<Vec<u8>, PoolError> {
+        let size = {
+            let namespace = self.namespace.lock();
+            namespace.inodes.get(&ino).map(|i| i.size).ok_or(PoolError::NoSuchInode(ino))?
+        };
+        // The chunk list plus the pending tail should already account for
+        // `size`, but derive the buffer from whichever is larger so a
+        // momentarily-stale size can never truncate real bytes.
+        let chunks_end = chunks
+            .iter()
+            .map(|c| c.logical_offset + c.len as u64)
+            .max()
+            .unwrap_or(0);
+        let total = size.max(chunks_end.saturating_add(pending.len() as u64)) as usize;
+
+        let mut buf = vec![0u8; total];
+        for chunk in chunks {
+            let bytes = self.read_chunk_bytes(chunk.content_hash)?;
+            let start = chunk.logical_offset as usize;
+            let end = (start + bytes.len()).min(buf.len());
+            if start < end {
+                buf[start..end].copy_from_slice(&bytes[..end - start]);
+            }
+        }
+        // The pending tail is by definition the end of the file: whatever
+        // has been appended but not yet cut into a chunk.
+        if !pending.is_empty() {
+            let buf_len = buf.len();
+            let start = buf_len.saturating_sub(pending.len());
+            let src_from = pending.len() - (buf_len - start);
+            buf[start..].copy_from_slice(&pending[src_from..]);
+        }
+        Ok(buf)
     }
 
     /// Assembles `[offset, offset+len)` from only the chunks overlapping it.
@@ -1821,11 +1882,8 @@ impl PoolShared {
         let Some(state) = self.open_files.lock().remove(&ino) else {
             return Ok(());
         };
-        let mut contents = Vec::new();
-        for chunk in &state.chunks {
-            contents.extend_from_slice(&self.read_chunk_bytes(chunk.content_hash)?);
-        }
-        contents.extend_from_slice(&state.pending_bytes);
+        let contents =
+            self.assemble_session_contents(ino, &state.chunks, &state.pending_bytes)?;
         self.file_state.lock().insert(
             ino,
             FileWorkingState {
@@ -2645,10 +2703,10 @@ impl PoolShared {
         // shard-local stream here, so reading them back is exactly what a
         // fresh `hydrate_file_state` would otherwise do.
         if let Some(chunks) = &session_chunks {
-            let mut contents = Vec::new();
-            for chunk in chunks {
-                contents.extend_from_slice(&self.read_chunk_bytes(chunk.content_hash)?);
-            }
+            // The session has already been finalized, so there is no pending
+            // tail left to account for -- but the chunks still need placing
+            // by offset, not concatenating, for a sparse file.
+            let contents = self.assemble_session_contents(ino, chunks, &[])?;
             self.file_state.lock().insert(
                 ino,
                 FileWorkingState {
