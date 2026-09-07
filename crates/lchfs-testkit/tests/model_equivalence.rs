@@ -116,6 +116,29 @@ impl Harness {
         }
     }
 
+    /// The namespace itself, which content comparison never inspects. A
+    /// stale or duplicated `DirEntry` left behind by a rename would
+    /// otherwise surface only if some later op happened to name that exact
+    /// path -- and a duplicate would not show up in `lookup` at all.
+    fn assert_namespace_matches(&self) {
+        for dir in ["/", "/dir1", "/dir2"] {
+            let p = PathBuf::from(dir);
+            let ino = if dir == "/" {
+                Some(1u64) // ROOT_DIR_INO
+            } else {
+                resolve(self.pool(), &p)
+                    .and_then(|(parent, name)| self.pool().lookup(parent, &name).ok().flatten())
+            };
+            let real = ino.and_then(|ino| self.pool().readdir(ino).ok()).map(|entries| {
+                let mut v: Vec<(String, InodeKind)> =
+                    entries.into_iter().map(|e| (e.name, e.kind)).collect();
+                v.sort_by(|a, b| a.0.cmp(&b.0));
+                v
+            });
+            assert_eq!(real, self.model.readdir(&p), "directory listing diverged for {p:?}");
+        }
+    }
+
     /// Structural check via `lchfs-fsck` -- an independent reader of the
     /// on-disk format that deliberately shares no code with `Pool`'s own
     /// scan/recovery paths, so a bug in those is still catchable here.
@@ -147,6 +170,16 @@ impl Harness {
     }
 
     fn apply(&mut self, op: &FsOp) {
+        self.apply_inner(op);
+        // Skipped after FsyncAndCrash: a non-checkpointing crash may
+        // legitimately lose a directory entry that was never made durable,
+        // so the two sides are allowed to differ there by construction.
+        if !matches!(op, FsOp::FsyncAndCrash { .. }) {
+            self.assert_namespace_matches();
+        }
+    }
+
+    fn apply_inner(&mut self, op: &FsOp) {
         match op {
             FsOp::Write { path, offset, data } => {
                 let real_ok = (|| -> Option<bool> {

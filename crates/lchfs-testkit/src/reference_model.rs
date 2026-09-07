@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use lchfs_format::InodeKind;
 use lchfs_store::FallocateMode;
 
 /// A file's content, shared (`Rc<RefCell<_>>`) rather than duplicated per
@@ -310,6 +311,45 @@ impl ReferenceModel {
 
     pub fn readlink(&self, path: &Path) -> Result<PathBuf, ModelError> {
         self.symlinks.get(path).cloned().ok_or(ModelError::NotFound)
+    }
+
+    /// Entries directly inside `path` as `(name, kind)` sorted by name --
+    /// the same shape `Pool::readdir` yields once its `DirEntry`s are
+    /// reduced to the fields this model tracks. Ino numbers are the
+    /// engine's own business and deliberately not modelled.
+    ///
+    /// `None` when `path` is not a directory here, matching `Pool::readdir`
+    /// returning `NotADirectory`.
+    pub fn readdir(&self, path: &Path) -> Option<Vec<(String, InodeKind)>> {
+        if !self.dirs.contains(path) {
+            return None;
+        }
+        fn collect(
+            out: &mut Vec<(String, InodeKind)>,
+            candidate: &Path,
+            dir: &Path,
+            kind: InodeKind,
+        ) {
+            if candidate.parent() != Some(dir) {
+                return;
+            }
+            if let Some(name) = candidate.file_name().and_then(|n| n.to_str()) {
+                out.push((name.to_string(), kind));
+            }
+        }
+        let mut out = Vec::new();
+        for f in self.files.keys() {
+            collect(&mut out, f, path, InodeKind::File);
+        }
+        // `/` is in `dirs` but its parent is None, so it never lists itself.
+        for d in &self.dirs {
+            collect(&mut out, d, path, InodeKind::Directory);
+        }
+        for l in self.symlinks.keys() {
+            collect(&mut out, l, path, InodeKind::Symlink);
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Some(out)
     }
 
     pub fn is_dir(&self, path: &Path) -> bool {
