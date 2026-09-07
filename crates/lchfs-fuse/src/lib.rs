@@ -27,10 +27,10 @@ pub use inodes::InodeAllocator;
 use fuser::{
     Errno, FileAttr, FileType, Filesystem, Generation, INodeNo, ReplyAttr, ReplyCreate,
     ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite,
-    ReplyXattr, Request,
+    ReplyLseek, ReplyXattr, Request,
 };
 use lchfs_format::{InodeKind, InodeObject};
-use lchfs_store::{FallocateMode, Pool, PoolError, XattrSetFlags};
+use lchfs_store::{FallocateMode, SeekWhence, Pool, PoolError, XattrSetFlags};
 use parking_lot::Mutex;
 use std::ffi::OsStr;
 use std::sync::Arc;
@@ -296,6 +296,46 @@ impl Filesystem for LchfsFilesystem {
         }
         match self.pool.getattr(ino.0) {
             Ok(inode) => reply.attr(&TTL, &file_attr(ino.0, &inode)),
+            Err(e) => reply.error(errno_for(&e)),
+        }
+    }
+
+    fn lseek(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: fuser::FileHandle,
+        offset: i64,
+        whence: i32,
+        reply: ReplyLseek,
+    ) {
+        // Raw SEEK_* constants are decoded here, not in lchfs-store (§5a).
+        // Only DATA/HOLE reach a filesystem: SET/CUR/END are resolved by the
+        // kernel against the file position without consulting us at all.
+        const SEEK_DATA: i32 = 3;
+        const SEEK_HOLE: i32 = 4;
+
+        let whence = match whence {
+            SEEK_DATA => SeekWhence::Data,
+            SEEK_HOLE => SeekWhence::Hole,
+            _ => {
+                reply.error(Errno::EINVAL);
+                return;
+            }
+        };
+        // A negative offset is never valid for either.
+        let Ok(offset) = u64::try_from(offset) else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+
+        match self.pool.seek(ino.0, offset, whence) {
+            // At/past EOF, or SEEK_DATA with only a trailing hole left.
+            Ok(None) => reply.error(Errno::ENXIO),
+            Ok(Some(off)) => match i64::try_from(off) {
+                Ok(off) => reply.offset(off),
+                Err(_) => reply.error(Errno::EOVERFLOW),
+            },
             Err(e) => reply.error(errno_for(&e)),
         }
     }

@@ -124,6 +124,18 @@ pub enum FallocateMode {
     ZeroRange { keep_size: bool },
 }
 
+/// Which boundary `Pool::seek` looks for. Mirrors `SEEK_DATA`/`SEEK_HOLE`
+/// from lseek(2); the raw whence constants are decoded in `lchfs-fuse` so
+/// the engine stays free of protocol encodings (ARCHITECTURE.md §5a).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeekWhence {
+    /// First byte at or after `offset` that holds data.
+    Data,
+    /// First hole at or after `offset`. End-of-file counts as a hole, so
+    /// this never fails for an in-range offset.
+    Hole,
+}
+
 /// `setxattr`'s create/replace semantics (`XATTR_CREATE`/`XATTR_REPLACE`).
 /// A plain enum rather than the raw libc flag bits so `lchfs-store` stays
 /// free of protocol-level encodings (ARCHITECTURE.md §5a).
@@ -836,6 +848,18 @@ impl Pool {
     /// host filesystem's free space (§8's Phase 1 scope). So `Allocate`
     /// extends the file when asked and otherwise does nothing, rather than
     /// writing zeros that would consume the very space it claims to reserve.
+    /// `SEEK_DATA`/`SEEK_HOLE` (lseek(2)). `Ok(None)` means ENXIO: either
+    /// `offset` is at or past EOF, or `Data` was asked for and only a
+    /// trailing hole remains.
+    pub fn seek(
+        &self,
+        ino: u64,
+        offset: u64,
+        whence: SeekWhence,
+    ) -> Result<Option<u64>, PoolError> {
+        self.0.seek(ino, offset, whence)
+    }
+
     pub fn fallocate(
         &self,
         ino: u64,
@@ -1351,10 +1375,9 @@ impl PoolShared {
     /// walks on a large file, and the reason a read of one block of an 8 GiB
     /// file no longer touches every chunk in it.
     ///
-    /// Any byte in range not covered by a chunk reads as zero. No writer
-    /// produces such a gap today, but treating it as zero rather than an
-    /// error is both the POSIX sparse-file semantic and what the upcoming
-    /// hole representation needs.
+    /// Any byte in range not covered by a chunk reads as zero -- that
+    /// absence *is* the hole representation (`dafa741`), so this is the
+    /// POSIX sparse-file semantic rather than an error case.
     fn read_range_from_chunks(
         &self,
         chunks: &[ChunkRef],
@@ -1942,6 +1965,101 @@ impl PoolShared {
     /// `rechunk_and_touch` then drops the resulting all-zero chunks, so the
     /// range genuinely disappears from the chunk list rather than becoming a
     /// run of zero extents.
+    /// Walks the chunk list, whose gaps are the holes. `chunks` is sorted by
+    /// `logical_offset` (an fsck-checked invariant), so the starting point
+    /// is a binary search rather than a scan.
+    fn seek_in_chunks(
+        chunks: &[ChunkRef],
+        size: u64,
+        offset: u64,
+        whence: SeekWhence,
+    ) -> Option<u64> {
+        let start_idx = chunks
+            .partition_point(|c| c.logical_offset <= offset)
+            .saturating_sub(1);
+        let tail = &chunks[start_idx.min(chunks.len())..];
+        match whence {
+            SeekWhence::Data => {
+                for c in tail {
+                    let end = c.logical_offset.saturating_add(c.len as u64);
+                    if end <= offset {
+                        continue;
+                    }
+                    // Either `offset` is already inside this chunk, or this
+                    // is the next chunk after a hole containing `offset`.
+                    return Some(c.logical_offset.max(offset).min(size));
+                }
+                // Only a trailing hole remains -> ENXIO.
+                None
+            }
+            SeekWhence::Hole => {
+                let mut cur = offset;
+                for c in tail {
+                    let cs = c.logical_offset;
+                    let ce = cs.saturating_add(c.len as u64);
+                    if ce <= cur {
+                        continue;
+                    }
+                    if cs > cur {
+                        return Some(cur);
+                    }
+                    // `cur` is covered; the hole can only start after this
+                    // chunk. Adjacent chunks keep extending the run.
+                    cur = ce;
+                }
+                // EOF always counts as a hole.
+                Some(cur.min(size))
+            }
+        }
+    }
+
+    fn seek(&self, ino: u64, offset: u64, whence: SeekWhence) -> Result<Option<u64>, PoolError> {
+        let (kind, size, content_ref) = {
+            let namespace = self.namespace.lock();
+            let inode = namespace.inodes.get(&ino).ok_or(PoolError::NoSuchInode(ino))?;
+            (inode.kind, inode.size, inode.content.clone())
+        };
+        if kind != InodeKind::File {
+            return Err(PoolError::Format(format!("ino {ino} is not a regular file")));
+        }
+        if offset >= size {
+            return Ok(None);
+        }
+
+        // Whenever content is materialized in memory there is no hole
+        // structure to consult -- a run of zeros in a byte buffer is not
+        // knowably a hole. Report the file as entirely data in that case.
+        //
+        // POSIX explicitly permits this (a filesystem may report only EOF as
+        // a hole), and the asymmetry is what makes it the safe default:
+        // calling a hole "data" costs only efficiency, whereas calling data
+        // "a hole" would make `cp --sparse` replace real bytes with zeros.
+        let materialized = self.open_files.lock().contains_key(&ino)
+            || self.file_state.lock().contains_key(&ino);
+        if materialized {
+            return Ok(Some(match whence {
+                SeekWhence::Data => offset,
+                SeekWhence::Hole => size,
+            }));
+        }
+
+        match content_ref {
+            ContentRef::Inline(_) => Ok(Some(match whence {
+                SeekWhence::Data => offset,
+                SeekWhence::Hole => size,
+            })),
+            ContentRef::ChunkList(hash) => {
+                let ihl_bytes = self.read_meta_object_bytes(hash)?;
+                let ihl: IndirectHashList = lchfs_format::decode(&ihl_bytes)
+                    .map_err(|e| PoolError::Format(e.to_string()))?;
+                Ok(Self::seek_in_chunks(&ihl.chunks, size, offset, whence))
+            }
+            ContentRef::DirEntries(_) | ContentRef::SymlinkTarget(_) => {
+                Err(PoolError::Format(format!("ino {ino} is not a regular file")))
+            }
+        }
+    }
+
     fn fallocate(
         &self,
         ino: u64,

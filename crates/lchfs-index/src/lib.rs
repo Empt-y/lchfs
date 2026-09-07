@@ -7,7 +7,7 @@
 //! boundary). This crate also has no dependency on `lchfs-store`; `store`
 //! depends on `index`, not the reverse (ARCHITECTURE.md §11).
 
-use lchfs_format::{ExtentLocation, Hash32, InodeObject};
+use lchfs_format::{ExtentLocation, Hash32};
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 use std::collections::HashMap;
 use std::path::Path;
@@ -208,22 +208,6 @@ impl IndexStore for RedbIndex {
 
     fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
-    }
-}
-
-/// In-memory `ino -> {current_hash, decoded InodeObject}` cache plus
-/// `(parent_ino, name) -> ino` directory-entry cache. ARCHITECTURE.md §4.
-#[derive(Default)]
-pub struct ActiveTreeCache {
-    // TODO(phase-E): HashMap<u64, (Hash32, InodeObject)> + HashMap<(u64, String), u64>
-    // -- not yet consumed by Pool, which still keeps its own equivalent
-    // maps directly; wiring Pool through this is bundled with Phase E's
-    // sharding refactor rather than done piecemeal now.
-}
-
-impl ActiveTreeCache {
-    pub fn get(&self, _ino: u64) -> Option<(Hash32, &InodeObject)> {
-        todo!("lchfs-index: ActiveTreeCache::get")
     }
 }
 
