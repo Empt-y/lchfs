@@ -116,6 +116,36 @@ impl Harness {
         }
     }
 
+    /// Structural check via `lchfs-fsck` -- an independent reader of the
+    /// on-disk format that deliberately shares no code with `Pool`'s own
+    /// scan/recovery paths, so a bug in those is still catchable here.
+    ///
+    /// Content assertions can only compare bytes the engine agrees to hand
+    /// back. This catches invariants they cannot observe at all: chunk-list
+    /// sort/overlap, InoMap sort/dup, dangling inos, dir-entry-kind vs
+    /// InodeObject mismatches, and size mismatches -- exactly the shapes the
+    /// sparse-file work put at risk by making a gap in a chunk list
+    /// meaningful.
+    ///
+    /// Closes the pool first. fsck's read-only checks are lock-free by
+    /// design, but `verify_index` opens INDEX.redb, which the live `Pool`
+    /// still holds open.
+    fn assert_structurally_sound(&mut self) {
+        self.pool().checkpoint().unwrap();
+        drop(self.pool.take());
+        let root = self.dir.path();
+        let live_roots = lchfs_fsck::collect_live_roots(root).expect("collect_live_roots");
+        // Guard against a vacuous pass: with no live roots `check` walks
+        // nothing and is trivially clean, so the assertion below would say
+        // nothing at all about the pool.
+        assert!(!live_roots.is_empty(), "no live roots to check");
+        let report = lchfs_fsck::check(root, &live_roots);
+        assert!(report.is_clean(), "fsck check: {:?}", report.errors);
+        assert!(report.objects_visited > 0, "fsck visited no objects");
+        let index = lchfs_fsck::verify_index(root, &live_roots);
+        assert!(index.is_clean(), "fsck verify_index: {:?}", index.errors);
+    }
+
     fn apply(&mut self, op: &FsOp) {
         match op {
             FsOp::Write { path, offset, data } => {
@@ -152,6 +182,13 @@ impl Harness {
                     .unwrap_or(false);
                 let model_ok = self.model.mkdir(path).is_ok();
                 assert_eq!(real_ok, model_ok, "mkdir({path:?}) diverged");
+            }
+            FsOp::Rmdir { path } => {
+                let real_ok = resolve(self.pool(), path)
+                    .map(|(parent, name)| self.pool().rmdir(parent, &name).is_ok())
+                    .unwrap_or(false);
+                let model_ok = self.model.rmdir(path).is_ok();
+                assert_eq!(real_ok, model_ok, "rmdir({path:?}) diverged");
             }
             FsOp::Unlink { path } => {
                 let real_ok = resolve(self.pool(), path)
@@ -252,6 +289,7 @@ proptest! {
         for op in &ops {
             harness.apply(op);
         }
+        harness.assert_structurally_sound();
     }
 }
 

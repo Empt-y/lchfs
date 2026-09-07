@@ -13,6 +13,10 @@ pub enum FsOp {
     Write { path: PathBuf, offset: u64, data: Vec<u8> },
     Truncate { path: PathBuf, len: u64 },
     Mkdir { path: PathBuf },
+    /// `rmdir(2)`. `ReferenceModel` has had a `rmdir` since it was written,
+    /// but no `FsOp` ever drove it, so directory removal had no differential
+    /// coverage at all -- only `unlink` did.
+    Rmdir { path: PathBuf },
     Rename { from: PathBuf, to: PathBuf },
     Unlink { path: PathBuf },
     Link { path: PathBuf, target: PathBuf },
@@ -84,6 +88,7 @@ pub fn arb_fs_op() -> impl proptest::strategy::Strategy<Value = FsOp> {
         (arb_path(), 0u64..8192, 0u64..4096, arb_fallocate_mode())
             .prop_map(|(path, offset, len, mode)| FsOp::Fallocate { path, offset, len, mode }),
         arb_path().prop_map(|path| FsOp::Mkdir { path }),
+        arb_path().prop_map(|path| FsOp::Rmdir { path }),
         (arb_path(), arb_path()).prop_map(|(from, to)| FsOp::Rename { from, to }),
         arb_path().prop_map(|path| FsOp::Unlink { path }),
         (arb_path(), arb_path()).prop_map(|(path, target)| FsOp::Link { path, target }),
