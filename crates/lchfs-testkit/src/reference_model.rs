@@ -8,6 +8,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use lchfs_store::FallocateMode;
+
 /// A file's content, shared (`Rc<RefCell<_>>`) rather than duplicated per
 /// path so `link` (hardlink) can alias the *same* backing bytes across
 /// multiple paths, matching real hardlink semantics: writing through one
@@ -27,6 +29,10 @@ pub enum ModelError {
     /// symlinks during resolution, matching how the harness that drives
     /// it resolves paths -- see `write`'s doc comment).
     WrongType,
+    /// A structurally invalid request -- `fallocate` with a zero length, or
+    /// a range that overflows `u64`. Mirrors the engine's
+    /// `PoolError::InvalidArgument`.
+    InvalidArgument,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -71,6 +77,15 @@ impl ReferenceModel {
         }
         let content = self.files.get(path).unwrap();
         let mut bytes = content.borrow_mut();
+        // A zero-length write returns success and changes nothing -- it must
+        // NOT extend the file to `offset`. POSIX: write(2) with count 0
+        // "may have no other results" for a regular file, and the engine
+        // mirrors this with an explicit early return. Creating the file
+        // (above) still happens, matching an O_CREAT open followed by a
+        // zero-length write.
+        if data.is_empty() {
+            return Ok(());
+        }
         let end = (offset as usize) + data.len();
         if bytes.len() < end {
             bytes.resize(end, 0);
@@ -90,6 +105,59 @@ impl ReferenceModel {
     pub fn truncate(&mut self, path: &Path, len: u64) -> Result<(), ModelError> {
         let content = self.files.get(path).ok_or(ModelError::NotFound)?;
         content.borrow_mut().resize(len as usize, 0);
+        Ok(())
+    }
+
+    /// `fallocate(2)`, mirroring `Pool::fallocate` exactly.
+    ///
+    /// This deliberately duplicates the engine's clamping rules rather than
+    /// expressing them more simply. The oracle's job is to catch the engine
+    /// drifting from these semantics, so an "obviously equivalent"
+    /// simplification here would only relocate a bug, not detect it.
+    ///
+    /// No `MAX_FILE_SIZE` check: the generator never produces ranges near
+    /// the 8 GiB cap, so modelling it would be untested code in the oracle.
+    pub fn fallocate(
+        &mut self,
+        path: &Path,
+        offset: u64,
+        len: u64,
+        mode: FallocateMode,
+    ) -> Result<(), ModelError> {
+        if self.dirs.contains(path) || self.symlinks.contains_key(path) {
+            return Err(ModelError::WrongType);
+        }
+        if len == 0 {
+            return Err(ModelError::InvalidArgument);
+        }
+        let end = offset.checked_add(len).ok_or(ModelError::InvalidArgument)?;
+        let content = self.files.get(path).ok_or(ModelError::NotFound)?;
+        let mut bytes = content.borrow_mut();
+        let grows = end > bytes.len() as u64;
+        match mode {
+            // Nothing to reserve without a block-reservation concept, so
+            // plain allocation is only ever a size change.
+            FallocateMode::Allocate { keep_size } => {
+                if grows && !keep_size {
+                    bytes.resize(end as usize, 0);
+                }
+            }
+            // Never changes size: a punch past EOF affects only the part of
+            // the range that actually exists.
+            FallocateMode::PunchHole => {
+                let lo = (offset as usize).min(bytes.len());
+                let hi = (end as usize).min(bytes.len());
+                bytes[lo..hi].fill(0);
+            }
+            FallocateMode::ZeroRange { keep_size } => {
+                if grows && !keep_size {
+                    bytes.resize(end as usize, 0);
+                }
+                let lo = (offset as usize).min(bytes.len());
+                let hi = (end as usize).min(bytes.len());
+                bytes[lo..hi].fill(0);
+            }
+        }
         Ok(())
     }
 
