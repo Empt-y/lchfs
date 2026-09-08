@@ -344,7 +344,9 @@ struct PoolShared {
     /// also released by the kernel if the process dies, so a killed mount
     /// leaves no stale lock to clean up, matching §7's "inert, no active
     /// cleanup required for correctness" philosophy.
-    _pool_lock: Flock<std::fs::File>,
+    /// One advisory guard per vdev root (§15.6), all held for the mount's
+    /// lifetime, so two mounts cannot share even a single device.
+    _pool_locks: Vec<Flock<std::fs::File>>,
 
     namespace: Mutex<Namespace>,
     file_state: Mutex<HashMap<u64, FileWorkingState>>,
@@ -406,13 +408,40 @@ impl Pool {
     /// valid superblock) with the given `params`, and runs an initial
     /// checkpoint so the empty pool is immediately mountable.
     pub fn create(pool_root: &Path, params: PoolParams) -> Result<Self, PoolError> {
-        std::fs::create_dir_all(pool_root)?;
-        let pool_lock = acquire_pool_lock(pool_root)?;
-        let vdevs = vec![Vdev::new(pool_root.to_path_buf())];
+        Self::create_replicated(&[pool_root], params)
+    }
+
+    /// Creates a pool spanning `vdev_roots`, replicating every write across
+    /// all of them (ARCHITECTURE.md §15.3). `vdev_roots[0]` is vdev 0 and
+    /// holds the pool's `INDEX.redb` (§15.10 -- the index is a rebuildable
+    /// cache, so replicating it would cost write amplification to protect
+    /// something recomputable).
+    ///
+    /// Every vdev is given the same `pool_uuid` and its own `vdev_id`, which
+    /// is what lets `open_replicated` tell "these devices belong together"
+    /// from "someone passed a foreign device".
+    pub fn create_replicated(vdev_roots: &[&Path], params: PoolParams) -> Result<Self, PoolError> {
+        if vdev_roots.is_empty() {
+            return Err(PoolError::InvalidArgument(
+                "a pool needs at least one vdev".into(),
+            ));
+        }
+        let pool_root = vdev_roots[0];
+        let mut pool_locks = Vec::with_capacity(vdev_roots.len());
+        let mut superblock_backends = Vec::with_capacity(vdev_roots.len());
+        for root in vdev_roots {
+            std::fs::create_dir_all(root)?;
+            pool_locks.push(acquire_pool_lock(root)?);
+            superblock_backends.push(FileBackend::open(root)?);
+        }
+        let vdevs: Vec<Vdev> = vdev_roots.iter().map(|r| Vdev::new(r.to_path_buf())).collect();
         let vdev_root_paths: Vec<PathBuf> = vdevs.iter().map(|v| v.root.clone()).collect();
-        let superblock_backends = vec![FileBackend::open(pool_root)?];
-        if read_superblock(&superblock_backends[0])?.is_some() {
-            return Err(PoolError::AlreadyExists(pool_root.display().to_string()));
+        // None of them may already hold a pool -- checked for every device,
+        // not just vdev 0, so a half-built set cannot be silently absorbed.
+        for (backend, root) in superblock_backends.iter().zip(vdev_roots) {
+            if read_superblock(backend)?.is_some() {
+                return Err(PoolError::AlreadyExists(root.display().to_string()));
+            }
         }
 
         let mut inodes = HashMap::new();
@@ -455,7 +484,7 @@ impl Pool {
         let meta_writer = SegmentWriter::create(&vdev_root_paths.iter().map(|p| p.as_path()).collect::<Vec<_>>(), meta_id, StreamKind::Meta, 0)?;
 
         let shard_delta_logs = (0..shard_count)
-            .map(|id| ShardDeltaLog::open(pool_root, id).map(Mutex::new))
+            .map(|id| ShardDeltaLog::open(&vdev_root_paths, id).map(Mutex::new))
             .collect::<Result<Vec<_>, _>>()?;
 
         let dedup_index = Arc::new(ChunkLocationCache::new());
@@ -487,10 +516,10 @@ impl Pool {
             // created across several devices (ARCHITECTURE.md §15.6).
             pool_uuid: lchfs_format::generate_pool_uuid()?,
             vdev_id: 0,
-            vdev_count: 1,
+            vdev_count: vdevs.len() as u16,
             vdevs,
             superblock_backends,
-            _pool_lock: pool_lock,
+            _pool_locks: pool_locks,
             namespace: Mutex::new(namespace),
             file_state: Mutex::new(HashMap::new()),
             open_files: Mutex::new(HashMap::new()),
@@ -534,16 +563,71 @@ impl Pool {
     /// in E.9; this is still the single-tier global-only recovery Phase B
     /// had.)
     pub fn open(pool_root: &Path) -> Result<Self, PoolError> {
-        let pool_lock = acquire_pool_lock(pool_root)?;
-        let vdevs = vec![Vdev::new(pool_root.to_path_buf())];
+        Self::open_replicated(&[pool_root])
+    }
+
+    /// Opens a pool spanning `vdev_roots`, which must be given in `vdev_id`
+    /// order with vdev 0 first.
+    ///
+    /// The device list is supplied by the caller rather than discovered:
+    /// §15.10 records that where to store it is still open, since a path
+    /// list in the superblock is fragile against devices moving between
+    /// mounts. What *is* checked is that the devices belong together --
+    /// every one must carry the same `pool_uuid`, declare the same
+    /// `vdev_count`, and occupy its expected slot. A foreign or stale device
+    /// is refused rather than mounted as if it were a member, which is the
+    /// whole reason the identity fields exist.
+    pub fn open_replicated(vdev_roots: &[&Path]) -> Result<Self, PoolError> {
+        if vdev_roots.is_empty() {
+            return Err(PoolError::InvalidArgument(
+                "a pool needs at least one vdev".into(),
+            ));
+        }
+        let pool_root = vdev_roots[0];
+        let mut pool_locks = Vec::with_capacity(vdev_roots.len());
+        let mut superblock_backends = Vec::with_capacity(vdev_roots.len());
+        for root in vdev_roots {
+            pool_locks.push(acquire_pool_lock(root)?);
+            superblock_backends.push(FileBackend::open(root)?);
+        }
+        let vdevs: Vec<Vdev> = vdev_roots.iter().map(|r| Vdev::new(r.to_path_buf())).collect();
         let vdev_root_paths: Vec<PathBuf> = vdevs.iter().map(|v| v.root.clone()).collect();
-        let superblock_backends = vec![FileBackend::open(pool_root)?];
-        let slot = read_superblock(&superblock_backends[0])?.ok_or_else(|| {
-            PoolError::Format(format!(
-                "no valid superblock found at {} — was create-pool run?",
-                pool_root.display()
-            ))
-        })?;
+
+        let mut slots = Vec::with_capacity(vdev_roots.len());
+        for (backend, root) in superblock_backends.iter().zip(vdev_roots) {
+            slots.push(read_superblock(backend)?.ok_or_else(|| {
+                PoolError::Format(format!(
+                    "no valid superblock found at {} — was create-pool run?",
+                    root.display()
+                ))
+            })?);
+        }
+        // Membership check (§15.6), before anything trusts these devices.
+        let expected_uuid = slots[0].pool_uuid;
+        for (idx, (s, root)) in slots.iter().zip(vdev_roots).enumerate() {
+            if s.pool_uuid != expected_uuid {
+                return Err(PoolError::Format(format!(
+                    "{} belongs to a different pool — refusing to mount it as vdev {idx}",
+                    root.display()
+                )));
+            }
+            if s.vdev_count as usize != vdev_roots.len() {
+                return Err(PoolError::Format(format!(
+                    "{} says the pool has {} vdevs but {} were given",
+                    root.display(),
+                    s.vdev_count,
+                    vdev_roots.len()
+                )));
+            }
+            if s.vdev_id as usize != idx {
+                return Err(PoolError::Format(format!(
+                    "{} is vdev {} but was given in position {idx} — devices must be passed in vdev_id order",
+                    root.display(),
+                    s.vdev_id
+                )));
+            }
+        }
+        let slot = slots[0];
 
         let index_file = index_path(pool_root);
         let fresh_index = index_file
@@ -679,7 +763,7 @@ impl Pool {
         // which exercised replay immediately followed by GC).
         let mut replayed_inos: HashSet<u64> = HashSet::new();
         for shard_id in 0..shard_count {
-            let shard_log = ShardDeltaLog::open(pool_root, shard_id)?;
+            let shard_log = ShardDeltaLog::open(&vdev_root_paths, shard_id)?;
             let watermark = root
                 .shard_watermarks
                 .get(shard_id as usize)
@@ -819,7 +903,7 @@ impl Pool {
             vdev_count: slot.vdev_count,
             vdevs,
             superblock_backends,
-            _pool_lock: pool_lock,
+            _pool_locks: pool_locks,
             namespace: Mutex::new(namespace),
             file_state: Mutex::new(file_state_from_replay),
             open_files: Mutex::new(HashMap::new()),

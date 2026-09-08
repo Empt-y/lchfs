@@ -19,7 +19,7 @@ fn inode_record(tag: &str) -> ShardCommitRecord {
 #[test]
 fn commit_then_replay_from_zero_returns_all_entries_in_order() {
     let dir = tempfile::tempdir().unwrap();
-    let mut log = ShardDeltaLog::open(dir.path(), 0).unwrap();
+    let mut log = ShardDeltaLog::open(&[dir.path().to_path_buf()], 0).unwrap();
 
     for i in 1..=5u64 {
         log.commit(i, Hash32::of(format!("hash-{i}").as_bytes()), &[inode_record(&i.to_string())])
@@ -39,7 +39,7 @@ fn commit_then_replay_from_zero_returns_all_entries_in_order() {
 #[test]
 fn replay_since_watermark_only_returns_newer_entries() {
     let dir = tempfile::tempdir().unwrap();
-    let mut log = ShardDeltaLog::open(dir.path(), 0).unwrap();
+    let mut log = ShardDeltaLog::open(&[dir.path().to_path_buf()], 0).unwrap();
     for i in 1..=5u64 {
         log.commit(i, Hash32::of(format!("hash-{i}").as_bytes()), &[])
             .unwrap();
@@ -54,14 +54,14 @@ fn replay_since_watermark_only_returns_newer_entries() {
 fn state_survives_drop_and_reopen() {
     let dir = tempfile::tempdir().unwrap();
     {
-        let mut log = ShardDeltaLog::open(dir.path(), 2).unwrap();
+        let mut log = ShardDeltaLog::open(&[dir.path().to_path_buf()], 2).unwrap();
         log.commit(10, Hash32::of(b"a"), &[]).unwrap();
         log.commit(11, Hash32::of(b"b"), &[]).unwrap();
     }
 
     // Reopen: local_epoch must have survived via the shard superblock, and
     // a fresh commit's epoch must continue from where it left off.
-    let mut log2 = ShardDeltaLog::open(dir.path(), 2).unwrap();
+    let mut log2 = ShardDeltaLog::open(&[dir.path().to_path_buf()], 2).unwrap();
     let slot = log2.read_shard_superblock().unwrap();
     assert_eq!(slot.local_epoch, 2);
     assert_eq!(slot.shard_id, 2);
@@ -76,7 +76,7 @@ fn state_survives_drop_and_reopen() {
 fn torn_trailing_record_is_tolerated_not_fatal() {
     let dir = tempfile::tempdir().unwrap();
     {
-        let mut log = ShardDeltaLog::open(dir.path(), 5).unwrap();
+        let mut log = ShardDeltaLog::open(&[dir.path().to_path_buf()], 5).unwrap();
         log.commit(1, Hash32::of(b"first"), &[]).unwrap();
         log.commit(2, Hash32::of(b"second"), &[]).unwrap();
     }
@@ -98,7 +98,7 @@ fn torn_trailing_record_is_tolerated_not_fatal() {
     file.set_len(len - 3).unwrap();
     drop(file);
 
-    let log = ShardDeltaLog::open(dir.path(), 5).unwrap();
+    let log = ShardDeltaLog::open(&[dir.path().to_path_buf()], 5).unwrap();
     let replay = log.replay_since(0).unwrap();
     // The first, intact record must still be recovered; the torn one is
     // silently dropped, not a hard error.
@@ -110,7 +110,7 @@ fn torn_trailing_record_is_tolerated_not_fatal() {
 fn missing_shard_superblock_degrades_to_fresh_state() {
     let dir = tempfile::tempdir().unwrap();
     // Never committed anything for this shard — open() must not error.
-    let log = ShardDeltaLog::open(dir.path(), 99).unwrap();
+    let log = ShardDeltaLog::open(&[dir.path().to_path_buf()], 99).unwrap();
     let slot = log.read_shard_superblock().unwrap();
     assert_eq!(slot.local_epoch, 0);
 }
@@ -119,7 +119,7 @@ fn missing_shard_superblock_degrades_to_fresh_state() {
 fn corrupt_shard_superblock_degrades_to_fresh_state_not_a_hard_error() {
     let dir = tempfile::tempdir().unwrap();
     {
-        let mut log = ShardDeltaLog::open(dir.path(), 1).unwrap();
+        let mut log = ShardDeltaLog::open(&[dir.path().to_path_buf()], 1).unwrap();
         log.commit(1, Hash32::of(b"x"), &[]).unwrap();
     }
     let sb_path = dir.path().join("segments/delta/00001/superblock.sblk");
@@ -134,7 +134,7 @@ fn corrupt_shard_superblock_degrades_to_fresh_state_not_a_hard_error() {
 
     // Must not panic/error — degrades to fresh state (epoch 0), and the
     // delta segments themselves are still fully scannable regardless.
-    let log = ShardDeltaLog::open(dir.path(), 1).unwrap();
+    let log = ShardDeltaLog::open(&[dir.path().to_path_buf()], 1).unwrap();
     let slot = log.read_shard_superblock().unwrap();
     assert_eq!(slot.local_epoch, 0);
     let replay = log.replay_since(0).unwrap();

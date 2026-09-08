@@ -63,7 +63,13 @@ pub struct ReplayResult {
 /// (ARCHITECTURE.md §1, §3).
 pub struct ShardDeltaLog {
     pub shard_id: u32,
+    /// Reads use vdev 0 (§15.10); writes fan out across all of these.
     pool_root: PathBuf,
+    /// Every vdev this shard's delta segments and shard superblock are
+    /// written to. The delta log is the fsync fast path (§3), so without
+    /// fan-out here a write made durable by fsync -- rather than by a
+    /// checkpoint -- would exist on one device only.
+    vdev_roots: Vec<PathBuf>,
     writer: SegmentWriter,
     local_epoch: u64,
     delta_log_tail: ExtentLocation,
@@ -78,7 +84,14 @@ impl ShardDeltaLog {
     /// "fresh state" (epoch 0) rather than a hard error -- non-fatal,
     /// since `replay_since(0)` against the still-intact, still-scannable
     /// delta segments just replays everything, which is idempotent.
-    pub fn open(pool_root: &Path, shard_id: u32) -> io::Result<Self> {
+    pub fn open(vdev_roots: &[PathBuf], shard_id: u32) -> io::Result<Self> {
+        if vdev_roots.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a delta log needs at least one vdev",
+            ));
+        }
+        let pool_root: &Path = &vdev_roots[0];
         let dir = delta_segment_dir(pool_root, shard_id);
         let next_id = if dir.is_dir() {
             let mut max_id: Option<u64> = None;
@@ -98,7 +111,11 @@ impl ShardDeltaLog {
             0
         };
 
-        let writer = SegmentWriter::create_delta(&[pool_root], shard_id, next_id)?;
+        let writer = SegmentWriter::create_delta(
+            &vdev_roots.iter().map(|p| p.as_path()).collect::<Vec<_>>(),
+            shard_id,
+            next_id,
+        )?;
 
         let (local_epoch, delta_log_tail) = match read_shard_superblock_file(pool_root, shard_id) {
             Ok(Some(slot)) if slot.shard_id == shard_id => (slot.local_epoch, slot.delta_log_tail),
@@ -108,6 +125,7 @@ impl ShardDeltaLog {
         Ok(Self {
             shard_id,
             pool_root: pool_root.to_path_buf(),
+            vdev_roots: vdev_roots.to_vec(),
             writer,
             local_epoch,
             delta_log_tail,
@@ -180,19 +198,22 @@ impl ShardDeltaLog {
             "ShardSuperblockSlot must fit in the reserved shard superblock file"
         );
 
-        let path = shard_superblock_path(&self.pool_root, self.shard_id);
-        std::fs::create_dir_all(path.parent().unwrap())?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)?;
         let mut buf = vec![0u8; SHARD_SUPERBLOCK_FILE_SIZE as usize];
         buf[0..4].copy_from_slice(&(encoded.len() as u32).to_le_bytes());
         buf[4..4 + encoded.len()].copy_from_slice(&encoded);
-        file.write_all_at(&buf, 0)?;
-        file.sync_all()
+        for root in &self.vdev_roots {
+            let path = shard_superblock_path(root, self.shard_id);
+            std::fs::create_dir_all(path.parent().unwrap())?;
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)?;
+            file.write_all_at(&buf, 0)?;
+            file.sync_all()?;
+        }
+        Ok(())
     }
 
     /// Read this shard's current tiny superblock slot, used both by

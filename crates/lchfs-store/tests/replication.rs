@@ -98,3 +98,116 @@ fn a_writer_with_no_vdevs_is_rejected() {
         Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
     }
 }
+
+// ---- End-to-end, through the Pool API -------------------------------
+
+use lchfs_format::PoolParams;
+use lchfs_store::Pool;
+
+fn small_params() -> PoolParams {
+    PoolParams {
+        data_segment_cap_bytes: 64 * 1024,
+        meta_segment_cap_bytes: 64 * 1024,
+        chunk_avg_size: 1024,
+        chunk_min_size: 256,
+        chunk_max_size: 4096,
+        inline_threshold: 64,
+        logical_shard_count: 1,
+    }
+}
+
+/// Every file under `dir`, relative path -> bytes.
+fn tree(dir: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    let mut out = std::collections::BTreeMap::new();
+    fn walk(
+        base: &std::path::Path,
+        d: &std::path::Path,
+        out: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
+    ) {
+        let Ok(entries) = std::fs::read_dir(d) else { return };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(base, &p, out);
+            } else if let Ok(bytes) = std::fs::read(&p) {
+                out.insert(p.strip_prefix(base).unwrap().to_path_buf(), bytes);
+            }
+        }
+    }
+    walk(dir, dir, &mut out);
+    out
+}
+
+/// The whole point: real file content written through `Pool` lands on every
+/// vdev, byte-identically, and the pool reopens from the set.
+#[test]
+fn a_two_vdev_pool_replicates_real_file_content() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+
+    let payload = vec![0xA5u8; 40_000]; // multi-chunk at these params
+    {
+        let pool = Pool::create_replicated(&[a.path(), b.path()], small_params()).unwrap();
+        let ino = pool.create_file(1, "big", 0o644).unwrap();
+        pool.write(ino, 0, &payload).unwrap();
+        pool.checkpoint().unwrap();
+    }
+
+    // Segment trees must match exactly. INDEX.redb is deliberately excluded:
+    // §15.10 keeps it on vdev 0 only, as a rebuildable cache.
+    let sa = tree(&a.path().join("segments"));
+    let sb = tree(&b.path().join("segments"));
+    assert!(!sa.is_empty(), "no segments were written at all");
+    assert_eq!(sa.keys().collect::<Vec<_>>(), sb.keys().collect::<Vec<_>>());
+    assert_eq!(sa, sb, "vdev b's segments differ from vdev a's");
+    assert!(!b.path().join("INDEX.redb").exists(), "the index should not be replicated");
+
+    // And it reopens from the set with content intact.
+    let pool = Pool::open_replicated(&[a.path(), b.path()]).unwrap();
+    let ino = pool.lookup(1, "big").unwrap().unwrap();
+    assert_eq!(pool.read(ino, 0, payload.len() as u32).unwrap(), payload);
+}
+
+#[test]
+fn a_device_from_another_pool_is_refused() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let foreign = tempfile::tempdir().unwrap();
+
+    drop(Pool::create_replicated(&[a.path(), b.path()], small_params()).unwrap());
+    drop(Pool::create(foreign.path(), small_params()).unwrap());
+
+    let err = Pool::open_replicated(&[a.path(), foreign.path()]).unwrap_err();
+    assert!(
+        err.to_string().contains("different pool"),
+        "expected a membership refusal, got: {err}"
+    );
+}
+
+#[test]
+fn devices_given_out_of_vdev_order_are_refused() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    drop(Pool::create_replicated(&[a.path(), b.path()], small_params()).unwrap());
+
+    let err = Pool::open_replicated(&[b.path(), a.path()]).unwrap_err();
+    assert!(
+        err.to_string().contains("vdev_id order"),
+        "expected an ordering refusal, got: {err}"
+    );
+}
+
+#[test]
+fn opening_a_two_vdev_pool_with_one_device_is_refused() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    drop(Pool::create_replicated(&[a.path(), b.path()], small_params()).unwrap());
+
+    // Degraded mount is a designed future capability (§15.8), not something
+    // that should happen by accident because a device was left off the list.
+    let err = Pool::open(a.path()).unwrap_err();
+    assert!(
+        err.to_string().contains("2 vdevs but 1"),
+        "expected a vdev-count refusal, got: {err}"
+    );
+}
