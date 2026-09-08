@@ -331,7 +331,13 @@ struct PoolShared {
     pool_uuid: [u8; 16],
     vdev_id: u16,
     vdev_count: u16,
-    superblock_backend: FileBackend,
+    /// Every vdev backing this pool, indexed by `vdev_id` (ARCHITECTURE.md
+    /// §15.10). `vdevs[0]`'s root is `pool_root`.
+    vdevs: Vec<Vdev>,
+    /// One superblock ring per vdev (§15.5), index-aligned with `vdevs`.
+    /// Each carries its own `vdev_id` and its own `root_location`, since a
+    /// root object's offset can differ per device after a repair.
+    superblock_backends: Vec<FileBackend>,
     /// Advisory single-writer guard on `<pool_root>/LOCK` (ARCHITECTURE.md
     /// §1's pool layout). Never read -- held purely for its lifetime, and
     /// released by `Flock`'s `Drop` when the `Pool` goes away. `flock(2)` is
@@ -402,8 +408,10 @@ impl Pool {
     pub fn create(pool_root: &Path, params: PoolParams) -> Result<Self, PoolError> {
         std::fs::create_dir_all(pool_root)?;
         let pool_lock = acquire_pool_lock(pool_root)?;
-        let superblock_backend = FileBackend::open(pool_root)?;
-        if read_superblock(&superblock_backend)?.is_some() {
+        let vdevs = vec![Vdev::new(pool_root.to_path_buf())];
+        let vdev_root_paths: Vec<PathBuf> = vdevs.iter().map(|v| v.root.clone()).collect();
+        let superblock_backends = vec![FileBackend::open(pool_root)?];
+        if read_superblock(&superblock_backends[0])?.is_some() {
             return Err(PoolError::AlreadyExists(pool_root.display().to_string()));
         }
 
@@ -436,7 +444,7 @@ impl Pool {
         let next_segment_id = Arc::new(AtomicU64::new(0));
         let shard_count = params.logical_shard_count;
         let committer_pool = CommitterPool::new(
-            pool_root,
+            &vdev_root_paths,
             shard_count,
             committer_thread_count(),
             SHARD_RING_CAPACITY,
@@ -444,7 +452,7 @@ impl Pool {
             Arc::clone(&next_segment_id),
         )?;
         let meta_id = next_segment_id.fetch_add(1, Ordering::Relaxed);
-        let meta_writer = SegmentWriter::create(&[pool_root], meta_id, StreamKind::Meta, 0)?;
+        let meta_writer = SegmentWriter::create(&vdev_root_paths.iter().map(|p| p.as_path()).collect::<Vec<_>>(), meta_id, StreamKind::Meta, 0)?;
 
         let shard_delta_logs = (0..shard_count)
             .map(|id| ShardDeltaLog::open(pool_root, id).map(Mutex::new))
@@ -480,7 +488,8 @@ impl Pool {
             pool_uuid: lchfs_format::generate_pool_uuid()?,
             vdev_id: 0,
             vdev_count: 1,
-            superblock_backend,
+            vdevs,
+            superblock_backends,
             _pool_lock: pool_lock,
             namespace: Mutex::new(namespace),
             file_state: Mutex::new(HashMap::new()),
@@ -526,8 +535,10 @@ impl Pool {
     /// had.)
     pub fn open(pool_root: &Path) -> Result<Self, PoolError> {
         let pool_lock = acquire_pool_lock(pool_root)?;
-        let superblock_backend = FileBackend::open(pool_root)?;
-        let slot = read_superblock(&superblock_backend)?.ok_or_else(|| {
+        let vdevs = vec![Vdev::new(pool_root.to_path_buf())];
+        let vdev_root_paths: Vec<PathBuf> = vdevs.iter().map(|v| v.root.clone()).collect();
+        let superblock_backends = vec![FileBackend::open(pool_root)?];
+        let slot = read_superblock(&superblock_backends[0])?.ok_or_else(|| {
             PoolError::Format(format!(
                 "no valid superblock found at {} — was create-pool run?",
                 pool_root.display()
@@ -631,7 +642,7 @@ impl Pool {
         let next_segment_id = Arc::new(AtomicU64::new(max_segment_id + 1));
         let shard_count = root.pool_params.logical_shard_count;
         let committer_pool = CommitterPool::new(
-            pool_root,
+            &vdev_root_paths,
             shard_count,
             committer_thread_count(),
             SHARD_RING_CAPACITY,
@@ -639,7 +650,7 @@ impl Pool {
             Arc::clone(&next_segment_id),
         )?;
         let meta_id = next_segment_id.fetch_add(1, Ordering::Relaxed);
-        let meta_writer = SegmentWriter::create(&[pool_root], meta_id, StreamKind::Meta, 0)?;
+        let meta_writer = SegmentWriter::create(&vdev_root_paths.iter().map(|p| p.as_path()).collect::<Vec<_>>(), meta_id, StreamKind::Meta, 0)?;
 
         // Two-tier crash recovery (ARCHITECTURE.md §7): the InoMap walk
         // above is tier one (the last full checkpoint's base state). Tier
@@ -806,7 +817,8 @@ impl Pool {
             pool_uuid: slot.pool_uuid,
             vdev_id: slot.vdev_id,
             vdev_count: slot.vdev_count,
-            superblock_backend,
+            vdevs,
+            superblock_backends,
             _pool_lock: pool_lock,
             namespace: Mutex::new(namespace),
             file_state: Mutex::new(file_state_from_replay),
@@ -1682,7 +1694,7 @@ impl PoolShared {
             > self.pool_params.meta_segment_cap_bytes as u64
         {
             let id = self.next_segment_id.fetch_add(1, Ordering::Relaxed);
-            let new_writer = SegmentWriter::create(&[&self.pool_root], id, StreamKind::Meta, 0)?;
+            let new_writer = SegmentWriter::create(&self.vdev_roots(), id, StreamKind::Meta, 0)?;
             let old = std::mem::replace(meta_writer, new_writer);
             old.seal()?;
         }
@@ -3163,7 +3175,7 @@ impl PoolShared {
             self.dedup_pins.unpin(*hash);
         }
 
-        let mut slot = SuperblockSlot {
+        let slot = SuperblockSlot {
             magic: SUPERBLOCK_MAGIC,
             format_version: lchfs_format::FORMAT_VERSION,
             pool_uuid: self.pool_uuid,
@@ -3184,10 +3196,24 @@ impl PoolShared {
             },
             header_checksum: 0,
         };
-        finalize_superblock_slot_checksum(&mut slot);
-        write_superblock_slot(&self.superblock_backend, &slot)?;
+        // One superblock per vdev (§15.5). Each records its own vdev_id, so
+        // a device can still say which member it is when read on its own.
+        for (idx, backend) in self.superblock_backends.iter().enumerate() {
+            let mut per_vdev = slot;
+            per_vdev.vdev_id = idx as u16;
+            finalize_superblock_slot_checksum(&mut per_vdev);
+            write_superblock_slot(backend, &per_vdev)?;
+        }
 
         Ok(())
+    }
+}
+
+impl PoolShared {
+    /// Every vdev root in `vdev_id` order -- what `SegmentWriter` fans a
+    /// write out to (ARCHITECTURE.md §15.3).
+    fn vdev_roots(&self) -> Vec<&Path> {
+        self.vdevs.iter().map(|v| v.root.as_path()).collect()
     }
 }
 

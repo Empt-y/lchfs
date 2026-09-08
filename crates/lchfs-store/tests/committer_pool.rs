@@ -27,7 +27,7 @@ fn make_op(inode_id: u64, logical_offset: u64, payload: &[u8]) -> (IngressOp, cr
 #[test]
 fn ops_land_in_the_correct_shard_and_are_readable() {
     let dir = tempfile::tempdir().unwrap();
-    let pool = CommitterPool::new(dir.path(), 4, 2, 16, 1024 * 1024, Arc::new(AtomicU64::new(0)))
+    let pool = CommitterPool::new(&[dir.path().to_path_buf()], 4, 2, 16, 1024 * 1024, Arc::new(AtomicU64::new(0)))
         .unwrap();
 
     let payload = b"hello from the committer pool";
@@ -51,7 +51,7 @@ fn ops_land_in_the_correct_shard_and_are_readable() {
 #[test]
 fn per_producer_push_order_is_preserved_in_commit_order() {
     let dir = tempfile::tempdir().unwrap();
-    let pool = CommitterPool::new(dir.path(), 4, 3, 64, 1024 * 1024, Arc::new(AtomicU64::new(0)))
+    let pool = CommitterPool::new(&[dir.path().to_path_buf()], 4, 3, 64, 1024 * 1024, Arc::new(AtomicU64::new(0)))
         .unwrap();
 
     // Force every op onto the same inode (same shard) from one producer
@@ -88,7 +88,7 @@ fn per_producer_push_order_is_preserved_in_commit_order() {
 fn concurrent_producers_to_different_inodes_all_complete() {
     let dir = tempfile::tempdir().unwrap();
     let pool = Arc::new(
-        CommitterPool::new(dir.path(), 8, 4, 32, 1024 * 1024, Arc::new(AtomicU64::new(0)))
+        CommitterPool::new(&[dir.path().to_path_buf()], 8, 4, 32, 1024 * 1024, Arc::new(AtomicU64::new(0)))
             .unwrap(),
     );
 

@@ -46,9 +46,17 @@ pub struct IngressOp {
 /// `PoolInner::ensure_data_room`'s mem::replace-and-seal pattern from the
 /// single-threaded engine, but scoped to one shard's own writer instead of
 /// one global one).
+/// Borrow a `[PathBuf]` as the `[&Path]` slice `SegmentWriter` takes.
+fn roots(v: &[PathBuf]) -> Vec<&Path> {
+    v.iter().map(|p| p.as_path()).collect()
+}
+
 struct ShardDataWriter {
     writer: SegmentWriter,
-    pool_root: PathBuf,
+    /// Every vdev this shard's Data segments are written to (§15.3). The
+    /// Data stream carries file content, so this is the fan-out that
+    /// actually replicates user data.
+    vdev_roots: Vec<PathBuf>,
     shard_id: u32,
     segment_cap_bytes: u64,
     next_segment_id: Arc<AtomicU64>,
@@ -73,7 +81,7 @@ impl ShardDataWriter {
     fn roll_over(&mut self) -> io::Result<()> {
         let new_id = self.next_segment_id.fetch_add(1, Ordering::Relaxed);
         let new_writer =
-            SegmentWriter::create(&[&self.pool_root], new_id, StreamKind::Data, self.shard_id)?;
+            SegmentWriter::create(&roots(&self.vdev_roots), new_id, StreamKind::Data, self.shard_id)?;
         let old = std::mem::replace(&mut self.writer, new_writer);
         old.seal()
     }
@@ -105,12 +113,12 @@ impl LogicalShard {
     fn new(
         id: u32,
         ring_capacity: usize,
-        pool_root: &Path,
+        vdev_roots: &[PathBuf],
         segment_cap_bytes: u64,
         next_segment_id: Arc<AtomicU64>,
     ) -> io::Result<Self> {
         let initial_id = next_segment_id.fetch_add(1, Ordering::Relaxed);
-        let writer = SegmentWriter::create(&[pool_root], initial_id, StreamKind::Data, id)?;
+        let writer = SegmentWriter::create(&roots(vdev_roots), initial_id, StreamKind::Data, id)?;
         Ok(Self {
             id,
             ring: ArrayQueue::new(ring_capacity),
@@ -118,7 +126,7 @@ impl LogicalShard {
             pending: AtomicBool::new(false),
             data: Mutex::new(ShardDataWriter {
                 writer,
-                pool_root: pool_root.to_path_buf(),
+                vdev_roots: vdev_roots.to_vec(),
                 shard_id: id,
                 segment_cap_bytes,
                 next_segment_id,
@@ -177,7 +185,7 @@ pub struct CommitterPool {
 
 impl CommitterPool {
     pub fn new(
-        pool_root: &Path,
+        vdev_roots: &[PathBuf],
         shard_count: u32,
         worker_count: usize,
         ring_capacity: usize,
@@ -189,7 +197,7 @@ impl CommitterPool {
             shards.push(Arc::new(LogicalShard::new(
                 id,
                 ring_capacity,
-                pool_root,
+                vdev_roots,
                 data_segment_cap_bytes,
                 Arc::clone(&next_segment_id),
             )?));
