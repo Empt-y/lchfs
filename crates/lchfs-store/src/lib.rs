@@ -499,11 +499,13 @@ impl Pool {
             checkpoint_lock: Mutex::new(()),
             coalesce: Mutex::new(coalesce::CoalesceDaemon::new(
                 pool_root.to_path_buf(),
+                0,
                 Arc::clone(&dedup_index),
                 Arc::clone(&dedup_pins),
             )),
             dedup: Mutex::new(dedup::DedupScanner::new(
                 pool_root.to_path_buf(),
+                0,
                 Arc::clone(&dedup_index),
             )),
             checkpoint_task: Mutex::new(None),
@@ -550,7 +552,7 @@ impl Pool {
                 let mut readers = HashMap::new();
                 let mut locations = HashMap::new();
                 let max_segment_id = scan_segments(pool_root, &mut readers, &mut locations)?;
-                let index = rebuild_index(&index_file, &locations, slot.generation)?;
+                let index = rebuild_index(&index_file, &locations, slot.vdev_id, slot.generation)?;
                 // The slow path's full scan already covers every segment
                 // unconditionally, so it has no analog of the fast path's
                 // "index might be missing recent, un-checkpointed
@@ -823,11 +825,13 @@ impl Pool {
             checkpoint_lock: Mutex::new(()),
             coalesce: Mutex::new(coalesce::CoalesceDaemon::new(
                 pool_root.to_path_buf(),
+                slot.vdev_id,
                 Arc::clone(&dedup_index),
                 Arc::clone(&dedup_pins),
             )),
             dedup: Mutex::new(dedup::DedupScanner::new(
                 pool_root.to_path_buf(),
+                slot.vdev_id,
                 Arc::clone(&dedup_index),
             )),
             checkpoint_task: Mutex::new(None),
@@ -1592,7 +1596,7 @@ impl PoolShared {
                 self.dedup_index.put(content_hash, location);
                 self.persisted_index
                     .write()
-                    .put_chunk_location(content_hash, location)?;
+                    .put_chunk_location(content_hash, self.vdev_id, location)?;
                 Ok((content_hash, location))
             }
         }
@@ -1665,7 +1669,7 @@ impl PoolShared {
         )?;
         drop(meta_writer);
         self.dedup_index.put(hash, loc);
-        self.persisted_index.write().put_chunk_location(hash, loc)?;
+        self.persisted_index.write().put_chunk_location(hash, self.vdev_id, loc)?;
         Ok((hash, loc))
     }
 
@@ -3262,6 +3266,7 @@ fn scan_segments(
 fn rebuild_index(
     index_file: &Path,
     locations: &HashMap<Hash32, ExtentLocation>,
+    vdev_id: u16,
     generation: u64,
 ) -> Result<RedbIndex, PoolError> {
     let mut index = match RedbIndex::open(index_file) {
@@ -3272,7 +3277,7 @@ fn rebuild_index(
         }
     };
     for (&hash, &loc) in locations {
-        index.put_chunk_location(hash, loc)?;
+        index.put_chunk_location(hash, vdev_id, loc)?;
     }
     index.checkpoint(generation)?;
     Ok(index)

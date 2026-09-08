@@ -20,8 +20,18 @@ use thiserror::Error;
 /// hand-rolling an LSM — ARCHITECTURE.md §4); this trait exists so that
 /// choice can change later without touching callers.
 pub trait IndexStore {
+    /// The preferred replica's location -- the lowest `vdev_id` holding this
+    /// hash. Callers that only need "where can I read this" use this; read
+    /// failover uses `chunk_locations` to see the alternates.
     fn get_chunk_location(&self, hash: Hash32) -> Result<Option<ExtentLocation>, IndexError>;
-    fn put_chunk_location(&mut self, hash: Hash32, loc: ExtentLocation) -> Result<(), IndexError>;
+    /// Every replica of `hash`, ascending by `vdev_id` (ARCHITECTURE.md §15.2).
+    fn chunk_locations(&self, hash: Hash32) -> Result<Vec<(u16, ExtentLocation)>, IndexError>;
+    fn put_chunk_location(
+        &mut self,
+        hash: Hash32,
+        vdev_id: u16,
+        loc: ExtentLocation,
+    ) -> Result<(), IndexError>;
 
     fn get_inode_hash(&self, ino: u64) -> Result<Option<Hash32>, IndexError>;
     fn put_inode_hash(&mut self, ino: u64, hash: Hash32) -> Result<(), IndexError>;
@@ -48,6 +58,31 @@ const CHUNK_LOCATIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("chu
 const INODE_HASHES: TableDefinition<u64, &[u8]> = TableDefinition::new("inode_hashes");
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 const GENERATION_KEY: &str = "generation";
+
+/// `CHUNK_LOCATIONS` key: `hash || vdev_id` (little-endian u16).
+///
+/// Composite key rather than a redb multimap (ARCHITECTURE.md §15.1). redb
+/// keys are ordered, so every replica of one hash is contiguous and a range
+/// scan over `hash||0x0000 ..= hash||0xFFFF` yields them all. The *value*
+/// stays the unchanged 16-byte location encoding, so nothing that already
+/// reads a location has to care.
+fn encode_chunk_key(hash: Hash32, vdev_id: u16) -> [u8; 34] {
+    let mut k = [0u8; 34];
+    k[0..32].copy_from_slice(&hash.0);
+    k[32..34].copy_from_slice(&vdev_id.to_le_bytes());
+    k
+}
+
+fn chunk_key_bounds(hash: Hash32) -> ([u8; 34], [u8; 34]) {
+    (encode_chunk_key(hash, u16::MIN), encode_chunk_key(hash, u16::MAX))
+}
+
+fn decode_chunk_key(bytes: &[u8]) -> Result<(Hash32, u16), IndexError> {
+    let bytes: [u8; 34] = bytes.try_into().map_err(|_| IndexError::Corrupt)?;
+    let mut h = [0u8; 32];
+    h.copy_from_slice(&bytes[0..32]);
+    Ok((Hash32(h), u16::from_le_bytes([bytes[32], bytes[33]])))
+}
 
 fn encode_location(loc: ExtentLocation) -> [u8; 16] {
     let mut buf = [0u8; 16];
@@ -138,11 +173,18 @@ impl RedbIndex {
     pub fn iter_chunk_locations(&self) -> Result<Vec<(Hash32, ExtentLocation)>, IndexError> {
         let txn = self.db.begin_read().map_err(err)?;
         let table = txn.open_table(CHUNK_LOCATIONS).map_err(err)?;
-        let mut out = Vec::new();
+        // Keys sort by hash then vdev_id, so the first entry seen for a hash
+        // is its lowest-numbered replica -- the preferred one. Callers of
+        // this want a hash->where-to-read map (it warms ChunkLocationCache),
+        // not every replica, so later ones are skipped.
+        let mut out: Vec<(Hash32, ExtentLocation)> = Vec::new();
         for entry in table.iter().map_err(err)? {
             let (k, v) = entry.map_err(err)?;
-            let hash: [u8; 32] = k.value().try_into().map_err(|_| IndexError::Corrupt)?;
-            out.push((Hash32(hash), decode_location(v.value())?));
+            let (hash, _vdev_id) = decode_chunk_key(k.value())?;
+            if out.last().is_some_and(|(prev, _)| *prev == hash) {
+                continue;
+            }
+            out.push((hash, decode_location(v.value())?));
         }
         Ok(out)
     }
@@ -152,19 +194,44 @@ impl IndexStore for RedbIndex {
     fn get_chunk_location(&self, hash: Hash32) -> Result<Option<ExtentLocation>, IndexError> {
         let txn = self.db.begin_read().map_err(err)?;
         let table = txn.open_table(CHUNK_LOCATIONS).map_err(err)?;
-        match table.get(hash.0.as_slice()).map_err(err)? {
-            Some(v) => Ok(Some(decode_location(v.value())?)),
+        let (lo, hi) = chunk_key_bounds(hash);
+        match table.range(lo.as_slice()..=hi.as_slice()).map_err(err)?.next() {
+            Some(entry) => {
+                let (_k, v) = entry.map_err(err)?;
+                Ok(Some(decode_location(v.value())?))
+            }
             None => Ok(None),
         }
     }
 
-    fn put_chunk_location(&mut self, hash: Hash32, loc: ExtentLocation) -> Result<(), IndexError> {
+    fn chunk_locations(&self, hash: Hash32) -> Result<Vec<(u16, ExtentLocation)>, IndexError> {
+        let txn = self.db.begin_read().map_err(err)?;
+        let table = txn.open_table(CHUNK_LOCATIONS).map_err(err)?;
+        let (lo, hi) = chunk_key_bounds(hash);
+        let mut out = Vec::new();
+        for entry in table.range(lo.as_slice()..=hi.as_slice()).map_err(err)? {
+            let (k, v) = entry.map_err(err)?;
+            let (_h, vdev_id) = decode_chunk_key(k.value())?;
+            out.push((vdev_id, decode_location(v.value())?));
+        }
+        Ok(out)
+    }
+
+    fn put_chunk_location(
+        &mut self,
+        hash: Hash32,
+        vdev_id: u16,
+        loc: ExtentLocation,
+    ) -> Result<(), IndexError> {
         let mut txn = self.db.begin_write().map_err(err)?;
         txn.set_durability(Durability::None).map_err(err)?;
         {
             let mut table = txn.open_table(CHUNK_LOCATIONS).map_err(err)?;
             table
-                .insert(hash.0.as_slice(), encode_location(loc).as_slice())
+                .insert(
+                    encode_chunk_key(hash, vdev_id).as_slice(),
+                    encode_location(loc).as_slice(),
+                )
                 .map_err(err)?;
         }
         txn.commit().map_err(err)?;

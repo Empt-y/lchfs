@@ -40,6 +40,8 @@ fn to_io_err(e: impl std::fmt::Display) -> io::Error {
 
 pub struct DedupScanner {
     pool_root: PathBuf,
+    /// The vdev whose segments this scanner repoints (see CoalesceDaemon).
+    vdev_id: u16,
     locations: Arc<ChunkLocationCache>,
     /// In-memory only, per stream (today only ever `StreamKind::Data` is
     /// scanned -- see `run_pass`). Losing this on restart is fine: the
@@ -55,9 +57,10 @@ pub struct DedupScanner {
 }
 
 impl DedupScanner {
-    pub fn new(pool_root: PathBuf, locations: Arc<ChunkLocationCache>) -> Self {
+    pub fn new(pool_root: PathBuf, vdev_id: u16, locations: Arc<ChunkLocationCache>) -> Self {
         Self {
             pool_root,
+            vdev_id,
             locations,
             scanned_up_to: HashMap::new(),
         }
@@ -159,7 +162,7 @@ impl DedupScanner {
             {
                 let mut index = persisted_index.write();
                 index
-                    .put_chunk_location(hash, canonical)
+                    .put_chunk_location(hash, self.vdev_id, canonical)
                     .map_err(to_io_err)?;
             }
             for &loser in &locs[1..] {

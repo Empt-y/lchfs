@@ -16,7 +16,7 @@ fn create_open_roundtrip_chunk_location() {
     {
         let mut index = RedbIndex::create(&path).unwrap();
         assert_eq!(index.get_chunk_location(hash).unwrap(), None);
-        index.put_chunk_location(hash, loc).unwrap();
+        index.put_chunk_location(hash, 0, loc).unwrap();
         assert_eq!(index.get_chunk_location(hash).unwrap(), Some(loc));
         assert_eq!(index.generation(), 0);
         index.checkpoint(5).unwrap();
@@ -63,7 +63,7 @@ fn iter_chunk_locations_returns_everything_put() {
         })
         .collect();
     for (hash, loc) in &entries {
-        index.put_chunk_location(*hash, *loc).unwrap();
+        index.put_chunk_location(*hash, 0, *loc).unwrap();
     }
 
     let mut loaded = index.iter_chunk_locations().unwrap();
@@ -79,4 +79,54 @@ fn fresh_index_starts_at_generation_zero() {
     let path = dir.path().join("INDEX.redb");
     let index = RedbIndex::create(&path).unwrap();
     assert_eq!(index.generation(), 0);
+}
+
+/// One hash, several replicas (ARCHITECTURE.md §15.1). The composite
+/// `hash || vdev_id` key has to keep them distinct, return them in vdev
+/// order, and still let the common "just tell me where to read this" caller
+/// get a single answer without knowing replication exists.
+#[test]
+fn a_hash_can_hold_a_location_per_vdev() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut index = RedbIndex::create(&dir.path().join("INDEX.redb")).unwrap();
+
+    let hash = Hash32::of(b"replicated");
+    let on_vdev0 = ExtentLocation { segment_id: 1, offset: 64, len: 128 };
+    let on_vdev1 = ExtentLocation { segment_id: 9, offset: 4096, len: 128 };
+    // Inserted out of order on purpose: ordering must come from the key, not
+    // from insertion sequence.
+    index.put_chunk_location(hash, 1, on_vdev1).unwrap();
+    index.put_chunk_location(hash, 0, on_vdev0).unwrap();
+
+    assert_eq!(
+        index.chunk_locations(hash).unwrap(),
+        vec![(0, on_vdev0), (1, on_vdev1)],
+        "replicas should come back ascending by vdev_id"
+    );
+
+    // The preferred replica is the lowest vdev_id, and this is what every
+    // existing read path uses.
+    assert_eq!(index.get_chunk_location(hash).unwrap(), Some(on_vdev0));
+
+    // Warming the hot-path cache must not multiply entries per replica.
+    let all = index.iter_chunk_locations().unwrap();
+    assert_eq!(all.len(), 1, "iter should collapse replicas to one entry per hash");
+    assert_eq!(all[0], (hash, on_vdev0));
+}
+
+#[test]
+fn replicas_of_different_hashes_do_not_collide() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut index = RedbIndex::create(&dir.path().join("INDEX.redb")).unwrap();
+    let a = Hash32::of(b"a");
+    let b = Hash32::of(b"b");
+    let loc = |id| ExtentLocation { segment_id: id, offset: 0, len: 16 };
+
+    index.put_chunk_location(a, 0, loc(1)).unwrap();
+    index.put_chunk_location(a, 1, loc(2)).unwrap();
+    index.put_chunk_location(b, 0, loc(3)).unwrap();
+
+    assert_eq!(index.chunk_locations(a).unwrap().len(), 2);
+    assert_eq!(index.chunk_locations(b).unwrap(), vec![(0, loc(3))]);
+    assert_eq!(index.chunk_locations(Hash32::of(b"absent")).unwrap(), vec![]);
 }

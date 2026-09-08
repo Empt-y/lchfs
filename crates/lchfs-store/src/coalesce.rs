@@ -31,13 +31,23 @@ fn to_io_err(e: impl std::fmt::Display) -> io::Error {
 
 pub struct CoalesceDaemon {
     pool_root: PathBuf,
+    /// The vdev this daemon repacks. Coalescing rewrites extents into new
+    /// segments *on this device*, so the relocations it records belong to
+    /// this vdev's replica set and no other (ARCHITECTURE.md §15.7: mark is
+    /// pool-global, sweep is per-vdev).
+    vdev_id: u16,
     gc: GcEngine,
 }
 
 impl CoalesceDaemon {
-    pub fn new(pool_root: PathBuf, locations: Arc<ChunkLocationCache>, pins: Arc<PendingDedupPins>) -> Self {
+    pub fn new(
+        pool_root: PathBuf,
+        vdev_id: u16,
+        locations: Arc<ChunkLocationCache>,
+        pins: Arc<PendingDedupPins>,
+    ) -> Self {
         let gc = GcEngine::new(pool_root.clone(), locations, pins);
-        Self { pool_root, gc }
+        Self { pool_root, vdev_id, gc }
     }
 
     /// One idle-cycle pass: mark, find segments below the liveness
@@ -183,7 +193,7 @@ impl CoalesceDaemon {
         {
             let mut index = persisted_index.write();
             for (hash, loc) in &relocations {
-                index.put_chunk_location(*hash, *loc).map_err(to_io_err)?;
+                index.put_chunk_location(*hash, self.vdev_id, *loc).map_err(to_io_err)?;
             }
             index.flush().map_err(to_io_err)?;
         }

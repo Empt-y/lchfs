@@ -488,7 +488,10 @@ pub fn rebuild_index(pool_root: &Path) -> Result<(), FsckError> {
     let _lock = lchfs_store::lock_pool(pool_root)
         .map_err(|e| FsckError::PoolLocked(format!("{e}")))?;
     let locations = scan_all_segments(pool_root)?;
-    let generation = read_superblock(pool_root)?.generation;
+    // Same slot supplies the generation and this device's vdev_id -- the
+    // rebuilt entries describe *this* vdev's copies (ARCHITECTURE.md §15.1).
+    let slot = read_superblock(pool_root)?;
+    let generation = slot.generation;
 
     let index_path = pool_root.join("INDEX.redb");
     let mut index = match RedbIndex::open(&index_path) {
@@ -500,7 +503,7 @@ pub fn rebuild_index(pool_root: &Path) -> Result<(), FsckError> {
     };
     for (&hash, &loc) in &locations {
         index
-            .put_chunk_location(hash, loc)
+            .put_chunk_location(hash, slot.vdev_id, loc)
             .map_err(|e| FsckError::Io(e.to_string()))?;
     }
     index
