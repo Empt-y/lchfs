@@ -19,17 +19,30 @@ use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
-/// One physical storage device/file backing (part of) a pool. Phase 1
-/// configures exactly one `Vdev`; multi-`Vdev` replication is a labeled
-/// future phase (ARCHITECTURE.md §8), not implemented now — this type
-/// exists today purely so that future doesn't require a redesign.
+/// One physical storage device backing (part of) a pool.
+///
+/// `root` is the vdev's directory, not any file inside it: per
+/// ARCHITECTURE.md §15.10 a vdev root is self-contained, holding its own
+/// `SUPERBLOCK`, `LOCK` and `segments/` tree. It previously held the
+/// SUPERBLOCK *file* path, which made the type quietly wrong about what a
+/// vdev is — §15.0 records that, and the whole `Vec<Vdev>`-shaped claim it
+/// was part of.
+///
+/// Phase 1 pools configure exactly one vdev; fan-out across several is the
+/// remaining Phase 3 work.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Vdev {
-    pub path: PathBuf,
+    pub root: PathBuf,
 }
 
 impl Vdev {
-    pub fn new(path: PathBuf) -> Self {
-        Self { path }
+    pub fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+
+    /// This vdev's superblock ring. Each vdev carries its own (§15.5).
+    pub fn superblock_path(&self) -> PathBuf {
+        self.root.join("SUPERBLOCK")
     }
 }
 
@@ -46,14 +59,19 @@ pub trait StorageBackend: Send + Sync {
 /// layout). Fixed size — `SUPERBLOCK_SLOT_COUNT * SUPERBLOCK_SLOT_SIZE`
 /// bytes — created on first open and never resized after.
 pub struct FileBackend {
-    _vdevs: Vec<Vdev>,
+    /// The vdev this backend's superblock belongs to. Previously a
+    /// `_`-prefixed `Vec<Vdev>` that was always length 1 and never read —
+    /// dead weight that made the abstraction look more ready for
+    /// replication than it was.
+    vdev: Vdev,
     file: std::fs::File,
 }
 
 impl FileBackend {
-    pub fn open(pool_root: &Path) -> io::Result<Self> {
-        std::fs::create_dir_all(pool_root)?;
-        let path = pool_root.join("SUPERBLOCK");
+    pub fn open(vdev_root: &Path) -> io::Result<Self> {
+        std::fs::create_dir_all(vdev_root)?;
+        let vdev = Vdev::new(vdev_root.to_path_buf());
+        let path = vdev.superblock_path();
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -64,10 +82,12 @@ impl FileBackend {
         if file.metadata()?.len() < total_size {
             file.set_len(total_size)?;
         }
-        Ok(Self {
-            _vdevs: vec![Vdev::new(path)],
-            file,
-        })
+        Ok(Self { vdev, file })
+    }
+
+    /// The vdev this backend reads and writes.
+    pub fn vdev(&self) -> &Vdev {
+        &self.vdev
     }
 }
 

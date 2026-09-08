@@ -149,3 +149,23 @@ fn fsck_also_refuses_a_v2_pool() {
         "fsck did not report the legacy format: {err}"
     );
 }
+
+/// `Vdev` describes a *device root*, not a file inside one (§15.10). It used
+/// to hold the SUPERBLOCK file path, which made the type quietly wrong about
+/// what a vdev is -- and that wrongness was part of what made §8's
+/// "`Vec<Vdev>`-shaped from day one" claim look true when it wasn't.
+#[test]
+fn a_backend_knows_which_vdev_root_it_belongs_to() {
+    use lchfs_store::backend::{FileBackend, Vdev};
+
+    let dir = tempfile::tempdir().unwrap();
+    let backend = FileBackend::open(dir.path()).unwrap();
+
+    assert_eq!(backend.vdev().root, dir.path(), "vdev root should be the directory");
+    assert_eq!(
+        backend.vdev().superblock_path(),
+        dir.path().join("SUPERBLOCK"),
+        "the superblock lives inside the vdev root, per the §15.10 layout"
+    );
+    assert_eq!(Vdev::new(dir.path().to_path_buf()), *backend.vdev());
+}
