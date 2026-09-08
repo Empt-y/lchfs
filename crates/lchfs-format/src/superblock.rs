@@ -30,6 +30,14 @@ pub struct Superblock {
 pub struct SuperblockSlot {
     pub magic: [u8; 8],
     pub format_version: u32,
+    /// Identifies the pool this device belongs to (ARCHITECTURE.md §15.6).
+    /// Every vdev of one pool carries the same value, so a foreign or
+    /// half-wiped device cannot silently join.
+    pub pool_uuid: [u8; 16],
+    /// This device's index within the pool, `0..vdev_count`.
+    pub vdev_id: u16,
+    /// How many vdevs the pool expects. Phase 1 pools are always 1.
+    pub vdev_count: u16,
     pub generation: u64,
     pub root_hash: Hash32,
     pub root_location: ExtentLocation,
@@ -90,4 +98,39 @@ pub fn compute_shard_superblock_slot_checksum(slot: &ShardSuperblockSlot) -> u32
 
 pub fn finalize_shard_superblock_slot_checksum(slot: &mut ShardSuperblockSlot) {
     slot.header_checksum = compute_shard_superblock_slot_checksum(slot);
+}
+
+/// The pre-v3 `SuperblockSlot` layout, kept **decode-only** so a v2 pool can
+/// be recognised and refused with an honest error.
+///
+/// Without this, a v2 slot simply fails to decode as v3 and is skipped as
+/// invalid — which would make an existing v2 pool look *empty*. That matters
+/// because `Pool::create` treats "no valid superblock" as "nothing here" and
+/// proceeds, so a silent skip would let it overwrite a real pool. Same class
+/// of silent-fallback bug that `e2c6fad`'s too-new guard exists to prevent,
+/// approached from the other direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SuperblockSlotV2 {
+    pub magic: [u8; 8],
+    pub format_version: u32,
+    pub generation: u64,
+    pub root_hash: Hash32,
+    pub root_location: ExtentLocation,
+    pub index_generation: u64,
+    pub committed_at_unix_nanos: i64,
+    pub stats: SuperblockStats,
+    pub header_checksum: u32,
+}
+
+/// A pool UUID drawn from the kernel CSPRNG.
+///
+/// `/dev/urandom` directly rather than adding a `rand`/`uuid` dependency for
+/// 16 bytes used once per pool. Deriving it from time+pid was rejected: two
+/// pools created in the same second on one machine could collide, and the
+/// whole point of the value is to tell pools apart.
+pub fn generate_pool_uuid() -> std::io::Result<[u8; 16]> {
+    use std::io::Read;
+    let mut buf = [0u8; 16];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut buf)?;
+    Ok(buf)
 }

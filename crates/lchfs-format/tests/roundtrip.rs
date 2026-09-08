@@ -243,6 +243,9 @@ prop_compose! {
     fn superblock_slot()(
         magic in any::<[u8; 8]>(),
         format_version in any::<u32>(),
+        pool_uuid in any::<[u8; 16]>(),
+        vdev_id in any::<u16>(),
+        vdev_count in any::<u16>(),
         generation in any::<u64>(),
         root_hash in hash32(),
         root_location in extent_location(),
@@ -254,6 +257,9 @@ prop_compose! {
         SuperblockSlot {
             magic,
             format_version,
+            pool_uuid,
+            vdev_id,
+            vdev_count,
             generation,
             root_hash,
             root_location,

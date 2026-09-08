@@ -100,6 +100,10 @@ pub enum PoolError {
         "pool was written with on-disk format version {found}, but this build only supports up to {supported} -- upgrade lchfs to open it"
     )]
     UnsupportedFormatVersion { found: u32, supported: u32 },
+    #[error(
+        "pool uses on-disk format version {found}, which this build can no longer read          (supported: {supported}); the vdev-identity fields added in v3 have no v2 equivalent,          so the pool must be recreated"
+    )]
+    LegacyFormatVersion { found: u32, supported: u32 },
     #[error("pool at {0} is already open in another process")]
     PoolLocked(String),
     /// Distinct from `NotFound`, which means a path/name lookup failed:
@@ -320,6 +324,13 @@ impl std::fmt::Debug for Pool {
 struct PoolShared {
     pool_root: PathBuf,
     pool_params: PoolParams,
+    /// Pool/vdev identity (ARCHITECTURE.md §15.6). Generated at `create`,
+    /// read back from the superblock at `open`, and rewritten unchanged by
+    /// every checkpoint -- a checkpoint must never mint a new identity, or
+    /// the pool would stop matching its own vdevs.
+    pool_uuid: [u8; 16],
+    vdev_id: u16,
+    vdev_count: u16,
     superblock_backend: FileBackend,
     /// Advisory single-writer guard on `<pool_root>/LOCK` (ARCHITECTURE.md
     /// §1's pool layout). Never read -- held purely for its lifetime, and
@@ -463,6 +474,12 @@ impl Pool {
         let shared = Arc::new(PoolShared {
             pool_root: pool_root.to_path_buf(),
             pool_params: params,
+            // A fresh pool mints its identity once, here. Phase 1 pools are
+            // single-vdev; `vdev_count` becomes meaningful when a pool is
+            // created across several devices (ARCHITECTURE.md §15.6).
+            pool_uuid: lchfs_format::generate_pool_uuid()?,
+            vdev_id: 0,
+            vdev_count: 1,
             superblock_backend,
             _pool_lock: pool_lock,
             namespace: Mutex::new(namespace),
@@ -782,6 +799,11 @@ impl Pool {
         let shared = Arc::new(PoolShared {
             pool_root: pool_root.to_path_buf(),
             pool_params: root.pool_params,
+            // Read back, never regenerated -- minting a new identity on open
+            // would make the pool stop matching its own vdevs.
+            pool_uuid: slot.pool_uuid,
+            vdev_id: slot.vdev_id,
+            vdev_count: slot.vdev_count,
             superblock_backend,
             _pool_lock: pool_lock,
             namespace: Mutex::new(namespace),
@@ -3140,6 +3162,9 @@ impl PoolShared {
         let mut slot = SuperblockSlot {
             magic: SUPERBLOCK_MAGIC,
             format_version: lchfs_format::FORMAT_VERSION,
+            pool_uuid: self.pool_uuid,
+            vdev_id: self.vdev_id,
+            vdev_count: self.vdev_count,
             generation,
             root_hash,
             root_location,
@@ -3370,8 +3395,27 @@ fn read_superblock(backend: &FileBackend) -> Result<Option<SuperblockSlot>, Pool
         if encoded_len == 0 || 4 + encoded_len > bytes.len() {
             continue;
         }
-        let Ok(slot) = lchfs_format::decode::<SuperblockSlot>(&bytes[4..4 + encoded_len]) else {
-            continue;
+        let slot = match lchfs_format::decode::<SuperblockSlot>(&bytes[4..4 + encoded_len]) {
+            Ok(slot) => slot,
+            Err(_) => {
+                // A v2 slot cannot decode as v3 (the identity fields have no
+                // bytes to read), and simply skipping it would make a real v2
+                // pool look *empty* -- which `Pool::create` would then treat
+                // as "nothing here" and overwrite. Recognise it and refuse.
+                match lchfs_format::decode::<lchfs_format::SuperblockSlotV2>(&bytes[4..4 + encoded_len]) {
+                    Ok(legacy)
+                        if legacy.magic == SUPERBLOCK_MAGIC
+                            && legacy.format_version < lchfs_format::FORMAT_VERSION =>
+                    {
+                        return Err(PoolError::LegacyFormatVersion {
+                            found: legacy.format_version,
+                            supported: lchfs_format::FORMAT_VERSION,
+                        });
+                    }
+                    _ => {}
+                }
+                continue;
+            }
         };
         if slot.magic != SUPERBLOCK_MAGIC {
             continue;
@@ -3389,6 +3433,15 @@ fn read_superblock(backend: &FileBackend) -> Result<Option<SuperblockSlot>, Pool
                 found: slot.format_version,
                 supported: lchfs_format::FORMAT_VERSION,
             });
+        }
+        // Identity sanity (§15.6). Checked here, where magic and CRC have
+        // already vouched for the bytes, so a malformed value is a real
+        // inconsistency rather than noise from an uninitialized slot.
+        if slot.vdev_count == 0 || slot.vdev_id >= slot.vdev_count {
+            return Err(PoolError::Format(format!(
+                "superblock declares vdev_id {} of vdev_count {} — out of range",
+                slot.vdev_id, slot.vdev_count
+            )));
         }
         if best.as_ref().is_none_or(|b| slot.generation > b.generation) {
             best = Some(slot);

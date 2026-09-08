@@ -13,6 +13,9 @@ fn slot(generation: u64) -> SuperblockSlot {
     let mut slot = SuperblockSlot {
         magic: lchfs_format::SUPERBLOCK_MAGIC,
         format_version: lchfs_format::FORMAT_VERSION,
+        pool_uuid: [0xAB; 16],
+        vdev_id: 0,
+        vdev_count: 1,
         generation,
         root_hash: Hash32::of(generation.to_le_bytes().as_slice()),
         root_location: ExtentLocation { segment_id: 0, offset: 4096, len: 64 },

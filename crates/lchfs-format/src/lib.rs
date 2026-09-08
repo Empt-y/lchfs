@@ -27,9 +27,10 @@ pub use segment::{
 };
 pub use superblock::{
     SHARD_SUPERBLOCK_MAGIC, SUPERBLOCK_MAGIC, SUPERBLOCK_SLOT_COUNT, SUPERBLOCK_SLOT_SIZE,
-    ShardSuperblockSlot, Superblock, SuperblockSlot, SuperblockStats,
+    ShardSuperblockSlot, Superblock, SuperblockSlot, SuperblockSlotV2, SuperblockStats,
     compute_shard_superblock_slot_checksum, compute_superblock_slot_checksum,
     finalize_shard_superblock_slot_checksum, finalize_superblock_slot_checksum,
+    generate_pool_uuid,
 };
 
 /// On-disk format version, stored in every superblock slot. Bump on any
@@ -45,4 +46,4 @@ pub use superblock::{
 ///   bump, so such a reader refuses the pool instead. A v2 reader handles v1
 ///   pools correctly with no migration, since a v1 chunk list simply has no
 ///   gaps.
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;

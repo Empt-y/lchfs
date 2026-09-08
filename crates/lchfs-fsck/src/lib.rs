@@ -57,6 +57,10 @@ pub enum FsckError {
         "pool was written with on-disk format version {found}, but this build only supports up to {supported} -- upgrade lchfs to check it"
     )]
     UnsupportedFormatVersion { found: u32, supported: u32 },
+    #[error(
+        "pool uses on-disk format version {found}, which this build can no longer read          (supported: {supported}); the pool must be recreated"
+    )]
+    LegacyFormatVersion { found: u32, supported: u32 },
     #[error("cannot rebuild the index while the pool is in use: {0}")]
     PoolLocked(String),
     #[error("I/O error: {0}")]
@@ -134,8 +138,26 @@ pub fn read_superblock(pool_root: &Path) -> Result<SuperblockSlot, FsckError> {
         if encoded_len == 0 || 4 + encoded_len > bytes.len() {
             continue;
         }
-        let Ok(slot) = lchfs_format::decode::<SuperblockSlot>(&bytes[4..4 + encoded_len]) else {
-            continue;
+        let slot = match lchfs_format::decode::<SuperblockSlot>(&bytes[4..4 + encoded_len]) {
+            Ok(slot) => slot,
+            Err(_) => {
+                // Mirrors lchfs-store: recognise a pre-v3 slot rather than
+                // skipping it, so fsck reports "too old" instead of the
+                // misleading "no valid superblock".
+                match lchfs_format::decode::<lchfs_format::SuperblockSlotV2>(&bytes[4..4 + encoded_len],) {
+                    Ok(legacy)
+                        if legacy.magic == SUPERBLOCK_MAGIC
+                            && legacy.format_version < lchfs_format::FORMAT_VERSION =>
+                    {
+                        return Err(FsckError::LegacyFormatVersion {
+                            found: legacy.format_version,
+                            supported: lchfs_format::FORMAT_VERSION,
+                        });
+                    }
+                    _ => {}
+                }
+                continue;
+            }
         };
         if slot.magic != SUPERBLOCK_MAGIC {
             continue;

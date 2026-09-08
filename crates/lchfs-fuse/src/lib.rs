@@ -86,7 +86,8 @@ fn errno_for(err: &PoolError) -> Errno {
         // Both only reachable via Pool::open/create, which happen before the
         // mount is serving callbacks -- mapped for exhaustiveness, not
         // because a live FUSE request can produce either.
-        PoolError::UnsupportedFormatVersion { .. } => Errno::EINVAL,
+        PoolError::UnsupportedFormatVersion { .. }
+        | PoolError::LegacyFormatVersion { .. } => Errno::EINVAL,
         PoolError::PoolLocked(_) => Errno::EBUSY,
     }
 }
