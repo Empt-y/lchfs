@@ -444,7 +444,7 @@ impl Pool {
             Arc::clone(&next_segment_id),
         )?;
         let meta_id = next_segment_id.fetch_add(1, Ordering::Relaxed);
-        let meta_writer = SegmentWriter::create(pool_root, meta_id, StreamKind::Meta, 0)?;
+        let meta_writer = SegmentWriter::create(&[pool_root], meta_id, StreamKind::Meta, 0)?;
 
         let shard_delta_logs = (0..shard_count)
             .map(|id| ShardDeltaLog::open(pool_root, id).map(Mutex::new))
@@ -639,7 +639,7 @@ impl Pool {
             Arc::clone(&next_segment_id),
         )?;
         let meta_id = next_segment_id.fetch_add(1, Ordering::Relaxed);
-        let meta_writer = SegmentWriter::create(pool_root, meta_id, StreamKind::Meta, 0)?;
+        let meta_writer = SegmentWriter::create(&[pool_root], meta_id, StreamKind::Meta, 0)?;
 
         // Two-tier crash recovery (ARCHITECTURE.md §7): the InoMap walk
         // above is tier one (the last full checkpoint's base state). Tier
@@ -1682,7 +1682,7 @@ impl PoolShared {
             > self.pool_params.meta_segment_cap_bytes as u64
         {
             let id = self.next_segment_id.fetch_add(1, Ordering::Relaxed);
-            let new_writer = SegmentWriter::create(&self.pool_root, id, StreamKind::Meta, 0)?;
+            let new_writer = SegmentWriter::create(&[&self.pool_root], id, StreamKind::Meta, 0)?;
             let old = std::mem::replace(meta_writer, new_writer);
             old.seal()?;
         }

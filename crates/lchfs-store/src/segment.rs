@@ -126,7 +126,14 @@ fn delta_segment_path(pool_root: &Path, shard_id: u32, segment_id: u64) -> PathB
 /// writer ever touches the same segment file"). Phase B: single-threaded,
 /// so exclusivity is just "the only `SegmentWriter` for this segment_id".
 pub struct SegmentWriter {
-    file: File,
+    /// One file per vdev, all carrying byte-identical content
+    /// (ARCHITECTURE.md §15.3: writes fan out synchronously to every online
+    /// vdev, never quorum). Because every replica receives the same appends
+    /// in the same order, offsets agree across them during normal
+    /// operation; per-vdev locations exist for what happens *after* a
+    /// repair, when heal appends recovered bytes at a fresh offset on one
+    /// device only.
+    files: Vec<File>,
     segment_id: u64,
     stream_kind: StreamKind,
     owner_shard: u32,
@@ -138,14 +145,17 @@ pub struct SegmentWriter {
 
 impl SegmentWriter {
     pub fn create(
-        pool_root: &Path,
+        vdev_roots: &[&Path],
         segment_id: u64,
         kind: StreamKind,
         owner_shard: u32,
     ) -> io::Result<Self> {
-        std::fs::create_dir_all(segment_dir(pool_root, kind))?;
-        let path = segment_path(pool_root, segment_id, kind);
-        Self::create_at(&path, segment_id, kind, owner_shard)
+        let mut paths = Vec::with_capacity(vdev_roots.len());
+        for root in vdev_roots {
+            std::fs::create_dir_all(segment_dir(root, kind))?;
+            paths.push(segment_path(root, segment_id, kind));
+        }
+        Self::create_at(&paths, segment_id, kind, owner_shard)
     }
 
     /// Open a fresh segment in shard `shard_id`'s own Delta stream
@@ -155,24 +165,42 @@ impl SegmentWriter {
     /// segment kind's convention of recording its owning shard in the
     /// header even though only Delta streams are shard-scoped by directory
     /// too.
-    pub fn create_delta(pool_root: &Path, shard_id: u32, segment_id: u64) -> io::Result<Self> {
-        std::fs::create_dir_all(delta_segment_dir(pool_root, shard_id))?;
-        let path = delta_segment_path(pool_root, shard_id, segment_id);
-        Self::create_at(&path, segment_id, StreamKind::Delta, shard_id)
+    pub fn create_delta(
+        vdev_roots: &[&Path],
+        shard_id: u32,
+        segment_id: u64,
+    ) -> io::Result<Self> {
+        let mut paths = Vec::with_capacity(vdev_roots.len());
+        for root in vdev_roots {
+            std::fs::create_dir_all(delta_segment_dir(root, shard_id))?;
+            paths.push(delta_segment_path(root, shard_id, segment_id));
+        }
+        Self::create_at(&paths, segment_id, StreamKind::Delta, shard_id)
     }
 
     fn create_at(
-        path: &Path,
+        paths: &[PathBuf],
         segment_id: u64,
         kind: StreamKind,
         owner_shard: u32,
     ) -> io::Result<Self> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)?;
+        if paths.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a segment needs at least one vdev to be written to",
+            ));
+        }
+        let mut files = Vec::with_capacity(paths.len());
+        for path in paths {
+            files.push(
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(path)?,
+            );
+        }
 
         let mut header = SegmentHeader {
             magic: SEGMENT_HEADER_MAGIC,
@@ -183,10 +211,12 @@ impl SegmentWriter {
             header_checksum: 0,
         };
         finalize_segment_header_checksum(&mut header);
-        write_header_page(&file, &header)?;
+        for file in &files {
+            write_header_page(file, &header)?;
+        }
 
         Ok(Self {
-            file,
+            files,
             segment_id,
             stream_kind: kind,
             owner_shard,
@@ -252,12 +282,16 @@ impl SegmentWriter {
         debug_assert_eq!(encoded.len() as u32, header_len);
 
         let record_offset = self.cursor;
-        self.file
-            .write_all_at(&header_len.to_le_bytes(), record_offset)?;
-        self.file
-            .write_all_at(&encoded, record_offset + 4)?;
-        self.file
-            .write_all_at(payload, record_offset + 4 + header_len as u64)?;
+        // Every replica gets the identical record at the identical offset.
+        // Any failure fails the whole append: §15.3 chose synchronous
+        // all-vdev durability over quorum, because acking a write present on
+        // only some replicas would need a catch-up log -- a second
+        // durability mechanism to get wrong.
+        for file in &self.files {
+            file.write_all_at(&header_len.to_le_bytes(), record_offset)?;
+            file.write_all_at(&encoded, record_offset + 4)?;
+            file.write_all_at(payload, record_offset + 4 + header_len as u64)?;
+        }
 
         let loc = ExtentLocation {
             segment_id: self.segment_id,
@@ -274,7 +308,10 @@ impl SegmentWriter {
     /// checkpoint durability barriers (ARCHITECTURE.md §3), which fsync
     /// still-open segments long before they fill up and get sealed.
     pub fn fsync(&self) -> io::Result<()> {
-        self.file.sync_all()
+        for file in &self.files {
+            file.sync_all()?;
+        }
+        Ok(())
     }
 
     /// Seal the segment: write record count, aggregate fingerprint hash,
@@ -289,9 +326,10 @@ impl SegmentWriter {
         finalize_segment_footer_checksum(&mut footer);
         let encoded =
             lchfs_format::encode(&footer).expect("SegmentFooter encoding is infallible");
-        self.file
-            .write_all_at(&(encoded.len() as u32).to_le_bytes(), self.cursor)?;
-        self.file.write_all_at(&encoded, self.cursor + 4)?;
+        for file in &self.files {
+            file.write_all_at(&(encoded.len() as u32).to_le_bytes(), self.cursor)?;
+            file.write_all_at(&encoded, self.cursor + 4)?;
+        }
 
         let mut header = SegmentHeader {
             magic: SEGMENT_HEADER_MAGIC,
@@ -302,9 +340,15 @@ impl SegmentWriter {
             header_checksum: 0,
         };
         finalize_segment_header_checksum(&mut header);
-        write_header_page(&self.file, &header)?;
+        for file in &self.files {
+            write_header_page(file, &header)?;
+        }
 
-        self.file.sync_all()
+        // Seal is only durable once every replica has it.
+        for file in &self.files {
+            file.sync_all()?;
+        }
+        Ok(())
     }
 }
 

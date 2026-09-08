@@ -170,7 +170,7 @@ impl CoalesceDaemon {
         }
 
         let new_id = next_segment_id.fetch_add(1, Ordering::Relaxed);
-        let mut writer = SegmentWriter::create(&self.pool_root, new_id, StreamKind::Data, owner_shard)?;
+        let mut writer = SegmentWriter::create(&[&self.pool_root], new_id, StreamKind::Data, owner_shard)?;
         let mut relocations = Vec::with_capacity(live_records.len());
         for (header, raw_payload) in &live_records {
             let new_loc = writer.append(

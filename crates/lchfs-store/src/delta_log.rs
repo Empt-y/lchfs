@@ -98,7 +98,7 @@ impl ShardDeltaLog {
             0
         };
 
-        let writer = SegmentWriter::create_delta(pool_root, shard_id, next_id)?;
+        let writer = SegmentWriter::create_delta(&[pool_root], shard_id, next_id)?;
 
         let (local_epoch, delta_log_tail) = match read_shard_superblock_file(pool_root, shard_id) {
             Ok(Some(slot)) if slot.shard_id == shard_id => (slot.local_epoch, slot.delta_log_tail),

@@ -73,7 +73,7 @@ impl ShardDataWriter {
     fn roll_over(&mut self) -> io::Result<()> {
         let new_id = self.next_segment_id.fetch_add(1, Ordering::Relaxed);
         let new_writer =
-            SegmentWriter::create(&self.pool_root, new_id, StreamKind::Data, self.shard_id)?;
+            SegmentWriter::create(&[&self.pool_root], new_id, StreamKind::Data, self.shard_id)?;
         let old = std::mem::replace(&mut self.writer, new_writer);
         old.seal()
     }
@@ -110,7 +110,7 @@ impl LogicalShard {
         next_segment_id: Arc<AtomicU64>,
     ) -> io::Result<Self> {
         let initial_id = next_segment_id.fetch_add(1, Ordering::Relaxed);
-        let writer = SegmentWriter::create(pool_root, initial_id, StreamKind::Data, id)?;
+        let writer = SegmentWriter::create(&[pool_root], initial_id, StreamKind::Data, id)?;
         Ok(Self {
             id,
             ring: ArrayQueue::new(ring_capacity),

@@ -11,7 +11,7 @@ use lchfs_store::segment::{SegmentReader, SegmentWriter};
 fn delta_segment_round_trips_and_is_shard_scoped() {
     let dir = tempfile::tempdir().unwrap();
 
-    let mut w7 = SegmentWriter::create_delta(dir.path(), 7, 0).unwrap();
+    let mut w7 = SegmentWriter::create_delta(&[dir.path()], 7, 0).unwrap();
     let payload = b"delta log entry payload";
     let hash = Hash32::of(payload);
     let loc = w7
@@ -28,7 +28,7 @@ fn delta_segment_round_trips_and_is_shard_scoped() {
 
     // A different shard's delta stream must be a genuinely separate file —
     // same segment_id 0 is fine, since the shard subdirectory disambiguates.
-    let mut w9 = SegmentWriter::create_delta(dir.path(), 9, 0).unwrap();
+    let mut w9 = SegmentWriter::create_delta(&[dir.path()], 9, 0).unwrap();
     let other_payload = b"a different shard's entry";
     let other_hash = Hash32::of(other_payload);
     w9.append(
@@ -64,7 +64,7 @@ fn delta_segment_round_trips_and_is_shard_scoped() {
 #[test]
 fn delta_segment_seal_round_trips_stream_kind_and_owner_shard() {
     let dir = tempfile::tempdir().unwrap();
-    let w = SegmentWriter::create_delta(dir.path(), 3, 0).unwrap();
+    let w = SegmentWriter::create_delta(&[dir.path()], 3, 0).unwrap();
     w.seal().unwrap();
 
     let r = SegmentReader::open_delta(dir.path(), 3, 0).unwrap();
