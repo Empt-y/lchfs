@@ -190,6 +190,40 @@ impl RedbIndex {
     }
 }
 
+impl RedbIndex {
+    /// Every `(hash, vdev_id, location)` the index holds, ordered by hash
+    /// then vdev -- so one hash's replicas are contiguous. What resilver
+    /// walks (ARCHITECTURE.md §15.4); everything else wants the collapsed
+    /// `iter_chunk_locations`.
+    pub fn iter_all_chunk_locations(&self) -> Result<Vec<(Hash32, u16, ExtentLocation)>, IndexError> {
+        let txn = self.db.begin_read().map_err(err)?;
+        let table = txn.open_table(CHUNK_LOCATIONS).map_err(err)?;
+        let mut out = Vec::new();
+        for entry in table.iter().map_err(err)? {
+            let (k, v) = entry.map_err(err)?;
+            let (hash, vdev_id) = decode_chunk_key(k.value())?;
+            out.push((hash, vdev_id, decode_location(v.value())?));
+        }
+        Ok(out)
+    }
+
+    /// Forgets one replica's entry. Not used by the engine itself -- a
+    /// device that misses writes simply never gets the entry -- but it is
+    /// how a test manufactures that state without taking a vdev offline.
+    pub fn delete_chunk_location(&mut self, hash: Hash32, vdev_id: u16) -> Result<(), IndexError> {
+        let mut txn = self.db.begin_write().map_err(err)?;
+        txn.set_durability(Durability::Immediate).map_err(err)?;
+        {
+            let mut table = txn.open_table(CHUNK_LOCATIONS).map_err(err)?;
+            table
+                .remove(encode_chunk_key(hash, vdev_id).as_slice())
+                .map_err(err)?;
+        }
+        txn.commit().map_err(err)?;
+        Ok(())
+    }
+}
+
 impl IndexStore for RedbIndex {
     fn get_chunk_location(&self, hash: Hash32) -> Result<Option<ExtentLocation>, IndexError> {
         let txn = self.db.begin_read().map_err(err)?;

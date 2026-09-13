@@ -130,3 +130,36 @@ fn replicas_of_different_hashes_do_not_collide() {
     assert_eq!(index.chunk_locations(b).unwrap(), vec![(0, loc(3))]);
     assert_eq!(index.chunk_locations(Hash32::of(b"absent")).unwrap(), vec![]);
 }
+
+#[test]
+fn iter_all_lists_every_replica_and_delete_forgets_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut index = RedbIndex::create(&dir.path().join("INDEX.redb")).unwrap();
+    let a = Hash32([1u8; 32]);
+    let b = Hash32([2u8; 32]);
+    let loc = |segment_id| ExtentLocation {
+        segment_id,
+        offset: 4096,
+        len: 10,
+    };
+    index.put_chunk_location(a, 1, loc(11)).unwrap();
+    index.put_chunk_location(a, 0, loc(10)).unwrap();
+    index.put_chunk_location(b, 0, loc(20)).unwrap();
+
+    assert_eq!(
+        index.iter_all_chunk_locations().unwrap(),
+        vec![(a, 0, loc(10)), (a, 1, loc(11)), (b, 0, loc(20))],
+        "every replica, hash-major then vdev-ascending"
+    );
+
+    index.delete_chunk_location(a, 0).unwrap();
+    assert_eq!(index.chunk_locations(a).unwrap(), vec![(1, loc(11))]);
+    assert_eq!(
+        index.get_chunk_location(a).unwrap(),
+        Some(loc(11)),
+        "preferred replica moves to the next lowest vdev"
+    );
+    // Deleting what isn't there is not an error.
+    index.delete_chunk_location(b, 5).unwrap();
+    assert_eq!(index.chunk_locations(b).unwrap(), vec![(0, loc(20))]);
+}

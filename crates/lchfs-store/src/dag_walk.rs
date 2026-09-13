@@ -16,7 +16,7 @@
 //! used to *discover* further inodes to visit.
 
 use crate::segment::SegmentReader;
-use crate::{PoolError, SegmentReaders, StreamKind, get_reader};
+use crate::{PRIMARY_VDEV_ID, PoolError, SegmentReaders, StreamKind, get_reader};
 use lchfs_format::{ContentRef, ExtentKind, ExtentLocation, Hash32, InoMap, InodeObject, IndirectHashList, RootObject};
 use lchfs_index::ChunkLocationCache;
 use roaring::RoaringBitmap;
@@ -51,7 +51,7 @@ fn resolve_and_read(
         .get(hash)
         .ok_or_else(|| PoolError::Format(format!("GC mark: {hash:?} not found in index")))?;
     mark_location(loc, live);
-    let reader: &SegmentReader = get_reader(readers, pool_root, loc.segment_id, stream)?;
+    let reader: &SegmentReader = get_reader(readers, pool_root, PRIMARY_VDEV_ID, loc.segment_id, stream)?;
     let (header, bytes) = reader.read_record(loc)?;
     Ok((header.kind, bytes))
 }

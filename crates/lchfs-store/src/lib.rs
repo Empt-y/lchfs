@@ -47,7 +47,8 @@ use delta_log::{ShardCommitRecord, ShardDeltaLog};
 use ingress::{CommitterPool, IngressOp};
 use lchfs_chunk::{ChunkBoundary, Chunker, FastCdcChunker};
 use lchfs_format::{
-    ChunkRef, CodecId, ContentRef, DirEntry, DirectoryObject, ExtentKind, ExtentLocation, Hash32,
+    ChunkRef, CodecId, ContentRef, DirEntry, DirectoryObject, ExtentKind, ExtentLocation,
+    ExtentRecordHeader, Hash32,
     InoMap, InoMapEntry, InodeKind, InodeObject, IndirectHashList, PoolParams, RootObject,
     SnapshotEntry, SnapshotTable, StreamKind, SuperblockSlot, SUPERBLOCK_MAGIC, SUPERBLOCK_SLOT_COUNT,
     SUPERBLOCK_SLOT_SIZE, XattrBlob, compute_superblock_slot_checksum,
@@ -229,7 +230,63 @@ fn index_path(pool_root: &Path) -> PathBuf {
     pool_root.join("INDEX.redb")
 }
 
-pub(crate) type SegmentReaders = HashMap<(u64, StreamKind), SegmentReader>;
+/// The vdev whose copy of everything is read by default. It holds the
+/// pool's `INDEX.redb` (ARCHITECTURE.md §15.10), `ChunkLocationCache`'s
+/// entries are *its* locations, and the mount path, GC mark and the
+/// coalesce/dedup daemons all read from it. Read failover (§15.2) is what
+/// consults the other vdevs, and only when this one fails.
+pub(crate) const PRIMARY_VDEV_ID: u16 = 0;
+
+/// Open readers keyed by `(vdev_id, segment_id, stream)`. A segment_id is
+/// pool-global (§15.4), but after a heal the same id can exist on one vdev
+/// and not another, so the vdev is part of the identity.
+pub(crate) type SegmentReaders = HashMap<(u16, u64, StreamKind), SegmentReader>;
+
+/// Heal appends per fsync during a resilver. One fsync per record would make
+/// resilvering a large device take as long as writing it record by record.
+const HEAL_BATCH: usize = 256;
+
+/// What a resilver found and did. `examined` counts distinct hashes, the
+/// rest count replicas on the resilvered vdev.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ResilverReport {
+    pub examined: u64,
+    /// No index entry for this vdev at all: the device missed the write.
+    pub missing: u64,
+    /// Indexed but the record did not read back and verify.
+    pub corrupt: u64,
+    pub healed: u64,
+    /// Hashes with no healthy replica anywhere -- genuine data loss.
+    pub unrecoverable: Vec<Hash32>,
+}
+
+#[derive(Default)]
+struct RepairStats {
+    failovers: AtomicU64,
+    heals: AtomicU64,
+    heal_failures: AtomicU64,
+}
+
+impl RepairStats {
+    fn snapshot(&self) -> RepairStatsSnapshot {
+        RepairStatsSnapshot {
+            failovers: self.failovers.load(Ordering::Relaxed),
+            heals: self.heals.load(Ordering::Relaxed),
+            heal_failures: self.heal_failures.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Point-in-time copy of the repair counters (`Pool::repair_stats`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RepairStatsSnapshot {
+    /// Reads served by a non-primary replica after the primary failed.
+    pub failovers: u64,
+    /// Records re-created on a vdev, by failover or resilver.
+    pub heals: u64,
+    /// Heals that themselves failed (the read still succeeded).
+    pub heal_failures: u64,
+}
 
 fn committer_thread_count() -> usize {
     std::thread::available_parallelism()
@@ -377,6 +434,14 @@ struct PoolShared {
     /// `checkpoint` need exclusive.
     persisted_index: RwLock<RedbIndex>,
     readers: Mutex<SegmentReaders>,
+    /// One open heal segment per `(vdev_id, stream)`, created on first use
+    /// (ARCHITECTURE.md §15.4). A heal writes to *one* device, so it can
+    /// never go through `meta_writer` or the committer pool: those fan the
+    /// identical record out to every vdev at the identical offset, and a
+    /// single-device append through them would leave the replicas'
+    /// cursors disagreeing. Sealed at every checkpoint.
+    heal_writers: Mutex<HashMap<(u16, StreamKind), SegmentWriter>>,
+    repair_stats: RepairStats,
 
     meta_writer: Mutex<SegmentWriter>,
     next_segment_id: Arc<AtomicU64>,
@@ -528,6 +593,8 @@ impl Pool {
             dedup_pins: Arc::clone(&dedup_pins),
             persisted_index: RwLock::new(persisted_index),
             readers: Mutex::new(HashMap::new()),
+            heal_writers: Mutex::new(HashMap::new()),
+            repair_stats: RepairStats::default(),
             meta_writer: Mutex::new(meta_writer),
             next_segment_id,
             published_generation,
@@ -659,6 +726,7 @@ impl Pool {
             let reader = get_reader(
                 &mut readers,
                 pool_root,
+                PRIMARY_VDEV_ID,
                 slot.root_location.segment_id,
                 StreamKind::Meta,
             )?;
@@ -675,6 +743,7 @@ impl Pool {
             let reader = get_reader(
                 &mut readers,
                 pool_root,
+                PRIMARY_VDEV_ID,
                 inomap_loc.segment_id,
                 StreamKind::Meta,
             )?;
@@ -692,7 +761,7 @@ impl Pool {
                 PoolError::Format(format!("InodeObject for ino {} missing from scan", entry.ino))
             })?;
             let bytes = {
-                let reader = get_reader(&mut readers, pool_root, loc.segment_id, StreamKind::Meta)?;
+                let reader = get_reader(&mut readers, pool_root, PRIMARY_VDEV_ID, loc.segment_id, StreamKind::Meta)?;
                 let (_h, bytes) = reader.read_record(loc)?;
                 bytes
             };
@@ -706,7 +775,7 @@ impl Pool {
                     .ok_or_else(|| PoolError::Format("DirectoryObject missing from scan".into()))?;
                 let dir_bytes = {
                     let reader =
-                        get_reader(&mut readers, pool_root, dir_loc.segment_id, StreamKind::Meta)?;
+                        get_reader(&mut readers, pool_root, PRIMARY_VDEV_ID, dir_loc.segment_id, StreamKind::Meta)?;
                     let (_h, bytes) = reader.read_record(dir_loc)?;
                     bytes
                 };
@@ -723,6 +792,16 @@ impl Pool {
         let next_ino = ino_map.entries.iter().map(|e| e.ino).max().unwrap_or(ROOT_DIR_INO) + 1;
         let next_ino = next_ino.max(root.next_ino_counter);
 
+        // Segment ids are pool-global (§15.4), and a heal segment can exist
+        // on one vdev only -- so the highest id in use is the highest on
+        // *any* device, not just the primary's. Seeding from the primary
+        // alone would hand a fresh writer an id that is live elsewhere,
+        // and `SegmentWriter::create` would truncate that heal segment on
+        // its way to fanning the new one out.
+        let mut max_segment_id = max_segment_id;
+        for vdev in &vdevs[1..] {
+            max_segment_id = max_segment_id.max(highest_segment_id_on(&vdev.root)?);
+        }
         let next_segment_id = Arc::new(AtomicU64::new(max_segment_id + 1));
         let shard_count = root.pool_params.logical_shard_count;
         let committer_pool = CommitterPool::new(
@@ -845,6 +924,7 @@ impl Pool {
                             let reader = get_reader(
                                 &mut readers,
                                 pool_root,
+                                PRIMARY_VDEV_ID,
                                 chunk_loc.segment_id,
                                 StreamKind::Data,
                             )?;
@@ -912,6 +992,8 @@ impl Pool {
             dedup_pins: Arc::clone(&dedup_pins),
             persisted_index: RwLock::new(persisted_index),
             readers: Mutex::new(readers),
+            heal_writers: Mutex::new(HashMap::new()),
+            repair_stats: RepairStats::default(),
             meta_writer: Mutex::new(meta_writer),
             next_segment_id,
             published_generation,
@@ -943,6 +1025,17 @@ impl Pool {
     /// ARCHITECTURE.md §4 (read path).
     pub fn read(&self, ino: u64, offset: u64, len: u32) -> Result<Bytes, PoolError> {
         self.0.read(ino, offset, len)
+    }
+
+    /// Repairs `vdev_id` from the other replicas (ARCHITECTURE.md §15.4).
+    /// Safe to run on a live pool; concurrent reads and writes proceed.
+    pub fn resilver(&self, vdev_id: u16) -> Result<ResilverReport, PoolError> {
+        self.0.resilver(vdev_id)
+    }
+
+    /// Counters for what read failover and heal have done so far.
+    pub fn repair_stats(&self) -> RepairStatsSnapshot {
+        self.0.repair_stats.snapshot()
     }
 
     /// ARCHITECTURE.md §3 (write path): sequential-append writes take the
@@ -1629,25 +1722,318 @@ impl PoolShared {
     }
 
     fn read_meta_object_bytes(&self, hash: Hash32) -> Result<Vec<u8>, PoolError> {
-        let loc = self
-            .dedup_index
-            .get(hash)
-            .ok_or_else(|| PoolError::Format(format!("object {hash:?} not found")))?;
-        let mut readers = self.readers.lock();
-        let reader = get_reader(&mut readers, &self.pool_root, loc.segment_id, StreamKind::Meta)?;
-        let (_header, bytes) = reader.read_record(loc)?;
-        Ok(bytes)
+        self.read_verified(hash, StreamKind::Meta)
     }
 
     fn read_chunk_bytes(&self, hash: Hash32) -> Result<Vec<u8>, PoolError> {
-        let loc = self
+        self.read_verified(hash, StreamKind::Data)
+    }
+
+    /// The one place record payloads are read on behalf of a caller
+    /// (ARCHITECTURE.md §15.2: "no third payload reader may be added
+    /// without going through the same helper").
+    ///
+    /// The primary vdev's copy is tried first, at the location the cache
+    /// holds -- `ChunkLocationCache` is single-valued and its entries are
+    /// the primary's (§15.1), so this path costs a replicated pool nothing
+    /// over a single-vdev one. `read_record` verifies the content hash on
+    /// every read, so a bad replica is *detected* here whether the failure
+    /// is an I/O error, a missing segment or silently rotted bytes.
+    ///
+    /// Only on failure does replication enter: the persisted index is
+    /// range-scanned for the other replicas, each is tried in `vdev_id`
+    /// order, and the first that verifies serves the read. The replicas
+    /// that failed are then healed from those bytes, synchronously and
+    /// best-effort -- a heal that fails is logged and counted, never
+    /// allowed to turn a read that just succeeded into an error.
+    fn read_verified(&self, hash: Hash32, kind: StreamKind) -> Result<Vec<u8>, PoolError> {
+        let what = match kind {
+            StreamKind::Data => "chunk",
+            _ => "object",
+        };
+        let preferred = self
             .dedup_index
             .get(hash)
-            .ok_or_else(|| PoolError::Format(format!("chunk {hash:?} not found")))?;
+            .ok_or_else(|| PoolError::Format(format!("{what} {hash:?} not found")))?;
+
+        let primary_err = {
+            let mut readers = self.readers.lock();
+            let reader = get_reader(
+                &mut readers,
+                &self.pool_root,
+                PRIMARY_VDEV_ID,
+                preferred.segment_id,
+                kind,
+            );
+            match reader.and_then(|r| r.read_record(preferred).map_err(PoolError::from)) {
+                Ok((_header, bytes)) => return Ok(bytes),
+                Err(e) => e,
+            }
+        };
+        if self.vdevs.len() == 1 {
+            return Err(primary_err);
+        }
+        tracing::warn!(
+            "{what} {hash:?} unreadable on vdev {PRIMARY_VDEV_ID} ({primary_err}); trying other replicas"
+        );
+
+        let replicas = self.persisted_index.read().chunk_locations(hash)?;
+        let mut failed = vec![PRIMARY_VDEV_ID];
+        for (vdev_id, loc) in replicas {
+            if vdev_id == PRIMARY_VDEV_ID {
+                continue;
+            }
+            match self.read_raw_from_vdev(vdev_id, loc, kind) {
+                Ok((header, raw)) => {
+                    self.repair_stats.failovers.fetch_add(1, Ordering::Relaxed);
+                    // Already verified by `read_record_raw`, so this cannot
+                    // fail on the codec path it just took.
+                    let bytes = segment::decode_payload(&header, raw.clone())?;
+                    for bad in failed {
+                        if let Err(e) = self.heal_one(bad, kind, &header, &raw) {
+                            self.repair_stats.heal_failures.fetch_add(1, Ordering::Relaxed);
+                            tracing::error!("heal of {what} {hash:?} onto vdev {bad} failed: {e}");
+                        }
+                    }
+                    return Ok(bytes);
+                }
+                Err(e) => {
+                    tracing::warn!("{what} {hash:?} unreadable on vdev {vdev_id} too ({e})");
+                    failed.push(vdev_id);
+                }
+            }
+        }
+        Err(PoolError::IntegrityFailure(hash))
+    }
+
+    /// Reads and verifies one record from a specific vdev, returning the
+    /// header and the *raw* (still-compressed) payload so a heal can
+    /// re-append it exactly as stored. `read_record_raw` still does the
+    /// full content-hash check via a throwaway decompress.
+    fn read_raw_from_vdev(
+        &self,
+        vdev_id: u16,
+        loc: ExtentLocation,
+        kind: StreamKind,
+    ) -> Result<(ExtentRecordHeader, Vec<u8>), PoolError> {
+        let root = self.vdev_root(vdev_id)?;
         let mut readers = self.readers.lock();
-        let reader = get_reader(&mut readers, &self.pool_root, loc.segment_id, StreamKind::Data)?;
-        let (_header, bytes) = reader.read_record(loc)?;
-        Ok(bytes)
+        let reader = get_reader(&mut readers, root, vdev_id, loc.segment_id, kind)?;
+        Ok(reader.read_record_raw(loc)?)
+    }
+
+    fn vdev_root(&self, vdev_id: u16) -> Result<&Path, PoolError> {
+        self.vdevs
+            .get(vdev_id as usize)
+            .map(|v| v.root.as_path())
+            .ok_or_else(|| PoolError::InvalidArgument(format!("no vdev {vdev_id} in this pool")))
+    }
+
+    /// Heals a single record onto `vdev_id` and makes the new location
+    /// durable before anything can rely on it. The primitive §15.4 builds
+    /// resilver on top of: "implement heal; resilver is a loop over it".
+    fn heal_one(
+        &self,
+        vdev_id: u16,
+        kind: StreamKind,
+        header: &ExtentRecordHeader,
+        raw_payload: &[u8],
+    ) -> Result<ExtentLocation, PoolError> {
+        let loc = self.heal_append(vdev_id, kind, header, raw_payload)?;
+        self.heal_commit(&[(vdev_id, kind, header.content_hash, loc)])?;
+        Ok(loc)
+    }
+
+    /// Appends a verified record to `vdev_id`'s open heal segment for
+    /// `kind`, rolling to a fresh segment at the stream's cap. Not durable
+    /// or indexed until `heal_commit` -- resilver batches many of these
+    /// under one fsync.
+    fn heal_append(
+        &self,
+        vdev_id: u16,
+        kind: StreamKind,
+        header: &ExtentRecordHeader,
+        raw_payload: &[u8],
+    ) -> Result<ExtentLocation, PoolError> {
+        let root = self.vdev_root(vdev_id)?.to_path_buf();
+        let cap = match kind {
+            StreamKind::Data => self.pool_params.data_segment_cap_bytes,
+            _ => self.pool_params.meta_segment_cap_bytes,
+        };
+        let mut writers = self.heal_writers.lock();
+        let key = (vdev_id, kind);
+        let needs_rollover = writers
+            .get(&key)
+            .is_some_and(|w| w.current_size() + raw_payload.len() as u64 > u64::from(cap));
+        if needs_rollover {
+            let full = writers.remove(&key).expect("checked present");
+            full.seal()?;
+        }
+        let writer = match writers.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let id = self.next_segment_id.fetch_add(1, Ordering::Relaxed);
+                // A heal segment has no owning shard: it is written by
+                // whichever reader (or resilver) found the damage, not by a
+                // committer. owner_shard 0 keeps it inside the mount-time
+                // owner-shard rescan's view, so a healed record on the
+                // primary is rediscovered after a crash even if the index
+                // write was lost.
+                e.insert(SegmentWriter::create(&[root.as_path()], id, kind, 0)?)
+            }
+        };
+        Ok(writer.append(
+            header.kind,
+            header.content_hash,
+            header.codec_id,
+            header.uncompressed_len,
+            raw_payload,
+            header.backpointers.clone(),
+        )?)
+    }
+
+    /// Makes a batch of heal appends durable, then records their
+    /// locations: fsync every touched heal segment *first*, so the index
+    /// never points at bytes that could vanish in a crash. A healed
+    /// primary replica is also repointed in the cache, so the next read
+    /// goes straight to the good copy instead of failing over again.
+    fn heal_commit(
+        &self,
+        healed: &[(u16, StreamKind, Hash32, ExtentLocation)],
+    ) -> Result<(), PoolError> {
+        if healed.is_empty() {
+            return Ok(());
+        }
+        {
+            let writers = self.heal_writers.lock();
+            let mut synced = HashSet::new();
+            for &(vdev_id, kind, _, _) in healed {
+                if synced.insert((vdev_id, kind))
+                    && let Some(w) = writers.get(&(vdev_id, kind))
+                {
+                    w.fsync()?;
+                }
+            }
+        }
+        {
+            let mut index = self.persisted_index.write();
+            for &(vdev_id, _, hash, loc) in healed {
+                index.put_chunk_location(hash, vdev_id, loc)?;
+            }
+            index.flush()?;
+        }
+        for &(vdev_id, _, hash, loc) in healed {
+            if vdev_id == PRIMARY_VDEV_ID {
+                self.dedup_index.put(hash, loc);
+            }
+        }
+        self.repair_stats
+            .heals
+            .fetch_add(healed.len() as u64, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Seals every open heal segment. Run at checkpoint so a heal segment
+    /// is closed within one checkpoint interval of its last write, and at
+    /// most one per `(vdev, stream)` is ever open.
+    fn seal_heal_writers(&self) -> Result<(), PoolError> {
+        let drained: Vec<_> = self.heal_writers.lock().drain().collect();
+        for (_, w) in drained {
+            w.seal()?;
+        }
+        Ok(())
+    }
+
+    /// Brings `vdev_id` up to date with the rest of the pool
+    /// (ARCHITECTURE.md §15.4): every hash the pool knows is checked on
+    /// that device, and any replica that is missing from the index *or*
+    /// present but failing verification is re-created from a healthy
+    /// replica elsewhere. The first covers a device that missed writes;
+    /// the second covers one that lost or corrupted what it had. Both are
+    /// the same heal, in bulk, batched under one fsync per `HEAL_BATCH`.
+    fn resilver(&self, vdev_id: u16) -> Result<ResilverReport, PoolError> {
+        if self.vdevs.len() == 1 {
+            return Err(PoolError::InvalidArgument(
+                "resilver needs another vdev to copy from".into(),
+            ));
+        }
+        self.vdev_root(vdev_id)?;
+        let all = self.persisted_index.read().iter_all_chunk_locations()?;
+
+        let mut report = ResilverReport::default();
+        let mut pending: Vec<(u16, StreamKind, Hash32, ExtentLocation)> = Vec::new();
+        let mut i = 0;
+        while i < all.len() {
+            let hash = all[i].0;
+            let mut j = i;
+            while j < all.len() && all[j].0 == hash {
+                j += 1;
+            }
+            let replicas = &all[i..j];
+            i = j;
+            report.examined += 1;
+
+            let own = replicas.iter().find(|(_, v, _)| *v == vdev_id).map(|r| r.2);
+            let own_kind = own.and_then(|loc| self.stream_kind_of(vdev_id, loc.segment_id));
+            let own_ok = match (own, own_kind) {
+                (Some(loc), Some(kind)) => self.read_raw_from_vdev(vdev_id, loc, kind).is_ok(),
+                _ => false,
+            };
+            if own_ok {
+                continue;
+            }
+            if own.is_some() {
+                report.corrupt += 1;
+            } else {
+                report.missing += 1;
+            }
+
+            let mut healed = false;
+            for &(_, src, loc) in replicas.iter().filter(|(_, v, _)| *v != vdev_id) {
+                let Some(kind) = self.stream_kind_of(src, loc.segment_id) else { continue };
+                let Ok((header, raw)) = self.read_raw_from_vdev(src, loc, kind) else { continue };
+                let new_loc = self.heal_append(vdev_id, kind, &header, &raw)?;
+                pending.push((vdev_id, kind, hash, new_loc));
+                healed = true;
+                break;
+            }
+            if !healed {
+                report.unrecoverable.push(hash);
+            }
+            if pending.len() >= HEAL_BATCH {
+                self.heal_commit(&pending)?;
+                report.healed += pending.len() as u64;
+                pending.clear();
+            }
+        }
+        self.heal_commit(&pending)?;
+        report.healed += pending.len() as u64;
+        self.seal_heal_writers()?;
+        Ok(report)
+    }
+
+    /// Which stream a segment belongs to on `vdev_id`, by which file exists.
+    /// Segment ids are pool-global and unique across streams, so at most one
+    /// answer is possible; `None` means the segment is not on that device.
+    fn stream_kind_of(&self, vdev_id: u16, segment_id: u64) -> Option<StreamKind> {
+        let root = self.vdev_root(vdev_id).ok()?;
+        [StreamKind::Data, StreamKind::Meta]
+            .into_iter()
+            .find(|&k| segment::segment_path(root, segment_id, k).exists())
+    }
+
+    /// Records `loc` for `hash` on every vdev. Fan-out writes land the
+    /// identical record at the identical offset on each replica (§15.3), so
+    /// one location is true of all of them -- but the index is keyed by
+    /// `(hash, vdev_id)` (§15.1) precisely so a later heal or per-vdev
+    /// coalesce can move one replica without the others' entries lying, and
+    /// that only works if every replica's entry exists to begin with.
+    fn record_replicated_location(&self, hash: Hash32, loc: ExtentLocation) -> Result<(), PoolError> {
+        let mut index = self.persisted_index.write();
+        for vdev_id in 0..self.vdevs.len() as u16 {
+            index.put_chunk_location(hash, vdev_id, loc)?;
+        }
+        Ok(())
     }
 
     /// Runs a chunk through the Ingest Preparation Pool and, on a miss,
@@ -1690,9 +2076,7 @@ impl PoolShared {
                     .recv()
                     .map_err(|_| PoolError::Format("committer pool completion channel closed".into()))??;
                 self.dedup_index.put(content_hash, location);
-                self.persisted_index
-                    .write()
-                    .put_chunk_location(content_hash, self.vdev_id, location)?;
+                self.record_replicated_location(content_hash, location)?;
                 Ok((content_hash, location))
             }
         }
@@ -1765,7 +2149,7 @@ impl PoolShared {
         )?;
         drop(meta_writer);
         self.dedup_index.put(hash, loc);
-        self.persisted_index.write().put_chunk_location(hash, self.vdev_id, loc)?;
+        self.record_replicated_location(hash, loc)?;
         Ok((hash, loc))
     }
 
@@ -3225,6 +3609,9 @@ impl PoolShared {
         // (InodeObjects, DirectoryObjects, IndirectHashLists, InoMap,
         // SnapshotTable, RootObject) went to meta_writer above.
         self.meta_writer.lock().fsync()?;
+        // Heal segments were fsync'd as they were committed; sealing here
+        // just closes them out on the same cadence as everything else.
+        self.seal_heal_writers()?;
 
         let generation = generation_before + 1;
 
@@ -3303,14 +3690,38 @@ impl PoolShared {
 
 pub(crate) fn get_reader<'a>(
     readers: &'a mut SegmentReaders,
-    pool_root: &Path,
+    vdev_root: &Path,
+    vdev_id: u16,
     segment_id: u64,
     kind: StreamKind,
 ) -> Result<&'a SegmentReader, PoolError> {
-    if let std::collections::hash_map::Entry::Vacant(e) = readers.entry((segment_id, kind)) {
-        e.insert(SegmentReader::open(pool_root, segment_id, kind)?);
+    let key = (vdev_id, segment_id, kind);
+    if let std::collections::hash_map::Entry::Vacant(e) = readers.entry(key) {
+        e.insert(SegmentReader::open(vdev_root, segment_id, kind)?);
     }
-    Ok(readers.get(&(segment_id, kind)).unwrap())
+    Ok(readers.get(&key).unwrap())
+}
+
+/// The highest Data/Meta segment id present under `vdev_root`, without
+/// opening anything; 0 if there are none. What the id allocator has to
+/// respect on every vdev, not just the one whose readers it opened.
+fn highest_segment_id_on(vdev_root: &Path) -> Result<u64, PoolError> {
+    let mut max = 0u64;
+    for sub in ["data", "meta"] {
+        let dir = vdev_root.join("segments").join(sub);
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries {
+            let name = entry?.file_name();
+            let stem = Path::new(&name)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            if let Ok(id) = stem.parse::<u64>() {
+                max = max.max(id);
+            }
+        }
+    }
+    Ok(max)
 }
 
 /// Opens a `SegmentReader` for every existing segment file under
@@ -3348,7 +3759,7 @@ fn open_all_segment_readers(pool_root: &Path) -> Result<(SegmentReaders, u64), P
             };
             max_segment_id = max_segment_id.max(segment_id);
             let reader = SegmentReader::open(pool_root, segment_id, kind)?;
-            readers.insert((segment_id, kind), reader);
+            readers.insert((PRIMARY_VDEV_ID, segment_id, kind), reader);
         }
     }
     Ok((readers, max_segment_id))
@@ -3360,7 +3771,7 @@ fn scan_segments(
     locations: &mut HashMap<Hash32, ExtentLocation>,
 ) -> Result<u64, PoolError> {
     let (opened, max_segment_id) = open_all_segment_readers(pool_root)?;
-    for (&(segment_id, _kind), reader) in &opened {
+    for (&(_vdev, segment_id, _kind), reader) in &opened {
         scan_one_segment(reader, segment_id, locations)?;
     }
     *readers = opened;
@@ -3429,7 +3840,7 @@ fn owner_shard_rescan(
     shard_id: u32,
     locations: &mut HashMap<Hash32, ExtentLocation>,
 ) -> Result<(), PoolError> {
-    for (&(segment_id, kind), reader) in readers {
+    for (&(_vdev, segment_id, kind), reader) in readers {
         if kind != StreamKind::Data {
             continue;
         }
