@@ -62,6 +62,10 @@ impl GcEngine {
         &self.pins
     }
 
+    pub fn liveness_threshold(&self) -> f64 {
+        self.liveness_threshold
+    }
+
     /// The slot mark reads from.
     pub fn primary_id(&self) -> u16 {
         self.vdevs.primary()
@@ -106,10 +110,14 @@ impl GcEngine {
     pub fn mark(&mut self, live_roots: &[Hash32]) -> LiveSet {
         let mut live = LiveSet::default();
         let primary = self.primary();
+        let ctx = dag_walk::WalkCtx {
+            primary: &primary,
+            vdevs: &self.vdevs,
+        };
         for &root in live_roots {
             if let Err(e) = dag_walk::walk_reachable(
                 root,
-                &primary,
+                &ctx,
                 &self.locations,
                 &mut self.readers,
                 &mut live,
@@ -163,6 +171,39 @@ impl GcEngine {
     /// `sweep_candidates` for an arbitrary vdev root, given that device's
     /// own live bitmaps (`LiveSet::resolve_on`). Sweep is per-vdev; only
     /// mark is pool-wide (ARCHITECTURE.md §15.7).
+    /// Sealed mirrored data segments under `vdev_root`, ascending by id,
+    /// with the last `GRACE_WINDOW_SEGMENTS + extra_age` left out -- the
+    /// ones old enough for the coalesce or stripe passes to touch.
+    pub fn aged_sealed_segments(vdev_root: &Path, extra_age: usize) -> Vec<u64> {
+        let dir = vdev_root.join("segments").join("data");
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return Vec::new();
+        };
+        let mut ids: Vec<u64> = entries
+            .flatten()
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("aseg"))
+            .filter_map(|e| {
+                e.path()
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .and_then(|s| s.parse::<u64>().ok())
+            })
+            .collect();
+        ids.sort_unstable();
+        let sealed: Vec<u64> = ids
+            .into_iter()
+            .filter(|&id| {
+                SegmentReader::open(vdev_root, id, StreamKind::Data)
+                    .ok()
+                    .and_then(|r| r.read_header().ok())
+                    .map(|h| h.state == SegmentState::Sealed)
+                    .unwrap_or(false)
+            })
+            .collect();
+        let cutoff = sealed.len().saturating_sub(GRACE_WINDOW_SEGMENTS + extra_age);
+        sealed[..cutoff].to_vec()
+    }
+
     pub fn sweep_candidates_on(
         &self,
         vdev_root: &Path,
@@ -199,6 +240,7 @@ impl GcEngine {
             .collect();
 
         let grace_cutoff = sealed_ids.len().saturating_sub(GRACE_WINDOW_SEGMENTS);
+        let sealed_ids = &sealed_ids;
 
         sealed_ids[..grace_cutoff]
             .iter()

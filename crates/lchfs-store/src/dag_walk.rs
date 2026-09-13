@@ -16,6 +16,8 @@
 //! used to *discover* further inodes to visit.
 
 use crate::segment::SegmentReader;
+use crate::stripe::StripeReader;
+use crate::vdevs::VdevSet;
 use crate::{PoolError, SegmentReaders, StreamKind, Vdev, get_reader};
 use lchfs_format::{ContentRef, ExtentKind, ExtentLocation, Hash32, InoMap, InodeObject, IndirectHashList, RootObject};
 use lchfs_index::{ChunkLocationCache, RedbIndex};
@@ -91,18 +93,36 @@ pub(crate) fn mark_location(loc: ExtentLocation, live: &mut HashMap<u64, Roaring
 fn resolve_and_read(
     hash: Hash32,
     stream: StreamKind,
-    primary: &Vdev,
+    ctx: &WalkCtx<'_>,
     locations: &ChunkLocationCache,
     readers: &mut SegmentReaders,
     live: &mut LiveSet,
 ) -> Result<(ExtentKind, Vec<u8>), PoolError> {
-    let loc = locations
-        .get(hash)
+    let (loc, striped) = locations
+        .get_tagged(hash)
         .ok_or_else(|| PoolError::Format(format!("GC mark: {hash:?} not found in index")))?;
     live.mark(hash, loc);
+    if striped {
+        // A cold record with no mirror copy: read through its stripe.
+        // Its bytes live in shard files that `sweep_candidates` never
+        // lists, so the primary bitmap entry `mark` just made is inert;
+        // what matters is the hash in the live set.
+        let online = ctx.vdevs.online();
+        let reader = StripeReader::open(loc.segment_id, |id| ctx.vdevs.root_of(id), &online)?;
+        let (header, bytes) = reader.read_record(loc)?;
+        return Ok((header.kind, bytes));
+    }
+    let primary = ctx.primary;
     let reader: &SegmentReader = get_reader(readers, &primary.root, primary.id, loc.segment_id, stream)?;
     let (header, bytes) = reader.read_record(loc)?;
     Ok((header.kind, bytes))
+}
+
+/// What a mark walk needs to find bytes: the primary for mirrored
+/// records, the device set for striped ones.
+pub(crate) struct WalkCtx<'a> {
+    pub primary: &'a Vdev,
+    pub vdevs: &'a VdevSet,
 }
 
 /// Marks `hash`'s own record live and, if it's a `RootObject`, walks
@@ -112,17 +132,17 @@ fn resolve_and_read(
 /// here would just be redundant work, not incorrect.
 pub(crate) fn walk_reachable(
     hash: Hash32,
-    primary: &Vdev,
+    ctx: &WalkCtx<'_>,
     locations: &ChunkLocationCache,
     readers: &mut SegmentReaders,
     live: &mut LiveSet,
 ) -> Result<(), PoolError> {
-    let (kind, bytes) = resolve_and_read(hash, StreamKind::Meta, primary, locations, readers, live)?;
+    let (kind, bytes) = resolve_and_read(hash, StreamKind::Meta, ctx, locations, readers, live)?;
     match kind {
         ExtentKind::RootObject => {
             let root: RootObject =
                 lchfs_format::decode(&bytes).map_err(|e| PoolError::Format(e.to_string()))?;
-            walk_inomap(root.inomap_hash, primary, locations, readers, live)?;
+            walk_inomap(root.inomap_hash, ctx, locations, readers, live)?;
             // Every RootObject reaches its own SnapshotTable record via
             // this field -- mark it here so it's correctly live whenever
             // *any* retained RootObject is walked, regardless of whether
@@ -134,7 +154,7 @@ pub(crate) fn walk_reachable(
             resolve_and_read(
                 root.snapshot_table_hash,
                 StreamKind::Meta,
-                primary,
+                ctx,
                 locations,
                 readers,
                 live,
@@ -152,28 +172,28 @@ pub(crate) fn walk_reachable(
 
 fn walk_inomap(
     hash: Hash32,
-    primary: &Vdev,
+    ctx: &WalkCtx<'_>,
     locations: &ChunkLocationCache,
     readers: &mut SegmentReaders,
     live: &mut LiveSet,
 ) -> Result<(), PoolError> {
-    let (_kind, bytes) = resolve_and_read(hash, StreamKind::Meta, primary, locations, readers, live)?;
+    let (_kind, bytes) = resolve_and_read(hash, StreamKind::Meta, ctx, locations, readers, live)?;
     let ino_map: InoMap =
         lchfs_format::decode(&bytes).map_err(|e| PoolError::Format(e.to_string()))?;
     for entry in &ino_map.entries {
-        walk_inode(entry.current_object_hash, primary, locations, readers, live)?;
+        walk_inode(entry.current_object_hash, ctx, locations, readers, live)?;
     }
     Ok(())
 }
 
 fn walk_inode(
     hash: Hash32,
-    primary: &Vdev,
+    ctx: &WalkCtx<'_>,
     locations: &ChunkLocationCache,
     readers: &mut SegmentReaders,
     live: &mut LiveSet,
 ) -> Result<(), PoolError> {
-    let (_kind, bytes) = resolve_and_read(hash, StreamKind::Meta, primary, locations, readers, live)?;
+    let (_kind, bytes) = resolve_and_read(hash, StreamKind::Meta, ctx, locations, readers, live)?;
     let inode: InodeObject =
         lchfs_format::decode(&bytes).map_err(|e| PoolError::Format(e.to_string()))?;
     match inode.content {
@@ -181,15 +201,15 @@ fn walk_inode(
             // Marks the DirectoryObject record live; its entries are not
             // used to discover further inodes (InoMap already covers
             // that) -- see this module's doc comment.
-            resolve_and_read(dir_hash, StreamKind::Meta, primary, locations, readers, live)?;
+            resolve_and_read(dir_hash, StreamKind::Meta, ctx, locations, readers, live)?;
         }
         ContentRef::ChunkList(ihl_hash) => {
             let (_kind, ihl_bytes) =
-                resolve_and_read(ihl_hash, StreamKind::Meta, primary, locations, readers, live)?;
+                resolve_and_read(ihl_hash, StreamKind::Meta, ctx, locations, readers, live)?;
             let ihl: IndirectHashList =
                 lchfs_format::decode(&ihl_bytes).map_err(|e| PoolError::Format(e.to_string()))?;
             for chunk in &ihl.chunks {
-                resolve_and_read(chunk.content_hash, StreamKind::Data, primary, locations, readers, live)?;
+                resolve_and_read(chunk.content_hash, StreamKind::Data, ctx, locations, readers, live)?;
             }
         }
         ContentRef::Inline(_) | ContentRef::SymlinkTarget(_) => {}

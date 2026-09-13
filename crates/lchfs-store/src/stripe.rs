@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 /// `u16::MAX` sorts last, so a surviving mirror copy is still the
 /// preferred replica and a striped one is what failover reaches after
 /// the mirrors.
-pub const STRIPED: u16 = u16::MAX;
+pub const STRIPED: u16 = lchfs_index::STRIPED_VDEV;
 
 /// Shard files are aligned to this so a shard boundary is a page boundary.
 const SHARD_ALIGN: u64 = 4096;
@@ -53,6 +53,46 @@ pub fn shards_on(root: &Path, segment_id: u64) -> Vec<u8> {
         }
     }
     out.sort_unstable();
+    out
+}
+
+/// Every segment id that has at least one shard file under `root`.
+pub fn segment_ids_with_shards(root: &Path) -> Vec<u64> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(segment_dir(root, StreamKind::Data)) {
+        for e in rd.flatten() {
+            if let Some(name) = e.file_name().to_str()
+                && let Some((stem, ext)) = name.split_once('.')
+                && ext.starts_with("ec")
+                && let Ok(id) = stem.parse::<u64>()
+            {
+                out.push(id);
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// The records in a segment body held in memory: `(header, file offset)`
+/// for each, in order, stopping at the first header that does not parse
+/// -- a reassembled body is either whole or not, so there is no damage
+/// to resync past. Offsets are file offsets (body offset + header page),
+/// the same `ExtentLocation::offset` a mirrored copy would have had.
+pub fn scan_body(body: &[u8]) -> Vec<(ExtentRecordHeader, u32)> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while pos + 4 < body.len() {
+        let Some((header, _consumed)) = crate::segment::parse_record_header(&body[pos..]) else {
+            break;
+        };
+        if header.record_len == 0 || pos + header.record_len as usize > body.len() {
+            break;
+        }
+        out.push((header.clone(), (pos as u64 + SEGMENT_HEADER_PAGE_SIZE) as u32));
+        pos += header.record_len as usize;
+    }
     out
 }
 

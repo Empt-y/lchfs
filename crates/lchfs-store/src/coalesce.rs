@@ -15,7 +15,8 @@
 use crate::gc::GcEngine;
 use crate::segment::{self, SegmentReader, SegmentWriter};
 use crate::vdevs::VdevSet;
-use crate::{StreamKind, Vdev};
+use crate::{StreamKind, Vdev, stripe};
+use crate::dag_walk::LiveSet;
 use lchfs_format::{ExtentLocation, Hash32};
 use lchfs_index::{ChunkLocationCache, IndexStore, PendingDedupPins, RedbIndex};
 use parking_lot::RwLock;
@@ -86,6 +87,29 @@ impl CoalesceDaemon {
         persisted_index: &RwLock<RedbIndex>,
         next_segment_id: &AtomicU64,
     ) -> io::Result<()> {
+        self.run_pass_with(
+            live_roots,
+            generation_at_mark,
+            published_generation,
+            persisted_index,
+            next_segment_id,
+            StripePolicy::default(),
+        )
+    }
+
+    /// `run_pass`, with the pool's erasure-coding policy (ARCHITECTURE.md
+    /// §17.2). After the sweep: striped segments that have gone mostly
+    /// dead are repacked back into fresh mirrored segments, and cold,
+    /// mostly-live mirrored segments are converted into stripes.
+    pub fn run_pass_with(
+        &mut self,
+        live_roots: &[Hash32],
+        generation_at_mark: u64,
+        published_generation: &AtomicU64,
+        persisted_index: &RwLock<RedbIndex>,
+        next_segment_id: &AtomicU64,
+        policy: StripePolicy,
+    ) -> io::Result<()> {
         let live = self.gc.mark(live_roots);
         if live.is_empty() {
             // mark() returns empty both on genuine failure (logged inside
@@ -116,6 +140,206 @@ impl CoalesceDaemon {
                     next_segment_id,
                 )?;
             }
+        }
+
+        if policy.enabled() {
+            self.repack_dead_stripes(&live, persisted_index, next_segment_id, &policy)?;
+            self.stripe_cold_segments(&live, persisted_index, &policy)?;
+        }
+        Ok(())
+    }
+
+    /// Converts cold, mostly-live mirrored data segments into stripes
+    /// (§17.2.4 "conversion pass"). Bounded per pass so it never starves
+    /// the sweep. A segment is read from the primary and every record
+    /// verified before anything is written; a segment with a bad record
+    /// is left for read failover and scrub to sort out first.
+    fn stripe_cold_segments(
+        &mut self,
+        live: &LiveSet,
+        persisted_index: &RwLock<RedbIndex>,
+        policy: &StripePolicy,
+    ) -> io::Result<()> {
+        let online = self.vdevs.online();
+        let (k, m) = (policy.k, policy.m);
+        let width = k as usize + m as usize;
+        if online.len() < width {
+            return Ok(());
+        }
+        let primary_id = self.primary_id();
+        let Some(primary) = online.iter().find(|v| v.id == primary_id).cloned() else {
+            return Ok(());
+        };
+        let mut converted = 0;
+        for segment_id in GcEngine::aged_sealed_segments(&primary.root, policy.min_age_segments as usize) {
+            if converted >= policy.max_per_pass {
+                break;
+            }
+            if !stripe::shards_on(&primary.root, segment_id).is_empty() {
+                continue;
+            }
+            let path = segment::segment_path(&primary.root, segment_id, StreamKind::Data);
+            let Ok(meta) = std::fs::metadata(&path) else { continue };
+            let total = meta.len().saturating_sub(segment::SEGMENT_HEADER_PAGE_SIZE);
+            if total == 0 {
+                continue;
+            }
+            let live_bytes = live.by_segment.get(&segment_id).map(|b| b.len()).unwrap_or(0);
+            if (live_bytes as f64 / total as f64) < policy.min_live_fraction {
+                continue;
+            }
+
+            // Read and verify every record from the primary's copy.
+            let reader = SegmentReader::open(&primary.root, segment_id, StreamKind::Data)?;
+            let mut records = Vec::new();
+            let mut clean = true;
+            for (header, offset) in reader.scan() {
+                let loc = ExtentLocation {
+                    segment_id,
+                    offset,
+                    len: header.record_len,
+                };
+                if reader.read_record(loc).is_err() {
+                    clean = false;
+                    break;
+                }
+                records.push((header.content_hash, loc));
+            }
+            if !clean || records.is_empty() {
+                tracing::warn!("stripe: segment {segment_id} has a record that does not verify; not converting it");
+                continue;
+            }
+            let mut body = std::fs::read(&path)?;
+            body.drain(..segment::SEGMENT_HEADER_PAGE_SIZE as usize);
+            // A sealed segment ends in its footer, which is not part of any
+            // record; the stripe keeps the whole body as written so record
+            // offsets are unchanged.
+            let devices: Vec<Vdev> = online.iter().take(width).cloned().collect();
+            stripe::write_stripe(&body, segment_id, k, m, &devices)?;
+
+            // Index first, then the cache, then the mirrors go: a crash
+            // before the index write leaves orphan shard files (cleaned
+            // up by a later pass); after it, the mirrors are spare copies
+            // until deleted.
+            let forget: Vec<u16> = online.iter().map(|v| v.id).collect();
+            persisted_index
+                .write()
+                .restripe_segment(segment_id, &records, &forget)
+                .map_err(to_io_err)?;
+            for (hash, loc) in &records {
+                self.gc_locations().put_striped(*hash, *loc);
+            }
+            for vdev in &online {
+                let mirror = segment::segment_path(&vdev.root, segment_id, StreamKind::Data);
+                if mirror.exists() {
+                    let _ = segment::mark_coalesced(&vdev.root, segment_id, StreamKind::Data);
+                    std::fs::remove_file(&mirror)?;
+                }
+            }
+            tracing::info!(
+                "stripe: segment {segment_id} ({} records, {} bytes) converted to {k}+{m} shards",
+                records.len(),
+                body.len()
+            );
+            converted += 1;
+        }
+        Ok(())
+    }
+
+    /// Striped segments whose live fraction has dropped below the sweep
+    /// threshold are repacked into a fresh *mirrored* segment on the
+    /// online set -- decode, append the live records, repoint the index,
+    /// delete the shards. Never rewritten in place; the segment becomes
+    /// cold again and may be striped later.
+    fn repack_dead_stripes(
+        &mut self,
+        live: &LiveSet,
+        persisted_index: &RwLock<RedbIndex>,
+        next_segment_id: &AtomicU64,
+        policy: &StripePolicy,
+    ) -> io::Result<()> {
+        let online = self.vdevs.online();
+        let striped_live = live.resolve_on(stripe::STRIPED, persisted_index).map_err(to_io_err)?;
+        let mut ids: Vec<u64> = online.iter().flat_map(|v| stripe::segment_ids_with_shards(&v.root)).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let mut repacked = 0;
+        for segment_id in ids {
+            if repacked >= policy.max_per_pass {
+                break;
+            }
+            let root_of = |id: u16| self.vdevs.root_of(id);
+            let Ok(reader) = stripe::StripeReader::open(segment_id, root_of, &online) else { continue };
+            let total = reader.desc.logical_len;
+            let live_bytes = striped_live.get(&segment_id).map(|b| b.len()).unwrap_or(0);
+            if total == 0 || (live_bytes as f64 / total as f64) >= self.gc.liveness_threshold() {
+                continue;
+            }
+            let body = match reader.read_body(0, total) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!("stripe: segment {segment_id} cannot be reassembled for repack ({e})");
+                    continue;
+                }
+            };
+            let empty = RoaringBitmap::new();
+            let live_bitmap = striped_live.get(&segment_id).unwrap_or(&empty);
+            let pins = self.gc.pins();
+            let mut keep = Vec::new();
+            for (header, offset) in stripe::scan_body(&body) {
+                if live_bitmap.contains(offset) || pins.is_pinned(header.content_hash) {
+                    let loc = ExtentLocation {
+                        segment_id,
+                        offset,
+                        len: header.record_len,
+                    };
+                    let (full, raw) = reader.read_record_raw(loc).map_err(to_io_err)?;
+                    keep.push((full, raw));
+                }
+            }
+            let new_id = next_segment_id.fetch_add(1, Ordering::Relaxed);
+            let mut records = Vec::with_capacity(keep.len());
+            if !keep.is_empty() {
+                let mut writer = SegmentWriter::create_on(&online, new_id, StreamKind::Data, 0)?;
+                for (header, raw) in &keep {
+                    let new_loc = writer.append(
+                        header.kind,
+                        header.content_hash,
+                        header.codec_id,
+                        header.uncompressed_len,
+                        raw,
+                        header.backpointers.clone(),
+                    )?;
+                    records.push((header.content_hash, new_loc));
+                }
+                let written: Vec<u16> = writer.vdev_ids().to_vec();
+                for id in writer.seal()? {
+                    self.vdevs.fault(id);
+                }
+                persisted_index
+                    .write()
+                    .unstripe_segment(segment_id, &records, &written)
+                    .map_err(to_io_err)?;
+                for (hash, loc) in &records {
+                    self.gc_locations().put(*hash, *loc);
+                }
+            } else {
+                let dead: Vec<(Hash32, ExtentLocation)> = Vec::new();
+                persisted_index
+                    .write()
+                    .unstripe_segment(segment_id, &dead, &[])
+                    .map_err(to_io_err)?;
+            }
+            for vdev in &online {
+                for i in stripe::shards_on(&vdev.root, segment_id) {
+                    std::fs::remove_file(stripe::shard_path(&vdev.root, segment_id, i))?;
+                }
+            }
+            tracing::info!(
+                "stripe: segment {segment_id} repacked into mirrored segment {new_id} ({} live records kept)",
+                keep.len()
+            );
+            repacked += 1;
         }
         Ok(())
     }
@@ -254,5 +478,38 @@ impl CoalesceDaemon {
 
     fn gc_locations(&self) -> &ChunkLocationCache {
         self.gc.locations()
+    }
+}
+
+/// The pool's erasure-coding policy as the daemon sees it (§17.2.5).
+#[derive(Debug, Clone, Copy)]
+pub struct StripePolicy {
+    pub k: u8,
+    pub m: u8,
+    /// Sealed segments past the sweep grace window a segment must be
+    /// before it counts as cold.
+    pub min_age_segments: u32,
+    /// Only segments at least this live are worth striping; a mostly-dead
+    /// one is repacked first and striped once it is full of live data.
+    pub min_live_fraction: f64,
+    /// Conversions and repacks per pass, so neither starves the sweep.
+    pub max_per_pass: usize,
+}
+
+impl Default for StripePolicy {
+    fn default() -> Self {
+        Self {
+            k: 0,
+            m: 0,
+            min_age_segments: 8,
+            min_live_fraction: 0.9,
+            max_per_pass: 4,
+        }
+    }
+}
+
+impl StripePolicy {
+    pub fn enabled(&self) -> bool {
+        self.k >= 2 && self.m >= 1
     }
 }

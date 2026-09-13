@@ -171,20 +171,30 @@ impl RedbIndex {
     /// segment scan when this index's generation matches the superblock's
     /// `index_generation`.
     pub fn iter_chunk_locations(&self) -> Result<Vec<(Hash32, ExtentLocation)>, IndexError> {
+        Ok(self
+            .iter_preferred_locations()?
+            .into_iter()
+            .map(|(hash, _, loc)| (hash, loc))
+            .collect())
+    }
+
+    /// `iter_chunk_locations` with the preferred replica's `vdev_id` too,
+    /// so a caller can tell a striped-only record from a mirrored one.
+    pub fn iter_preferred_locations(&self) -> Result<Vec<(Hash32, u16, ExtentLocation)>, IndexError> {
         let txn = self.db.begin_read().map_err(err)?;
         let table = txn.open_table(CHUNK_LOCATIONS).map_err(err)?;
         // Keys sort by hash then vdev_id, so the first entry seen for a hash
         // is its lowest-numbered replica -- the preferred one. Callers of
         // this want a hash->where-to-read map (it warms ChunkLocationCache),
         // not every replica, so later ones are skipped.
-        let mut out: Vec<(Hash32, ExtentLocation)> = Vec::new();
+        let mut out: Vec<(Hash32, u16, ExtentLocation)> = Vec::new();
         for entry in table.iter().map_err(err)? {
             let (k, v) = entry.map_err(err)?;
-            let (hash, _vdev_id) = decode_chunk_key(k.value())?;
-            if out.last().is_some_and(|(prev, _)| *prev == hash) {
+            let (hash, vdev_id) = decode_chunk_key(k.value())?;
+            if out.last().is_some_and(|(prev, _, _)| *prev == hash) {
                 continue;
             }
-            out.push((hash, decode_location(v.value())?));
+            out.push((hash, vdev_id, decode_location(v.value())?));
         }
         Ok(out)
     }
@@ -259,6 +269,81 @@ impl RedbIndex {
             out.push((hash, vdev_id, decode_location(v.value())?));
         }
         Ok(out)
+    }
+
+    /// Moves a segment's records from mirror entries to the striped entry,
+    /// in one transaction: for each `(hash, loc)`, writes `(hash, STRIPED)`
+    /// and removes `(hash, v)` for every `v` in `forget` whose location
+    /// is in `segment_id`. Entries on other segments -- a mirror copy of
+    /// the same content elsewhere -- are left alone: they are real.
+    pub fn restripe_segment(
+        &mut self,
+        segment_id: u64,
+        records: &[(Hash32, ExtentLocation)],
+        forget: &[u16],
+    ) -> Result<(), IndexError> {
+        let mut txn = self.db.begin_write().map_err(err)?;
+        txn.set_durability(Durability::Immediate).map_err(err)?;
+        {
+            let mut table = txn.open_table(CHUNK_LOCATIONS).map_err(err)?;
+            for (hash, loc) in records {
+                for &v in forget {
+                    let key = encode_chunk_key(*hash, v);
+                    let stale = table
+                        .get(key.as_slice())
+                        .map_err(err)?
+                        .map(|g| decode_location(g.value()))
+                        .transpose()?
+                        .is_some_and(|l| l.segment_id == segment_id);
+                    if stale {
+                        table.remove(key.as_slice()).map_err(err)?;
+                    }
+                }
+                table
+                    .insert(
+                        encode_chunk_key(*hash, STRIPED_VDEV).as_slice(),
+                        encode_location(*loc).as_slice(),
+                    )
+                    .map_err(err)?;
+            }
+        }
+        txn.commit().map_err(err)?;
+        Ok(())
+    }
+
+    /// The inverse of `restripe_segment`: a striped segment's records got
+    /// mirrored copies at `new_locs` on `vdevs`; write those and drop the
+    /// striped entries that pointed into `segment_id`.
+    pub fn unstripe_segment(
+        &mut self,
+        segment_id: u64,
+        records: &[(Hash32, ExtentLocation)],
+        vdevs: &[u16],
+    ) -> Result<(), IndexError> {
+        let mut txn = self.db.begin_write().map_err(err)?;
+        txn.set_durability(Durability::Immediate).map_err(err)?;
+        {
+            let mut table = txn.open_table(CHUNK_LOCATIONS).map_err(err)?;
+            for (hash, new_loc) in records {
+                let key = encode_chunk_key(*hash, STRIPED_VDEV);
+                let stale = table
+                    .get(key.as_slice())
+                    .map_err(err)?
+                    .map(|g| decode_location(g.value()))
+                    .transpose()?
+                    .is_some_and(|l| l.segment_id == segment_id);
+                if stale {
+                    table.remove(key.as_slice()).map_err(err)?;
+                }
+                for &v in vdevs {
+                    table
+                        .insert(encode_chunk_key(*hash, v).as_slice(), encode_location(*new_loc).as_slice())
+                        .map_err(err)?;
+                }
+            }
+        }
+        txn.commit().map_err(err)?;
+        Ok(())
     }
 
     /// Forgets every entry for one vdev, returning how many there were.
@@ -409,8 +494,17 @@ fn bucket_for(hash: Hash32) -> usize {
 
 /// In-memory `content_hash -> {segment_id, offset, len}` cache, the hot
 /// path in front of `IndexStore::get_chunk_location`. ARCHITECTURE.md §4.
+/// The `vdev_id` an erasure-coded record's index entry is keyed under
+/// (ARCHITECTURE.md §17.2.2). Defined here because it is an index key;
+/// `lchfs_store::stripe::STRIPED` re-exports it. `u16::MAX` sorts last,
+/// so a surviving mirror copy is still the preferred replica.
+pub const STRIPED_VDEV: u16 = u16::MAX;
+
 pub struct ChunkLocationCache {
-    buckets: Vec<RwLock<HashMap<Hash32, ExtentLocation>>>,
+    /// The location, and whether it is in a striped segment rather than a
+    /// mirror copy on the primary -- a reader needs to know which before it
+    /// opens anything.
+    buckets: Vec<RwLock<HashMap<Hash32, (ExtentLocation, bool)>>>,
 }
 
 impl Default for ChunkLocationCache {
@@ -429,10 +523,36 @@ impl ChunkLocationCache {
     }
 
     pub fn get(&self, hash: Hash32) -> Option<ExtentLocation> {
+        self.get_tagged(hash).map(|(loc, _)| loc)
+    }
+
+    /// The location and whether it is striped (`true`) or a mirror copy on
+    /// the primary (`false`).
+    pub fn get_tagged(&self, hash: Hash32) -> Option<(ExtentLocation, bool)> {
         let bucket = self.buckets[bucket_for(hash)]
             .read()
             .expect("ChunkLocationCache lock poisoned");
         bucket.get(&hash).copied()
+    }
+
+    /// `put` for a record whose only copy is in a striped segment.
+    pub fn put_striped(&self, hash: Hash32, loc: ExtentLocation) {
+        let mut bucket = self.buckets[bucket_for(hash)]
+            .write()
+            .expect("ChunkLocationCache lock poisoned");
+        bucket.insert(hash, (loc, true));
+    }
+
+    /// Bulk-load preferred replicas as `iter_preferred_locations` yields
+    /// them, tagging the striped ones.
+    pub fn extend_preferred(&self, entries: impl IntoIterator<Item = (Hash32, u16, ExtentLocation)>) {
+        for (hash, vdev_id, loc) in entries {
+            if vdev_id == STRIPED_VDEV {
+                self.put_striped(hash, loc);
+            } else {
+                self.put(hash, loc);
+            }
+        }
     }
 
     /// Insert or overwrite `hash`'s location. Used both by the inline
@@ -445,7 +565,7 @@ impl ChunkLocationCache {
         let mut bucket = self.buckets[bucket_for(hash)]
             .write()
             .expect("ChunkLocationCache lock poisoned");
-        bucket.insert(hash, loc);
+        bucket.insert(hash, (loc, false));
     }
 
     /// Bulk-load every entry, e.g. from `RedbIndex::iter_chunk_locations`

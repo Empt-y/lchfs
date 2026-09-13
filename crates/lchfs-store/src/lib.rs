@@ -337,6 +337,8 @@ pub struct ResilverReport {
     pub healed: u64,
     /// Hashes with no healthy replica anywhere -- genuine data loss.
     pub unrecoverable: Vec<Hash32>,
+    /// Shards of striped segments rebuilt onto this vdev (§17.2.4).
+    pub shards_rebuilt: u64,
 }
 
 /// What a scrub found and did on one vdev.
@@ -350,6 +352,11 @@ pub struct ScrubReport {
     pub healed: u64,
     /// Corrupt here and with no healthy replica anywhere else.
     pub unrecoverable: Vec<Hash32>,
+    /// Shards of striped segments this vdev holds that were checked,
+    /// found bad, and rebuilt (§17.2.4).
+    pub shards_verified: u64,
+    pub shards_corrupt: u64,
+    pub shards_rebuilt: u64,
 }
 
 #[derive(Default)]
@@ -583,6 +590,20 @@ impl Pool {
             return Err(PoolError::InvalidArgument(
                 "a pool needs at least one vdev".into(),
             ));
+        }
+        // Stripe policy (§17.2.5): off, or a real Reed-Solomon shape. A
+        // pool with fewer devices than k + m is allowed -- the conversion
+        // pass is a no-op until it has enough -- but a shape that can
+        // never work is not.
+        if (params.stripe_k, params.stripe_m) != (0, 0)
+            && (params.stripe_k < 2
+                || params.stripe_m < 1
+                || params.stripe_k as u16 + params.stripe_m as u16 > 255)
+        {
+            return Err(PoolError::InvalidArgument(format!(
+                "stripe policy k={} m={} is not valid: need k >= 2, m >= 1, k + m <= 255, or 0/0 for none",
+                params.stripe_k, params.stripe_m
+            )));
         }
         let pool_root = vdev_roots[0];
         let mut members = Vec::with_capacity(vdev_roots.len());
@@ -1370,7 +1391,10 @@ impl Pool {
         }
 
         let dedup_index = Arc::new(ChunkLocationCache::new());
-        dedup_index.extend(locations);
+        // Warmed from the index rather than the mount's own map, because
+        // the index knows which entries are striped.
+        dedup_index.extend_preferred(persisted_index.iter_preferred_locations()?);
+        drop(locations);
         let dedup_pins = Arc::new(PendingDedupPins::new());
         let prep_pool = IngestPreparationPool::new(
             committer_thread_count(),
@@ -2014,12 +2038,19 @@ impl PoolShared {
         let snapshot_table = self.current_snapshot_table()?;
         live_roots.extend(snapshot_table.entries.iter().map(|e| e.root_hash));
 
-        self.coalesce.lock().run_pass(
+        let policy = coalesce::StripePolicy {
+            k: self.pool_params.stripe_k,
+            m: self.pool_params.stripe_m,
+            min_age_segments: self.pool_params.stripe_min_age_segments,
+            ..coalesce::StripePolicy::default()
+        };
+        self.coalesce.lock().run_pass_with(
             &live_roots,
             generation_at_mark,
             &self.published_generation,
             &self.persisted_index,
             &self.next_segment_id,
+            policy,
         )?;
         Ok(())
     }
@@ -2384,10 +2415,33 @@ impl PoolShared {
             StreamKind::Data => "chunk",
             _ => "object",
         };
-        let preferred = self
+        let (preferred, striped) = self
             .dedup_index
-            .get(hash)
+            .get_tagged(hash)
             .ok_or_else(|| PoolError::Format(format!("{what} {hash:?} not found")))?;
+
+        if striped {
+            // Cold data: no mirror copy exists to try first. Served from
+            // the one shard that holds it, reconstructed if that shard is
+            // gone; never healed as a mirror -- a missing shard is
+            // rebuilt by resilver, not by a read.
+            return match self.stripe_reader(preferred.segment_id).and_then(|r| Ok(r.read_record(preferred)?)) {
+                Ok((_, bytes)) => Ok(bytes),
+                Err(e) => {
+                    self.record_corruption(CorruptionEvent {
+                        at: SystemTime::now(),
+                        vdev_id: stripe::STRIPED,
+                        stream: kind,
+                        hash,
+                        location: Some(preferred),
+                        ino,
+                        detail: e.to_string(),
+                        healed: false,
+                    });
+                    Err(e)
+                }
+            };
+        }
 
         let primary = self.primary();
         let primary_err = {
@@ -2434,7 +2488,7 @@ impl PoolShared {
         let mut failed: Vec<(u16, Option<ExtentLocation>, String)> =
             vec![(self.primary(), Some(preferred), primary_err.to_string())];
         for (vdev_id, loc) in replicas {
-            if vdev_id == self.primary() || !self.is_online(vdev_id) {
+            if vdev_id == self.primary() || (vdev_id != stripe::STRIPED && !self.is_online(vdev_id)) {
                 continue;
             }
             match self.read_raw_from_vdev(vdev_id, loc, kind) {
@@ -2478,6 +2532,9 @@ impl PoolShared {
         loc: ExtentLocation,
         kind: StreamKind,
     ) -> Result<(ExtentRecordHeader, Vec<u8>), PoolError> {
+        if vdev_id == stripe::STRIPED {
+            return Ok(self.stripe_reader(loc.segment_id)?.read_record_raw(loc)?);
+        }
         let root = self.vdev_root(vdev_id)?;
         let mut readers = self.readers.lock();
         let reader = get_reader(&mut readers, &root, vdev_id, loc.segment_id, kind)?;
@@ -2732,7 +2789,7 @@ impl PoolShared {
             let mut index = self.persisted_index.write();
             let rebuilt = rebuild_index(&index_path(&new_primary.root), &online, generation)?;
             self.dedup_index.clear();
-            self.dedup_index.extend(rebuilt.iter_chunk_locations()?);
+            self.dedup_index.extend_preferred(rebuilt.iter_preferred_locations()?);
             *index = rebuilt;
         }
         self.vdevs.promote(new_primary.id);
@@ -2771,7 +2828,9 @@ impl PoolShared {
         let mut pending: Vec<PendingHeal> = Vec::new();
         self.for_each_replica_group(|hash, replicas| {
             report.examined += 1;
-            if replicas.iter().any(|(v, _)| *v == vdev_id) {
+            // A striped record's copies are its shards; a device's share of
+            // it is a shard, rebuilt below, never a mirror copy.
+            if replicas.iter().any(|(v, _)| *v == vdev_id || *v == stripe::STRIPED) {
                 return Ok(());
             }
             report.missing += 1;
@@ -2788,7 +2847,53 @@ impl PoolShared {
         self.heal_commit(&pending)?;
         report.healed += pending.len() as u64;
         self.seal_heal_writers()?;
+        report.shards_rebuilt = self.rebuild_shards_on(vdev_id)?;
         Ok(report)
+    }
+
+    /// Rebuilds every shard that the stripes say belongs on `vdev_id` and
+    /// that the device does not hold intact (§17.2.4). Striped segments
+    /// are found by their shard files on any online device.
+    fn rebuild_shards_on(&self, vdev_id: u16) -> Result<u64, PoolError> {
+        let Some(target) = self.vdevs.online().into_iter().find(|v| v.id == vdev_id) else {
+            return Ok(0);
+        };
+        let mut rebuilt = 0;
+        for segment_id in self.striped_segments() {
+            let reader = match self.stripe_reader(segment_id) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!("striped segment {segment_id}: cannot open ({e})");
+                    continue;
+                }
+            };
+            let Some(index) = reader.desc.devices.iter().position(|&d| d == vdev_id) else {
+                continue;
+            };
+            if reader.verify_shard(index as u8)? {
+                continue;
+            }
+            match stripe::rebuild_shard(&reader, index as u8, &target) {
+                Ok(()) => rebuilt += 1,
+                Err(e) => tracing::error!(
+                    "striped segment {segment_id}: shard {index} could not be rebuilt onto vdev {vdev_id}: {e}"
+                ),
+            }
+        }
+        Ok(rebuilt)
+    }
+
+    /// Every segment id with a shard file on any online device.
+    fn striped_segments(&self) -> Vec<u64> {
+        let mut ids: Vec<u64> = self
+            .vdevs
+            .online()
+            .iter()
+            .flat_map(|v| stripe::segment_ids_with_shards(&v.root))
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
     }
 
     /// Reads and verifies every record on every online vdev, healing what
@@ -2811,6 +2916,10 @@ impl PoolShared {
             };
             let mut pending: Vec<PendingHeal> = Vec::new();
             self.for_each_replica_group(|hash, replicas| {
+                if replicas.iter().any(|(v, _)| *v == stripe::STRIPED) {
+                    // Verified per shard below, not per record.
+                    return Ok(());
+                }
                 let Some(&(_, own)) = replicas.iter().find(|(v, _)| *v == vdev.id) else {
                     return Ok(());
                 };
@@ -2845,6 +2954,21 @@ impl PoolShared {
             })?;
             self.heal_commit(&pending)?;
             report.healed += pending.len() as u64;
+            // Striped segments: this device's shard, checked by hash and
+            // rebuilt from its siblings if it does not verify.
+            for segment_id in self.striped_segments() {
+                let Ok(reader) = self.stripe_reader(segment_id) else { continue };
+                let Some(i) = reader.desc.devices.iter().position(|&d| d == vdev.id) else { continue };
+                report.shards_verified += 1;
+                if reader.verify_shard(i as u8)? {
+                    continue;
+                }
+                report.shards_corrupt += 1;
+                match stripe::rebuild_shard(&reader, i as u8, vdev) {
+                    Ok(()) => report.shards_rebuilt += 1,
+                    Err(e) => tracing::error!("striped segment {segment_id}: shard {i} on vdev {} not rebuilt: {e}", vdev.id),
+                }
+            }
             reports.push(report);
         }
         self.seal_heal_writers()?;
@@ -2914,7 +3038,10 @@ impl PoolShared {
             &live
         }];
         for candidates in attempts {
-            for &(src, loc) in candidates.iter().filter(|(v, _)| *v != target && self.is_online(*v)) {
+            for &(src, loc) in candidates
+                .iter()
+                .filter(|(v, _)| *v != target && (*v == stripe::STRIPED || self.is_online(*v)))
+            {
                 let Some(kind) = self.stream_kind_of(src, loc.segment_id) else { continue };
                 let Ok((header, raw)) = self.read_raw_from_vdev(src, loc, kind) else { continue };
                 let new_loc = self.heal_append(target, kind, &header, &raw)?;
@@ -2929,10 +3056,25 @@ impl PoolShared {
     /// Segment ids are pool-global and unique across streams, so at most one
     /// answer is possible; `None` means the segment is not on that device.
     fn stream_kind_of(&self, vdev_id: u16, segment_id: u64) -> Option<StreamKind> {
+        if vdev_id == stripe::STRIPED {
+            // Only the data stream is ever striped (§17.2.6).
+            return self
+                .vdevs
+                .online()
+                .iter()
+                .any(|v| !stripe::shards_on(&v.root, segment_id).is_empty())
+                .then_some(StreamKind::Data);
+        }
         let root = self.vdev_root(vdev_id).ok()?;
         [StreamKind::Data, StreamKind::Meta]
             .into_iter()
             .find(|&k| segment::segment_path(&root, segment_id, k).exists())
+    }
+
+    /// Opens the stripe for `segment_id` against every online device.
+    fn stripe_reader(&self, segment_id: u64) -> Result<stripe::StripeReader, PoolError> {
+        let online = self.vdevs.online();
+        Ok(stripe::StripeReader::open(segment_id, |id| self.vdevs.root_of(id), &online)?)
     }
 
     /// Records `loc` for `hash` on each of `vdev_ids` -- the slots the
@@ -4880,16 +5022,24 @@ fn mount_read(
         Ok((_, bytes)) => return Ok(bytes),
         Err(e) => e,
     };
+    let replicas = index.chunk_locations(hash).unwrap_or_default();
+    if let Some(&(_, sloc)) = replicas.iter().find(|(v, _)| *v == stripe::STRIPED) {
+        // A cold record whose mirrors are gone: only its stripe has it.
+        let root_of = |id: u16| vdevs.iter().find(|v| v.id == id).map(|v| v.root.clone());
+        if let Ok(reader) = stripe::StripeReader::open(sloc.segment_id, root_of, vdevs)
+            && let Ok((_, bytes)) = reader.read_record(sloc)
+        {
+            return Ok(bytes);
+        }
+    }
     for vdev in &vdevs[1..] {
         let mut candidates = vec![loc];
-        if let Ok(replicas) = index.chunk_locations(hash) {
-            candidates.extend(
-                replicas
-                    .into_iter()
-                    .filter(|(v, l)| *v == vdev.id && *l != loc)
-                    .map(|(_, l)| l),
-            );
-        }
+        candidates.extend(
+            replicas
+                .iter()
+                .filter(|(v, l)| *v == vdev.id && *l != loc)
+                .map(|(_, l)| *l),
+        );
         for candidate in candidates {
             let read = get_reader(readers, &vdev.root, vdev.id, candidate.segment_id, kind)
                 .and_then(|r| r.read_record(candidate).map_err(PoolError::from));
@@ -4977,14 +5127,21 @@ fn open_all_segment_readers(pool_root: &Path, vdev_id: u16) -> Result<(SegmentRe
         if !dir.is_dir() {
             continue;
         }
+        let expected_ext = match kind {
+            StreamKind::Data => "aseg",
+            _ => "mseg",
+        };
         let mut entries: Vec<_> = std::fs::read_dir(&dir)?.collect::<Result<_, _>>()?;
         entries.sort_by_key(|e| e.file_name());
         for entry in entries {
             let file_name = entry.file_name();
-            let stem = Path::new(&file_name)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("");
+            let path = Path::new(&file_name);
+            // Shard files (`<id>.ec<i>`) share the directory and the id;
+            // they are not segments and are read through stripe.rs.
+            if path.extension().and_then(|e| e.to_str()) != Some(expected_ext) {
+                continue;
+            }
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
             let Ok(segment_id) = stem.parse::<u64>() else {
                 continue;
             };
@@ -5037,6 +5194,40 @@ fn rebuild_index(index_file: &Path, vdevs: &[Vdev], generation: u64) -> Result<R
         }
         for (hash, loc) in locations {
             index.put_chunk_location(hash, vdev.id, loc)?;
+        }
+    }
+    // Striped segments (§17.2): their records live in shard files, which
+    // the scans above skip. Each is reassembled from any k shards and
+    // scanned once, and its records indexed under STRIPED.
+    let root_of = |id: u16| vdevs.iter().find(|v| v.id == id).map(|v| v.root.clone());
+    let mut striped: Vec<u64> = vdevs.iter().flat_map(|v| stripe::segment_ids_with_shards(&v.root)).collect();
+    striped.sort_unstable();
+    striped.dedup();
+    for segment_id in striped {
+        let reader = match stripe::StripeReader::open(segment_id, root_of, vdevs) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("index rebuild: striped segment {segment_id} unreadable ({e}); its records are not indexed");
+                continue;
+            }
+        };
+        let body = match reader.read_body(0, reader.desc.logical_len) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("index rebuild: striped segment {segment_id} short of shards ({e}); its records are not indexed");
+                continue;
+            }
+        };
+        for (header, offset) in stripe::scan_body(&body) {
+            index.put_chunk_location(
+                header.content_hash,
+                stripe::STRIPED,
+                ExtentLocation {
+                    segment_id,
+                    offset,
+                    len: header.record_len,
+                },
+            )?;
         }
     }
     index.checkpoint(generation)?;
