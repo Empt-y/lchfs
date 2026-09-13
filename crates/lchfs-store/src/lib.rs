@@ -429,12 +429,6 @@ struct PoolShared {
     mount_resilver: Vec<(u16, ResilverReport)>,
     /// One live attach at a time.
     attach_lock: Mutex<()>,
-    /// Held for reading by every write from its append to its index
-    /// record; taken for writing (and released at once) by a live attach
-    /// after it has rolled every writer. That makes "every write that
-    /// could have landed on an old segment has recorded its entries" a
-    /// thing the attach can wait for rather than hope for.
-    in_flight_writes: RwLock<()>,
     namespace: Mutex<Namespace>,
     file_state: Mutex<HashMap<u64, FileWorkingState>>,
     open_files: Mutex<HashMap<u64, IncrementalWriteState>>,
@@ -462,7 +456,7 @@ struct PoolShared {
     /// rebuildable cache, never authoritative." `RwLock` since
     /// `get_chunk_location` only needs shared access while `put_*`/
     /// `checkpoint` need exclusive.
-    persisted_index: RwLock<RedbIndex>,
+    persisted_index: Arc<RwLock<RedbIndex>>,
     readers: Mutex<SegmentReaders>,
     /// One open heal segment per `(vdev_id, stream)`, created on first use
     /// (ARCHITECTURE.md §15.4). A heal writes to *one* device, so it can
@@ -584,7 +578,22 @@ impl Pool {
 
         let dedup_index = Arc::new(ChunkLocationCache::new());
         let dedup_pins = Arc::new(PendingDedupPins::new());
-        let persisted_index = RedbIndex::create(&index_path(pool_root))?;
+        let persisted_index = Arc::new(RwLock::new(RedbIndex::create(&index_path(pool_root))?));
+        {
+            // Index recording happens on the committer, under the shard's
+            // own lock, before the write is acknowledged -- see
+            // `ingress::Indexer` for why that placement matters.
+            let cache = Arc::clone(&dedup_index);
+            let persisted = Arc::clone(&persisted_index);
+            committer_pool.set_indexer(Arc::new(move |hash, loc, on: &[u16]| {
+                cache.put(hash, loc);
+                let mut index = persisted.write();
+                for &vdev_id in on {
+                    index.put_chunk_location(hash, vdev_id, loc).map_err(std::io::Error::other)?;
+                }
+                Ok(())
+            }));
+        }
         let prep_pool = IngestPreparationPool::new(
             committer_thread_count(),
             Arc::clone(&dedup_index),
@@ -618,14 +627,13 @@ impl Pool {
             vdevs: vdev_set,
             mount_resilver: Vec::new(),
             attach_lock: Mutex::new(()),
-            in_flight_writes: RwLock::new(()),
             namespace: Mutex::new(namespace),
             file_state: Mutex::new(HashMap::new()),
             open_files: Mutex::new(HashMap::new()),
             ino_locks: Mutex::new(HashMap::new()),
             dedup_index: Arc::clone(&dedup_index),
             dedup_pins: Arc::clone(&dedup_pins),
-            persisted_index: RwLock::new(persisted_index),
+            persisted_index: Arc::clone(&persisted_index),
             readers: Mutex::new(HashMap::new()),
             heal_writers: Mutex::new(HashMap::new()),
             repair_stats: RepairStats::default(),
@@ -816,7 +824,7 @@ impl Pool {
             .flatten()
             .filter(|idx| idx.generation() == slot.generation);
 
-        let (mut readers, mut locations, max_segment_id, persisted_index, took_fast_path) =
+        let (mut readers, mut locations, max_segment_id, persisted_index_inner, took_fast_path) =
             if let Some(index) = fresh_index {
                 let (readers, max_segment_id) = open_all_segment_readers(pool_root, primary_id)?;
                 let locations: HashMap<Hash32, ExtentLocation> =
@@ -850,6 +858,8 @@ impl Pool {
                 // entries" gap -- no owner_shard rescan needed here.
                 (readers, locations, max_segment_id, index, false)
             };
+
+        let persisted_index = persisted_index_inner;
 
         let root_bytes = mount_read(
             &mut readers,
@@ -1097,6 +1107,22 @@ impl Pool {
             root_hash: slot.root_hash,
         };
 
+        let persisted_index = Arc::new(RwLock::new(persisted_index));
+        {
+            // Index recording happens on the committer, under the shard's
+            // own lock, before the write is acknowledged -- see
+            // `ingress::Indexer` for why that placement matters.
+            let cache = Arc::clone(&dedup_index);
+            let persisted = Arc::clone(&persisted_index);
+            committer_pool.set_indexer(Arc::new(move |hash, loc, on: &[u16]| {
+                cache.put(hash, loc);
+                let mut index = persisted.write();
+                for &vdev_id in on {
+                    index.put_chunk_location(hash, vdev_id, loc).map_err(std::io::Error::other)?;
+                }
+                Ok(())
+            }));
+        }
         // Every online device gets swept and scanned (§15.7); the daemons
         // hold their own copy of the list.
         let daemon_targets: Vec<Vdev> = vdevs.clone();
@@ -1111,14 +1137,13 @@ impl Pool {
             vdevs: vdev_set,
             mount_resilver: Vec::new(),
             attach_lock: Mutex::new(()),
-            in_flight_writes: RwLock::new(()),
             namespace: Mutex::new(namespace),
             file_state: Mutex::new(file_state_from_replay),
             open_files: Mutex::new(HashMap::new()),
             ino_locks: Mutex::new(HashMap::new()),
             dedup_index: Arc::clone(&dedup_index),
             dedup_pins: Arc::clone(&dedup_pins),
-            persisted_index: RwLock::new(persisted_index),
+            persisted_index: Arc::clone(&persisted_index),
             readers: Mutex::new(readers),
             heal_writers: Mutex::new(HashMap::new()),
             repair_stats: RepairStats::default(),
@@ -2316,7 +2341,6 @@ impl PoolShared {
         logical_offset: u64,
         raw_bytes: &[u8],
     ) -> Result<(Hash32, ExtentLocation), PoolError> {
-        let _in_flight = self.in_flight_writes.read();
         let prepared = self.prep_pool.submit(PrepTask {
             inode_id,
             logical_offset,
@@ -2343,11 +2367,10 @@ impl PoolShared {
                     logical_offset,
                     completion: tx,
                 });
-                let ingress::Appended { location, vdevs } = rx
+                // Indexed already, by the committer under its shard lock.
+                let ingress::Appended { location, .. } = rx
                     .recv()
                     .map_err(|_| PoolError::Format("committer pool completion channel closed".into()))??;
-                self.dedup_index.put(content_hash, location);
-                self.record_replicated_location(content_hash, location, &vdevs)?;
                 Ok((content_hash, location))
             }
         }
@@ -2408,7 +2431,6 @@ impl PoolShared {
         if let Some(loc) = self.dedup_index.get(hash) {
             return Ok((hash, loc));
         }
-        let _in_flight = self.in_flight_writes.read();
         let mut meta_writer = self.meta_writer.lock();
         self.ensure_meta_room(&mut meta_writer, encoded.len() as u64)?;
         let loc = meta_writer.append(
@@ -2419,10 +2441,13 @@ impl PoolShared {
             &encoded,
             Vec::new(),
         )?;
-        let on: Vec<u16> = meta_writer.vdev_ids().to_vec();
-        drop(meta_writer);
+        // Recorded before the meta lock is released, for the same reason
+        // the committer records under its shard lock: rolling this writer
+        // under its lock then guarantees everything on the old segment is
+        // indexed (see `attach_vdev_live`).
         self.dedup_index.put(hash, loc);
-        self.record_replicated_location(hash, loc, &on)?;
+        self.record_replicated_location(hash, loc, meta_writer.vdev_ids())?;
+        drop(meta_writer);
         Ok((hash, loc))
     }
 
@@ -2455,16 +2480,17 @@ impl PoolShared {
     ///    checkpoints leave its superblock alone until step 4.
     /// 2. Every fan-out writer -- each shard's data writer, the meta
     ///    writer, each shard's delta log -- is rolled to a fresh segment
-    ///    under its own lock. After this, nothing appended anywhere can
-    ///    miss the new device. An append that was in flight finished on
-    ///    its old segment, and is recorded under that segment's slots,
-    ///    which do not include the new one: true, and exactly what the
-    ///    resilver in step 3 is for.
-    /// 3. The in-flight write barrier is taken and released, so every
-    ///    such straggler has recorded its index entries, and then the
-    ///    device is resilvered from an index snapshot. Everything before
-    ///    the barrier is in the snapshot; everything after it fanned out
-    ///    to the device directly.
+    ///    under its own lock. That is the whole barrier, and it costs the
+    ///    write path nothing: a record is indexed by the committer under
+    ///    the same shard lock before its write is acknowledged (and a meta
+    ///    object under the meta lock), so once a writer has been rolled,
+    ///    everything on its previous segment is already in the index,
+    ///    under that segment's slots -- which do not include the new
+    ///    device, which is true, and exactly what step 3 is for. After
+    ///    this, nothing appended anywhere can miss the new device.
+    /// 3. The device is resilvered from an index snapshot. Everything
+    ///    before the rollover is in it; everything after fanned out to
+    ///    the device directly.
     /// 4. The device stops catching up and a checkpoint publishes every
     ///    member's superblock with the new slot count.
     ///
@@ -2511,7 +2537,6 @@ impl PoolShared {
         self.dedup.lock().set_targets(online);
 
         // 3.
-        drop(self.in_flight_writes.write());
         let report = self.resilver(new_id)?;
 
         // 4.

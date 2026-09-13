@@ -18,7 +18,7 @@ use parking_lot::{Condvar, Mutex};
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -192,8 +192,19 @@ pub fn shard_for_inode(inode_id: u64, shard_count: u32) -> u32 {
 
 /// K physical committer threads (K ~= num_cpus) draining a work-stealing
 /// deque of "logical shards with pending work". ARCHITECTURE.md §5.
+/// Records a landed record in the pool's index: `(hash, location, the
+/// slots it landed on)`. Called by a committer *under its shard's lock*,
+/// before the write is acknowledged, so that "this shard's writer has been
+/// rolled" implies "every record on its previous segment is indexed" --
+/// which is what lets a live attach use the writers' own locks as its
+/// barrier instead of a lock every write would have to take (§5).
+pub type Indexer = Arc<dyn Fn(Hash32, ExtentLocation, &[u16]) -> io::Result<()> + Send + Sync>;
+
 pub struct CommitterPool {
     shards: Vec<Arc<LogicalShard>>,
+    /// Set once, after the pool's index exists; lock-free to read after
+    /// that. `None` (never set) for pools driven directly by tests.
+    indexer: Arc<OnceLock<Indexer>>,
     injector: Arc<Injector<u32>>,
     wake: Arc<(Mutex<()>, Condvar)>,
     shutdown: Arc<AtomicBool>,
@@ -229,6 +240,7 @@ impl CommitterPool {
         data_segment_cap_bytes: u64,
         next_segment_id: Arc<AtomicU64>,
     ) -> io::Result<Self> {
+        let indexer: Arc<OnceLock<Indexer>> = Arc::new(OnceLock::new());
         let mut shards = Vec::with_capacity(shard_count as usize);
         for id in 0..shard_count {
             shards.push(Arc::new(LogicalShard::new(
@@ -250,15 +262,17 @@ impl CommitterPool {
                 let injector = Arc::clone(&injector);
                 let wake = Arc::clone(&wake);
                 let shutdown = Arc::clone(&shutdown);
+                let indexer = Arc::clone(&indexer);
                 std::thread::Builder::new()
                     .name(format!("lchfs-committer-{worker_idx}"))
-                    .spawn(move || committer_loop(shards, injector, wake, shutdown))
+                    .spawn(move || committer_loop(shards, injector, wake, shutdown, indexer))
                     .expect("spawn committer thread")
             })
             .collect();
 
         Ok(Self {
             shards,
+            indexer,
             injector,
             wake,
             shutdown,
@@ -280,6 +294,12 @@ impl CommitterPool {
     /// a live attach needs: an append in flight when the set grew finishes
     /// on the old segment and is recorded under the old slots (which is
     /// true), and nothing appended after this can miss the new device.
+    /// Installs the index recorder every committer runs under its shard
+    /// lock. Once only; a second call is ignored.
+    pub fn set_indexer(&self, indexer: Indexer) {
+        let _ = self.indexer.set(indexer);
+    }
+
     pub fn roll_all_writers(&self) -> io::Result<()> {
         for shard in &self.shards {
             shard.data.lock().roll_over()?;
@@ -373,6 +393,7 @@ fn committer_loop(
     injector: Arc<Injector<u32>>,
     wake: Arc<(Mutex<()>, Condvar)>,
     shutdown: Arc<AtomicBool>,
+    indexer: Arc<OnceLock<Indexer>>,
 ) {
     while !shutdown.load(Ordering::Acquire) {
         match pop_pending(&injector) {
@@ -393,13 +414,20 @@ fn committer_loop(
 
                 let mut data = shard.data.lock();
                 while let Some(op) = shard.ring.pop() {
-                    let result = data.append(
-                        ExtentKind::RawChunk,
-                        op.content_hash,
-                        op.codec_id,
-                        op.uncompressed_len,
-                        &op.payload,
-                    );
+                    let result = data
+                        .append(
+                            ExtentKind::RawChunk,
+                            op.content_hash,
+                            op.codec_id,
+                            op.uncompressed_len,
+                            &op.payload,
+                        )
+                        .and_then(|appended| {
+                            if let Some(index) = indexer.get() {
+                                index(op.content_hash, appended.location, &appended.vdevs)?;
+                            }
+                            Ok(appended)
+                        });
                     let _ = op.completion.send(result);
                 }
                 drop(data);
