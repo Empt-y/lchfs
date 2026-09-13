@@ -41,6 +41,7 @@ pub mod gc;
 pub mod ingress;
 pub mod prep;
 pub mod segment;
+pub mod stripe;
 pub mod vdevs;
 
 use bytes::Bytes;

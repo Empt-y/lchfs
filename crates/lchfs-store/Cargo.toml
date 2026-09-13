@@ -10,6 +10,7 @@ lchfs-format = { workspace = true }
 lchfs-crypto = { workspace = true }
 lchfs-compress = { workspace = true }
 lchfs-chunk = { workspace = true }
+reed-solomon-erasure = "6"
 lchfs-index = { workspace = true }
 crossbeam = { workspace = true }
 parking_lot = { workspace = true }

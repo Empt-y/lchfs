@@ -101,7 +101,7 @@ pub enum SegmentError {
     },
 }
 
-fn segment_dir(pool_root: &Path, kind: StreamKind) -> PathBuf {
+pub(crate) fn segment_dir(pool_root: &Path, kind: StreamKind) -> PathBuf {
     let sub = match kind {
         StreamKind::Data => "data",
         StreamKind::Meta => "meta",
@@ -741,7 +741,17 @@ impl SegmentReader {
         let mut record_bytes = vec![0u8; loc.len as usize];
         self.file
             .read_exact_at(&mut record_bytes, loc.offset as u64)?;
+        decode_record_bytes(record_bytes)
+    }
+}
 
+/// Turns the raw bytes of one record -- exactly `record_len` of them,
+/// wherever they were read from: a segment file, or a stripe's shards
+/// (stripe.rs) -- into its header and still-compressed payload, with the
+/// framing checks of ARCHITECTURE.md §1 (magic, bounds, header checksum).
+/// No content-hash check; `verify_record` does that.
+pub fn decode_record_bytes(record_bytes: Vec<u8>) -> Result<(ExtentRecordHeader, Vec<u8>), SegmentError> {
+    {
         let (header, consumed) = parse_record_header(&record_bytes).ok_or_else(|| {
             SegmentError::Io(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -774,7 +784,32 @@ impl SegmentReader {
         let payload = record_bytes[payload_start..payload_end].to_vec();
         Ok((header, payload))
     }
+}
 
+/// The content-hash half of the mandatory check sequence: decompresses
+/// the payload and compares BLAKE3 of the result with the header's
+/// `content_hash`. Returns the decompressed bytes. `segment_id`/`offset`
+/// only name the record in the error.
+pub fn verify_record(
+    header: &ExtentRecordHeader,
+    payload: Vec<u8>,
+    segment_id: u64,
+    offset: u32,
+) -> Result<Vec<u8>, SegmentError> {
+    let decompressed = decode_payload(header, payload)?;
+    if let Err(_verify_err) = lchfs_crypto::verify(&decompressed, header.content_hash) {
+        let actual = Hash32::of(&decompressed);
+        return Err(SegmentError::ContentHash {
+            segment_id,
+            offset,
+            expected: header.content_hash,
+            actual,
+        });
+    }
+    Ok(decompressed)
+}
+
+impl SegmentReader {
     /// Read and validate one Extent Record at `loc`. Performs the full
     /// mandatory check sequence from ARCHITECTURE.md §1: magic -> bounds ->
     /// header checksum -> decompress -> BLAKE3(decompressed) == content_hash.
