@@ -165,6 +165,7 @@ pub fn handle(pool: &Pool, request: &Value) -> anyhow::Result<Value> {
                     "failovers": stats.failovers,
                     "heals": stats.heals,
                     "heal_failures": stats.heal_failures,
+                    "corruption_events": pool.corruption_events().len(),
                 },
                 "mount_resilver": pool
                     .mount_resilver()
@@ -208,6 +209,27 @@ pub fn handle(pool: &Pool, request: &Value) -> anyhow::Result<Value> {
                 .ok_or_else(|| anyhow::anyhow!("vdev must be a number"))? as u16;
             pool.offline_vdev(id)?;
             Ok(json!({ "vdev": id, "health": "FAULTED" }))
+        }
+        "corruption" => {
+            let events = pool.corruption_events();
+            let clear = request.get("clear").and_then(Value::as_bool).unwrap_or(false);
+            if clear {
+                pool.clear_corruption_events();
+            }
+            Ok(json!(events
+                .iter()
+                .map(|e| json!({
+                    "at": e.at.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+                    "vdev": e.vdev_id,
+                    "stream": format!("{:?}", e.stream).to_lowercase(),
+                    "hash": format!("{:?}", e.hash),
+                    "segment": e.location.map(|l| l.segment_id),
+                    "offset": e.location.map(|l| l.offset),
+                    "ino": e.ino,
+                    "detail": e.detail,
+                    "healed": e.healed,
+                }))
+                .collect::<Vec<_>>()))
         }
         other => anyhow::bail!("unknown command {other:?}"),
     }

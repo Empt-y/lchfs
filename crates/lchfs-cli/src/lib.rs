@@ -106,6 +106,13 @@ enum PoolAction {
     Online { root: PathBuf, device: PathBuf },
     /// Stop using a device, cleanly.
     Offline { root: PathBuf, vdev: u16 },
+    /// Every corruption detected since mount, with what was done about it.
+    Corruption {
+        root: PathBuf,
+        /// Forget the events after printing them.
+        #[arg(long)]
+        clear: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -335,6 +342,7 @@ fn pool_control(action: PoolAction) -> anyhow::Result<()> {
         PoolAction::Attach { root, device } => (root, json!({ "cmd": "attach", "path": abs(device)? })),
         PoolAction::Online { root, device } => (root, json!({ "cmd": "online", "path": abs(device)? })),
         PoolAction::Offline { root, vdev } => (root, json!({ "cmd": "offline", "vdev": vdev })),
+        PoolAction::Corruption { root, clear } => (root, json!({ "cmd": "corruption", "clear": clear })),
     };
     let reply = control::request(&root.join(control::SOCKET_NAME), &req)?;
     println!("{}", serde_json::to_string_pretty(&reply)?);

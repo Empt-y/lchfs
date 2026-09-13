@@ -405,3 +405,73 @@ fn delta_replay_at_mount_fails_over_too() {
     let pool = Pool::open_replicated(&[a.path(), b.path()]).unwrap();
     assert_eq!(pool.read(ino, 0, data.len() as u32).unwrap(), data);
 }
+
+// ---- Corruption is data ----------------------------------------------
+
+/// §8 asked for a structured corruption log: which device, which record,
+/// what was seen, which inode was being read, whether it was put right.
+/// A read that fails over records all of that; the happy path records
+/// nothing.
+#[test]
+fn corruption_found_by_a_read_is_recorded_with_its_inode_and_outcome() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let ino = write_and_checkpoint(a.path(), b.path());
+    corrupt_data_segments(a.path());
+
+    let pool = Pool::open_replicated(&[a.path(), b.path()]).unwrap();
+    assert!(pool.corruption_events().is_empty(), "nothing has been read yet");
+    assert_eq!(read_all(&pool, ino), payload());
+
+    let events = pool.corruption_events();
+    assert!(!events.is_empty());
+    for e in &events {
+        assert_eq!(e.vdev_id, 0, "{e:?}");
+        assert_eq!(e.ino, Some(ino), "{e:?}");
+        assert!(e.healed, "{e:?}");
+        assert!(e.location.is_some(), "{e:?}");
+        assert!(!e.detail.is_empty());
+    }
+    assert_eq!(events.len() as u64, pool.repair_stats().heals);
+
+    // A clean second read adds nothing.
+    assert_eq!(read_all(&pool, ino), payload());
+    assert_eq!(pool.corruption_events().len(), events.len());
+    pool.clear_corruption_events();
+    assert!(pool.corruption_events().is_empty());
+}
+
+/// Scrub findings are recorded too, without an inode, and say whether
+/// the record could be healed.
+#[test]
+fn corruption_found_by_scrub_is_recorded() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    write_and_checkpoint(a.path(), b.path());
+    corrupt_data_segments(b.path());
+    let pool = Pool::open_replicated(&[a.path(), b.path()]).unwrap();
+    let reports = pool.scrub().unwrap();
+    let events = pool.corruption_events();
+    assert_eq!(events.len() as u64, reports[1].corrupt, "{events:?}");
+    assert!(events.iter().all(|e| e.vdev_id == 1 && e.ino.is_none() && e.healed), "{events:?}");
+}
+
+/// On a single device nothing can be healed, and the event says so.
+#[test]
+fn unhealable_corruption_is_recorded_as_such() {
+    let a = tempfile::tempdir().unwrap();
+    let ino = {
+        let pool = Pool::create(a.path(), small_params()).unwrap();
+        let ino = pool.create_file(1, "big", 0o644).unwrap();
+        pool.write(ino, 0, &payload()).unwrap();
+        pool.checkpoint().unwrap();
+        ino
+    };
+    corrupt_data_segments(a.path());
+    let pool = Pool::open(a.path()).unwrap();
+    assert!(pool.read(ino, 0, payload().len() as u32).is_err());
+    let events = pool.corruption_events();
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert!(!events[0].healed);
+    assert_eq!(events[0].ino, Some(ino));
+}

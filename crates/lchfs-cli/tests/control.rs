@@ -66,6 +66,10 @@ fn every_command_round_trips_over_the_socket() {
     let status = request(&sock, &json!({ "cmd": "status" })).unwrap();
     assert_eq!(status["vdevs"][1]["health"], "online");
 
+    let corruption = request(&sock, &json!({ "cmd": "corruption" })).unwrap();
+    assert_eq!(corruption.as_array().unwrap().len(), 0);
+    assert_eq!(status["repair"]["corruption_events"], 0);
+
     // Bad requests are errors, not disconnects.
     let err = request(&sock, &json!({ "cmd": "dance" })).unwrap_err().to_string();
     assert!(err.contains("unknown command"), "{err}");

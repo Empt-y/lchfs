@@ -261,6 +261,26 @@ pub(crate) const INDEX_PAGE: usize = 8192;
 /// resilvering a large device take as long as writing it record by record.
 const HEAL_BATCH: usize = 256;
 
+/// One detected corruption, recorded as data (ARCHITECTURE.md §8's
+/// "structured corruption log"), never on a happy path. `ino` is the
+/// inode whose read tripped over it when a read did; scrub findings
+/// carry none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorruptionEvent {
+    pub at: SystemTime,
+    pub vdev_id: u16,
+    pub stream: StreamKind,
+    pub hash: Hash32,
+    pub location: Option<ExtentLocation>,
+    pub ino: Option<u64>,
+    pub detail: String,
+    /// Whether a good copy was found and written back onto `vdev_id`.
+    pub healed: bool,
+}
+
+/// Events kept in memory; older ones are dropped past this.
+const CORRUPTION_EVENTS_KEPT: usize = 1024;
+
 /// What `Pool::discover` found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Discovered {
@@ -450,6 +470,9 @@ struct PoolShared {
     mount_resilver: Vec<(u16, ResilverReport)>,
     /// One live attach at a time.
     attach_lock: Mutex<()>,
+    /// Corruption seen by reads, mount and scrub, newest last. Touched only
+    /// when something has already gone wrong.
+    corruption: Mutex<std::collections::VecDeque<CorruptionEvent>>,
     namespace: Mutex<Namespace>,
     file_state: Mutex<HashMap<u64, FileWorkingState>>,
     open_files: Mutex<HashMap<u64, IncrementalWriteState>>,
@@ -649,6 +672,7 @@ impl Pool {
             vdevs: Arc::clone(&vdev_set),
             mount_resilver: Vec::new(),
             attach_lock: Mutex::new(()),
+            corruption: Mutex::new(std::collections::VecDeque::new()),
             namespace: Mutex::new(namespace),
             file_state: Mutex::new(HashMap::new()),
             open_files: Mutex::new(HashMap::new()),
@@ -1373,6 +1397,7 @@ impl Pool {
             vdevs: Arc::clone(&vdev_set),
             mount_resilver: Vec::new(),
             attach_lock: Mutex::new(()),
+            corruption: Mutex::new(std::collections::VecDeque::new()),
             namespace: Mutex::new(namespace),
             file_state: Mutex::new(file_state_from_replay),
             open_files: Mutex::new(HashMap::new()),
@@ -1474,6 +1499,16 @@ impl Pool {
     /// One entry per slot: online, catching up, faulted or absent.
     pub fn vdev_status(&self) -> Vec<vdevs::VdevStatus> {
         self.0.vdevs.status()
+    }
+
+    /// Every corruption detected since mount (or since `clear`), oldest
+    /// first, up to the last 1024.
+    pub fn corruption_events(&self) -> Vec<CorruptionEvent> {
+        self.0.corruption.lock().iter().cloned().collect()
+    }
+
+    pub fn clear_corruption_events(&self) {
+        self.0.corruption.lock().clear();
     }
 
     /// Takes a device out of service on purpose -- to pull it cleanly, or
@@ -1923,7 +1958,7 @@ impl PoolShared {
         match hash {
             None => Ok(SnapshotTable::default()),
             Some(hash) => {
-                let bytes = self.read_meta_object_bytes(hash)?;
+                let bytes = self.read_meta_object_bytes(hash, None)?;
                 lchfs_format::decode(&bytes).map_err(|e| PoolError::Format(e.to_string()))
             }
         }
@@ -2039,10 +2074,10 @@ impl PoolShared {
         match content_ref {
             ContentRef::Inline(bytes) => Ok(slice_of(&bytes, offset, len)),
             ContentRef::ChunkList(hash) => {
-                let ihl_bytes = self.read_meta_object_bytes(hash)?;
+                let ihl_bytes = self.read_meta_object_bytes(hash, Some(ino))?;
                 let ihl: IndirectHashList = lchfs_format::decode(&ihl_bytes)
                     .map_err(|e| PoolError::Format(e.to_string()))?;
-                self.read_range_from_chunks(&ihl.chunks, size, offset, len)
+                self.read_range_from_chunks(ino, &ihl.chunks, size, offset, len)
             }
             ContentRef::DirEntries(_) | ContentRef::SymlinkTarget(_) => Ok(Bytes::new()),
         }
@@ -2079,7 +2114,7 @@ impl PoolShared {
 
         let mut buf = vec![0u8; total];
         for chunk in chunks {
-            let bytes = self.read_chunk_bytes(chunk.content_hash)?;
+            let bytes = self.read_chunk_bytes(chunk.content_hash, Some(ino))?;
             let start = chunk.logical_offset as usize;
             let end = (start + bytes.len()).min(buf.len());
             if start < end {
@@ -2110,6 +2145,7 @@ impl PoolShared {
     /// POSIX sparse-file semantic rather than an error case.
     fn read_range_from_chunks(
         &self,
+        ino: u64,
         chunks: &[ChunkRef],
         size: u64,
         offset: u64,
@@ -2135,7 +2171,7 @@ impl PoolShared {
             if chunk_end <= start {
                 continue;
             }
-            let bytes = self.read_chunk_bytes(chunk.content_hash)?;
+            let bytes = self.read_chunk_bytes(chunk.content_hash, Some(ino))?;
             // Trust the record's own length, not the ChunkRef's: the read
             // above already verified the payload against its content hash,
             // so a disagreement means a corrupt chunk list rather than
@@ -2186,7 +2222,7 @@ impl PoolShared {
         };
         match content_ref {
             ContentRef::ChunkList(hash) => {
-                let bytes = self.read_meta_object_bytes(hash)?;
+                let bytes = self.read_meta_object_bytes(hash, Some(ino))?;
                 let ihl: IndirectHashList =
                     lchfs_format::decode(&bytes).map_err(|e| PoolError::Format(e.to_string()))?;
                 Ok(ihl.chunks)
@@ -2209,7 +2245,7 @@ impl PoolShared {
         let (contents, chunks) = match content_ref {
             ContentRef::Inline(bytes) => (bytes, Vec::new()),
             ContentRef::ChunkList(hash) => {
-                let ihl_bytes = self.read_meta_object_bytes(hash)?;
+                let ihl_bytes = self.read_meta_object_bytes(hash, Some(ino))?;
                 let ihl: IndirectHashList =
                     lchfs_format::decode(&ihl_bytes).map_err(|e| PoolError::Format(e.to_string()))?;
                 // Place each chunk at its own `logical_offset` rather than
@@ -2219,7 +2255,7 @@ impl PoolShared {
                 // zeroed, so holes materialize as zeros for free.
                 let mut buf = vec![0u8; size as usize];
                 for chunk in &ihl.chunks {
-                    let chunk_bytes = self.read_chunk_bytes(chunk.content_hash)?;
+                    let chunk_bytes = self.read_chunk_bytes(chunk.content_hash, Some(ino))?;
                     let start = chunk.logical_offset as usize;
                     let end = (start + chunk_bytes.len()).min(buf.len());
                     if start < end {
@@ -2236,12 +2272,12 @@ impl PoolShared {
         Ok(())
     }
 
-    fn read_meta_object_bytes(&self, hash: Hash32) -> Result<Vec<u8>, PoolError> {
-        self.read_verified(hash, StreamKind::Meta)
+    fn read_meta_object_bytes(&self, hash: Hash32, ino: Option<u64>) -> Result<Vec<u8>, PoolError> {
+        self.read_verified(hash, StreamKind::Meta, ino)
     }
 
-    fn read_chunk_bytes(&self, hash: Hash32) -> Result<Vec<u8>, PoolError> {
-        self.read_verified(hash, StreamKind::Data)
+    fn read_chunk_bytes(&self, hash: Hash32, ino: Option<u64>) -> Result<Vec<u8>, PoolError> {
+        self.read_verified(hash, StreamKind::Data, ino)
     }
 
     /// The one place record payloads are read on behalf of a caller
@@ -2261,7 +2297,7 @@ impl PoolShared {
     /// that failed are then healed from those bytes, synchronously and
     /// best-effort -- a heal that fails is logged and counted, never
     /// allowed to turn a read that just succeeded into an error.
-    fn read_verified(&self, hash: Hash32, kind: StreamKind) -> Result<Vec<u8>, PoolError> {
+    fn read_verified(&self, hash: Hash32, kind: StreamKind, ino: Option<u64>) -> Result<Vec<u8>, PoolError> {
         let what = match kind {
             StreamKind::Data => "chunk",
             _ => "object",
@@ -2285,7 +2321,22 @@ impl PoolShared {
                 Err(e) => e,
             }
         };
+        // From here on something is wrong, and every step is recorded:
+        // which device, which record, what was seen, whether it was put
+        // right. That is §8's structured corruption log; the happy path
+        // above never touches it.
+        let event = |vdev_id: u16, location: Option<ExtentLocation>, detail: String, healed: bool| CorruptionEvent {
+            at: SystemTime::now(),
+            vdev_id,
+            stream: kind,
+            hash,
+            location,
+            ino,
+            detail,
+            healed,
+        };
         if self.vdevs.len() == 1 {
+            self.record_corruption(event(self.primary_id, Some(preferred), primary_err.to_string(), false));
             return Err(primary_err);
         }
         tracing::warn!(
@@ -2294,7 +2345,8 @@ impl PoolShared {
         );
 
         let replicas = self.persisted_index.read().chunk_locations(hash)?;
-        let mut failed = vec![self.primary_id];
+        let mut failed: Vec<(u16, Option<ExtentLocation>, String)> =
+            vec![(self.primary_id, Some(preferred), primary_err.to_string())];
         for (vdev_id, loc) in replicas {
             if vdev_id == self.primary_id || !self.is_online(vdev_id) {
                 continue;
@@ -2305,19 +2357,27 @@ impl PoolShared {
                     // Already verified by `read_record_raw`, so this cannot
                     // fail on the codec path it just took.
                     let bytes = segment::decode_payload(&header, raw.clone())?;
-                    for bad in failed {
-                        if let Err(e) = self.heal_one(bad, kind, &header, &raw) {
-                            self.repair_stats.heal_failures.fetch_add(1, Ordering::Relaxed);
-                            tracing::error!("heal of {what} {hash:?} onto vdev {bad} failed: {e}");
-                        }
+                    for (bad, location, detail) in failed {
+                        let healed = match self.heal_one(bad, kind, &header, &raw) {
+                            Ok(_) => true,
+                            Err(e) => {
+                                self.repair_stats.heal_failures.fetch_add(1, Ordering::Relaxed);
+                                tracing::error!("heal of {what} {hash:?} onto vdev {bad} failed: {e}");
+                                false
+                            }
+                        };
+                        self.record_corruption(event(bad, location, detail, healed));
                     }
                     return Ok(bytes);
                 }
                 Err(e) => {
                     tracing::warn!("{what} {hash:?} unreadable on vdev {vdev_id} too ({e})");
-                    failed.push(vdev_id);
+                    failed.push((vdev_id, Some(loc), e.to_string()));
                 }
             }
+        }
+        for (bad, location, detail) in failed {
+            self.record_corruption(event(bad, location, detail, false));
         }
         Err(PoolError::IntegrityFailure(hash))
     }
@@ -2466,6 +2526,14 @@ impl PoolShared {
         Ok(())
     }
 
+    fn record_corruption(&self, event: CorruptionEvent) {
+        let mut log = self.corruption.lock();
+        if log.len() >= CORRUPTION_EVENTS_KEPT {
+            log.pop_front();
+        }
+        log.push_back(event);
+    }
+
     /// Tells the device set about slots a writer has dropped. Every writer
     /// that trips over the same dead device reports it; the set makes the
     /// first report count and the rest no-ops.
@@ -2543,9 +2611,20 @@ impl PoolShared {
                     return Ok(());
                 }
                 report.corrupt += 1;
-                if !self.heal_from_any_replica(hash, vdev.id, replicas, &mut pending)? {
+                let healed = self.heal_from_any_replica(hash, vdev.id, replicas, &mut pending)?;
+                if !healed {
                     report.unrecoverable.push(hash);
                 }
+                self.record_corruption(CorruptionEvent {
+                    at: SystemTime::now(),
+                    vdev_id: vdev.id,
+                    stream: self.stream_kind_of(vdev.id, own.segment_id).unwrap_or(StreamKind::Data),
+                    hash,
+                    location: Some(own),
+                    ino: None,
+                    detail: "scrub: record did not read back and verify".into(),
+                    healed,
+                });
                 if pending.len() >= HEAL_BATCH {
                     self.heal_commit(&pending)?;
                     report.healed += pending.len() as u64;
@@ -3375,7 +3454,7 @@ impl PoolShared {
                 SeekWhence::Hole => size,
             })),
             ContentRef::ChunkList(hash) => {
-                let ihl_bytes = self.read_meta_object_bytes(hash)?;
+                let ihl_bytes = self.read_meta_object_bytes(hash, Some(ino))?;
                 let ihl: IndirectHashList = lchfs_format::decode(&ihl_bytes)
                     .map_err(|e| PoolError::Format(e.to_string()))?;
                 Ok(Self::seek_in_chunks(&ihl.chunks, size, offset, whence))
