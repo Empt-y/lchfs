@@ -1,0 +1,165 @@
+//! Removing a device (ARCHITECTURE.md §15.9). For a mirror there is no
+//! evacuation: the leaving device's records are copies. Detach proves the
+//! survivors are complete, then forgets the slot.
+
+use lchfs_format::PoolParams;
+use lchfs_store::Pool;
+use std::path::{Path, PathBuf};
+
+fn small_params() -> PoolParams {
+    PoolParams {
+        data_segment_cap_bytes: 64 * 1024,
+        meta_segment_cap_bytes: 64 * 1024,
+        chunk_avg_size: 1024,
+        chunk_min_size: 256,
+        chunk_max_size: 4096,
+        inline_threshold: 64,
+        logical_shard_count: 1,
+    }
+}
+
+fn payload(seed: u32) -> Vec<u8> {
+    (0..30_000u32)
+        .map(|i| ((i ^ seed).wrapping_mul(2654435761) >> 13) as u8)
+        .collect()
+}
+
+fn data_segments(root: &Path) -> Vec<PathBuf> {
+    let mut v: Vec<_> = std::fs::read_dir(root.join("segments/data"))
+        .map(|rd| rd.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+    v.sort();
+    v
+}
+
+fn read_file(pool: &Pool, name: &str, len: usize) -> Vec<u8> {
+    let ino = pool.lookup(1, name).unwrap().expect(name);
+    pool.read(ino, 0, len as u32).unwrap().to_vec()
+}
+
+#[test]
+fn a_mirror_shrinks_back_to_a_single_device() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let data = payload(21);
+    {
+        let pool = Pool::create_replicated(&[a.path(), b.path()], small_params()).unwrap();
+        let ino = pool.create_file(1, "f", 0o644).unwrap();
+        pool.write(ino, 0, &data).unwrap();
+        pool.checkpoint().unwrap();
+    }
+
+    assert_eq!(Pool::detach_vdev(&[a.path(), b.path()]).unwrap(), 1);
+
+    // b is no longer a member in any sense.
+    assert!(!b.path().join("SUPERBLOCK").exists());
+    let err = Pool::open_replicated(&[a.path(), b.path()]).unwrap_err().to_string();
+    assert!(err.contains("no valid superblock"), "{err}");
+
+    // a stands alone, as a plain single-vdev pool.
+    let pool = Pool::open(a.path()).unwrap();
+    assert!(!pool.is_degraded());
+    assert_eq!(read_file(&pool, "f", data.len()), data);
+    assert_eq!(pool.repair_stats().failovers, 0, "nothing should have needed b");
+    pool.scrub().unwrap();
+    assert_eq!(pool.repair_stats().heal_failures, 0);
+}
+
+/// The leaving device is still a member while the survivors are proven,
+/// so anything only it holds gets copied over before it goes.
+#[test]
+fn detach_first_fills_the_survivors_from_the_leaving_device() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let data = payload(22);
+    {
+        let pool = Pool::create_replicated(&[a.path(), b.path()], small_params()).unwrap();
+        let ino = pool.create_file(1, "f", 0o644).unwrap();
+        pool.write(ino, 0, &data).unwrap();
+        pool.checkpoint().unwrap();
+    }
+    // a's copies rot; b's are the good ones -- and b is the one leaving.
+    for path in data_segments(a.path()) {
+        let mut bytes = std::fs::read(&path).unwrap();
+        if bytes.len() > 8192 {
+            let mid = bytes.len() / 2;
+            for x in &mut bytes[mid..mid + 64] {
+                *x ^= 0xff;
+            }
+            std::fs::write(&path, &bytes).unwrap();
+        }
+    }
+
+    assert_eq!(Pool::detach_vdev(&[a.path(), b.path()]).unwrap(), 1);
+    let pool = Pool::open(a.path()).unwrap();
+    assert_eq!(read_file(&pool, "f", data.len()), data);
+}
+
+/// If the survivors could not stand alone, nothing is changed.
+#[test]
+fn detach_refuses_when_a_record_would_lose_its_last_good_copy() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let data = payload(23);
+    {
+        let pool = Pool::create_replicated(&[a.path(), b.path()], small_params()).unwrap();
+        let ino = pool.create_file(1, "f", 0o644).unwrap();
+        pool.write(ino, 0, &data).unwrap();
+        pool.checkpoint().unwrap();
+    }
+    // Both copies of the data are gone: nothing can be proven complete.
+    for root in [a.path(), b.path()] {
+        for f in data_segments(root) {
+            std::fs::remove_file(f).unwrap();
+        }
+    }
+    let err = Pool::detach_vdev(&[a.path(), b.path()]).unwrap_err().to_string();
+    assert!(err.contains("refusing to detach"), "{err}");
+    assert!(b.path().join("SUPERBLOCK").exists(), "the leaving device must be untouched");
+    assert!(Pool::open_replicated(&[a.path(), b.path()]).is_ok(), "the set must still be coherent");
+}
+
+#[test]
+fn only_the_last_slot_can_leave_and_a_single_device_cannot() {
+    let a = tempfile::tempdir().unwrap();
+    drop(Pool::create(a.path(), small_params()).unwrap());
+    let err = Pool::detach_vdev(&[a.path()]).unwrap_err().to_string();
+    assert!(err.contains("nothing to detach"), "{err}");
+}
+
+/// Round trip: attach, use, detach, use, attach again.
+#[test]
+fn a_pool_can_grow_and_shrink_repeatedly() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let c = tempfile::tempdir().unwrap();
+    let one = payload(31);
+    let two = payload(32);
+    {
+        let pool = Pool::create(a.path(), small_params()).unwrap();
+        let ino = pool.create_file(1, "one", 0o644).unwrap();
+        pool.write(ino, 0, &one).unwrap();
+        pool.checkpoint().unwrap();
+    }
+    Pool::attach_vdev(&[a.path()], b.path()).unwrap();
+    {
+        let pool = Pool::open_replicated(&[a.path(), b.path()]).unwrap();
+        let ino = pool.create_file(1, "two", 0o644).unwrap();
+        pool.write(ino, 0, &two).unwrap();
+        pool.checkpoint().unwrap();
+    }
+    Pool::detach_vdev(&[a.path(), b.path()]).unwrap();
+    Pool::attach_vdev(&[a.path()], c.path()).unwrap();
+    // c is filled at this mount; then a loses its data and c serves.
+    {
+        let pool = Pool::open_replicated(&[a.path(), c.path()]).unwrap();
+        assert_eq!(pool.mount_resilver().len(), 1);
+        pool.checkpoint().unwrap();
+    }
+    for f in data_segments(a.path()) {
+        std::fs::remove_file(f).unwrap();
+    }
+    let pool = Pool::open_replicated(&[a.path(), c.path()]).unwrap();
+    assert_eq!(read_file(&pool, "one", one.len()), one);
+    assert_eq!(read_file(&pool, "two", two.len()), two);
+}

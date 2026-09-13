@@ -724,9 +724,7 @@ impl Pool {
     /// generation 0, so the next `open_replicated` sees it trailing and
     /// resilvers everything onto it before the pool serves.
     ///
-    /// Offline because the fan-out writers hold their device list for the
-    /// life of a mount; growing that list under a live writer is a
-    /// different piece of work.
+    /// Offline; `attach_vdev_live` is the same operation on a mounted pool.
     pub fn attach_vdev(vdev_roots: &[&Path], new_root: &Path) -> Result<u16, PoolError> {
         let membership = check_membership(vdev_roots, true)?;
         let (new_id, new_count) = match membership.missing_vdevs.as_slice() {
@@ -786,6 +784,93 @@ impl Pool {
         finalize_superblock_slot_checksum(&mut fresh);
         write_superblock_slot(&new_backend, &fresh)?;
         Ok(new_id)
+    }
+
+    /// Removes the highest-numbered device from a pool, offline
+    /// (ARCHITECTURE.md §15.9's "vdev removal"). `vdev_roots` is the
+    /// complete set; the last of them leaves.
+    ///
+    /// §15.9 left removal open over "where the evacuated data goes". For
+    /// an N-way mirror the answer is nowhere: every record on the leaving
+    /// device is a copy of one the survivors hold, so removal is proving
+    /// that and then forgetting the slot. The proof is a resilver of every
+    /// survivor (fills anything a survivor is missing -- from the leaving
+    /// device if need be, it is still a member at that point) followed by
+    /// a scrub, and it refuses if any record would have no verified copy
+    /// left. Only then are the survivors' superblocks rewritten with the
+    /// smaller count, the slot's index entries dropped, and the leaving
+    /// device's superblock erased so it can never be taken for a member
+    /// again. Its segment files are left for the caller to wipe.
+    ///
+    /// Only the last slot can leave, because slots are `0..count` and a
+    /// hole in the middle is a degraded pool, not a smaller one.
+    pub fn detach_vdev(vdev_roots: &[&Path]) -> Result<u16, PoolError> {
+        let membership = check_membership(vdev_roots, false)?;
+        if membership.vdev_count < 2 {
+            return Err(PoolError::InvalidArgument(
+                "a single-vdev pool has nothing to detach".into(),
+            ));
+        }
+        let leaving = membership.vdev_count - 1;
+        let leaving_root = membership
+            .members
+            .iter()
+            .find(|(s, _)| s.vdev_id == leaving)
+            .map(|(_, r)| r.to_path_buf())
+            .expect("complete set contains its last slot");
+
+        // Prove the survivors can stand alone, with the leaving device
+        // still a member and so still a source to heal from.
+        {
+            let pool = Self::open_replicated(vdev_roots)?;
+            for id in 0..leaving {
+                let report = pool.resilver(id)?;
+                if !report.unrecoverable.is_empty() {
+                    return Err(PoolError::Format(format!(
+                        "vdev {id} is missing {} records that no device can supply; refusing to detach",
+                        report.unrecoverable.len()
+                    )));
+                }
+            }
+            for report in pool.scrub()? {
+                if report.vdev_id != leaving && !report.unrecoverable.is_empty() {
+                    return Err(PoolError::Format(format!(
+                        "vdev {} holds {} corrupt records that no device can supply; refusing to detach",
+                        report.vdev_id,
+                        report.unrecoverable.len()
+                    )));
+                }
+            }
+            pool.checkpoint()?;
+        }
+
+        // Every survivor at once, under every lock, so no mount can slip
+        // in between one device saying N and the next saying N-1.
+        let membership = check_membership(vdev_roots, false)?;
+        let mut locks = Vec::with_capacity(vdev_roots.len());
+        for root in vdev_roots {
+            locks.push(acquire_pool_lock(root)?);
+        }
+        for (slot, root) in &membership.members {
+            if slot.vdev_id == leaving {
+                continue;
+            }
+            let backend = FileBackend::open(root)?;
+            let mut updated = *slot;
+            updated.vdev_count = leaving;
+            finalize_superblock_slot_checksum(&mut updated);
+            write_superblock_slot(&backend, &updated)?;
+        }
+        let index_file = index_path(vdev_roots[0]);
+        if index_file.exists()
+            && let Ok(mut index) = RedbIndex::open(&index_file)
+        {
+            index.delete_vdev_locations(leaving)?;
+        }
+        // The leaving device's ring is erased last: until here it still
+        // agreed with the survivors and a crash left a coherent set.
+        std::fs::remove_file(backend::superblock_path(&leaving_root))?;
+        Ok(leaving)
     }
 
     fn open_set(given_roots: &[&Path], allow_missing: bool) -> Result<Self, PoolError> {

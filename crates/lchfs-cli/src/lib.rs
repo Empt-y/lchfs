@@ -54,6 +54,16 @@ enum Command {
         /// The blank device to add.
         new_device: PathBuf,
     },
+    /// Remove the highest-numbered device from a pool, offline
+    /// (ARCHITECTURE.md §15.9). Refuses unless every record has a verified
+    /// copy on the devices that remain.
+    DetachVdev {
+        /// vdev 0's root.
+        pool: PathBuf,
+        /// Every other device, the last of which leaves.
+        #[arg(long = "vdev")]
+        vdevs: Vec<PathBuf>,
+    },
     /// Snapshot management (ARCHITECTURE.md §6).
     Snapshot {
         #[command(subcommand)]
@@ -90,6 +100,13 @@ pub fn run() -> anyhow::Result<()> {
                 "{} attached as vdev {id}. Mount with every device to resilver it.",
                 new_device.display()
             );
+            Ok(())
+        }
+        Command::DetachVdev { pool, vdevs } => {
+            let mut roots: Vec<&std::path::Path> = vec![pool.as_path()];
+            roots.extend(vdevs.iter().map(|p| p.as_path()));
+            let id = lchfs_store::Pool::detach_vdev(&roots)?;
+            println!("vdev {id} detached; its segment files can be deleted.");
             Ok(())
         }
         Command::Snapshot { action } => snapshot(action),
