@@ -14,14 +14,13 @@
 
 use crate::gc::GcEngine;
 use crate::segment::{self, SegmentReader, SegmentWriter};
-use crate::{PRIMARY_VDEV_ID, StreamKind, Vdev};
+use crate::{StreamKind, Vdev};
 use lchfs_format::{ExtentLocation, Hash32};
 use lchfs_index::{ChunkLocationCache, IndexStore, PendingDedupPins, RedbIndex};
 use parking_lot::RwLock;
 use roaring::RoaringBitmap;
 use std::collections::HashMap;
 use std::io;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -44,14 +43,15 @@ pub struct CoalesceDaemon {
 }
 
 impl CoalesceDaemon {
-    pub fn new(
-        pool_root: PathBuf,
-        targets: Vec<Vdev>,
-        locations: Arc<ChunkLocationCache>,
-        pins: Arc<PendingDedupPins>,
-    ) -> Self {
-        let gc = GcEngine::new(pool_root, locations, pins);
+    /// `targets` is the online set, ascending by id; its first entry is the
+    /// primary, which is where mark reads from.
+    pub fn new(targets: Vec<Vdev>, locations: Arc<ChunkLocationCache>, pins: Arc<PendingDedupPins>) -> Self {
+        let gc = GcEngine::new_on(targets[0].clone(), locations, pins);
         Self { targets, gc }
+    }
+
+    fn primary_id(&self) -> u16 {
+        self.targets[0].id
     }
 
     /// One idle-cycle pass: mark, find segments below the liveness
@@ -93,7 +93,7 @@ impl CoalesceDaemon {
         for vdev in &targets {
             // The primary's bitmaps come straight out of mark; any other
             // device's are the same hashes at that device's own offsets.
-            let bitmaps = if vdev.id == PRIMARY_VDEV_ID {
+            let bitmaps = if vdev.id == self.primary_id() {
                 live.by_segment.clone()
             } else {
                 live.resolve_on(vdev.id, &persisted_index.read()).map_err(to_io_err)?
@@ -216,7 +216,7 @@ impl CoalesceDaemon {
         // The cache holds the primary's locations and nobody else's
         // (§15.1); a relocation on another device is the index's business
         // alone.
-        if vdev.id == PRIMARY_VDEV_ID {
+        if vdev.id == self.primary_id() {
             for (hash, loc) in &relocations {
                 self.gc_locations().put(*hash, *loc);
             }

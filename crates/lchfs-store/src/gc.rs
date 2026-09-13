@@ -14,7 +14,7 @@
 //! it isn't a parallel concern.
 
 use crate::segment::SegmentReader;
-use crate::{SegmentReaders, StreamKind, dag_walk};
+use crate::{SegmentReaders, StreamKind, Vdev, dag_walk};
 use crate::dag_walk::LiveSet;
 use std::path::Path;
 use lchfs_format::{Hash32, SegmentState};
@@ -36,7 +36,8 @@ const DEFAULT_LIVENESS_THRESHOLD: f64 = 0.5;
 const GRACE_WINDOW_SEGMENTS: usize = 2;
 
 pub struct GcEngine {
-    pool_root: PathBuf,
+    /// The device mark reads from (root and id): the mount's primary.
+    primary: Vdev,
     locations: Arc<ChunkLocationCache>,
     pins: Arc<PendingDedupPins>,
     readers: SegmentReaders,
@@ -60,8 +61,13 @@ impl GcEngine {
     }
 
     pub fn new(pool_root: PathBuf, locations: Arc<ChunkLocationCache>, pins: Arc<PendingDedupPins>) -> Self {
+        Self::new_on(Vdev::new(crate::PRIMARY_VDEV_ID, pool_root), locations, pins)
+    }
+
+    /// `new`, for a mount whose primary is not vdev 0 (§15.8).
+    pub fn new_on(primary: Vdev, locations: Arc<ChunkLocationCache>, pins: Arc<PendingDedupPins>) -> Self {
         Self {
-            pool_root,
+            primary,
             locations,
             pins,
             readers: HashMap::new(),
@@ -90,7 +96,7 @@ impl GcEngine {
         for &root in live_roots {
             if let Err(e) = dag_walk::walk_reachable(
                 root,
-                &self.pool_root,
+                &self.primary,
                 &self.locations,
                 &mut self.readers,
                 &mut live,
@@ -138,7 +144,7 @@ impl GcEngine {
     /// actual space to reclaim) lives; Meta-stream segments are far
     /// smaller and churn differently, not addressed by this pass.
     pub fn sweep_candidates(&self, live_sets: &HashMap<u64, RoaringBitmap>) -> Vec<u64> {
-        self.sweep_candidates_on(&self.pool_root, live_sets)
+        self.sweep_candidates_on(&self.primary.root, live_sets)
     }
 
     /// `sweep_candidates` for an arbitrary vdev root, given that device's

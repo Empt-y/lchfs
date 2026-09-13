@@ -25,7 +25,7 @@
 //! special-casing.
 
 use crate::segment::SegmentReader;
-use crate::{PRIMARY_VDEV_ID, StreamKind, Vdev};
+use crate::{StreamKind, Vdev};
 use lchfs_format::{ExtentLocation, Hash32, SegmentState};
 use lchfs_index::{ChunkLocationCache, IndexStore, RedbIndex};
 use parking_lot::RwLock;
@@ -57,12 +57,18 @@ pub struct DedupScanner {
 }
 
 impl DedupScanner {
+    /// `targets` is the online set, ascending by id; its first entry is the
+    /// primary, whose locations the cache holds.
     pub fn new(targets: Vec<Vdev>, locations: Arc<ChunkLocationCache>) -> Self {
         Self {
             targets,
             locations,
             scanned_up_to: HashMap::new(),
         }
+    }
+
+    fn primary_id(&self) -> u16 {
+        self.targets[0].id
     }
 
     /// Scan newly-sealed Data-stream segments for `content_hash`
@@ -156,7 +162,7 @@ impl DedupScanner {
             // That is the cache for the primary and the index for any
             // other device (§15.1: the cache holds the primary's locations
             // only).
-            let existing = if vdev.id == PRIMARY_VDEV_ID {
+            let existing = if vdev.id == self.primary_id() {
                 self.locations.get(hash)
             } else {
                 persisted_index
@@ -185,7 +191,7 @@ impl DedupScanner {
             // among them, lowest `(segment_id, offset)` keeps the choice
             // deterministic.
             let canonical = existing.filter(|e| locs.contains(e)).unwrap_or(locs[0]);
-            if vdev.id == PRIMARY_VDEV_ID {
+            if vdev.id == self.primary_id() {
                 self.locations.put(hash, canonical);
             }
             {

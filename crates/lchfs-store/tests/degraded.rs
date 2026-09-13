@@ -133,13 +133,53 @@ fn a_short_list_is_still_refused_unless_degraded_is_asked_for() {
     assert!(Pool::open_degraded(&[a.path()]).is_ok());
 }
 
+/// Vdev 0 is only the primary because it is the lowest slot. Without it,
+/// the next device up takes the role: it rebuilds an index of its own,
+/// serves reads, takes writes, and when vdev 0 comes back it is the one
+/// that is stale and gets resilvered.
 #[test]
-fn a_degraded_mount_without_the_primary_is_refused() {
+fn a_pool_mounts_without_vdev_0_and_resilvers_it_when_it_returns() {
     let a = tempfile::tempdir().unwrap();
     let b = tempfile::tempdir().unwrap();
-    drop(Pool::create_replicated(&[a.path(), b.path()], small_params()).unwrap());
-    let err = Pool::open_degraded(&[b.path()]).unwrap_err().to_string();
-    assert!(err.contains("vdev 0 is not among the devices given"), "{err}");
+    let before = payload(5);
+    let during = payload(6);
+    {
+        let pool = Pool::create_replicated(&[a.path(), b.path()], small_params()).unwrap();
+        let ino = pool.create_file(1, "before", 0o644).unwrap();
+        pool.write(ino, 0, &before).unwrap();
+        pool.checkpoint().unwrap();
+    }
+    let a_tree_while_away = tree(a.path());
+
+    // vdev 0 is gone. b mounts alone, as primary.
+    {
+        let pool = Pool::open_degraded(&[b.path()]).unwrap();
+        assert_eq!(pool.missing_vdevs(), &[0]);
+        assert_eq!(read_file(&pool, "before", before.len()), before);
+        let ino = pool.create_file(1, "during", 0o644).unwrap();
+        pool.write(ino, 0, &during).unwrap();
+        pool.checkpoint().unwrap();
+        assert!(b.path().join("INDEX.redb").exists(), "the stand-in primary keeps its own index");
+    }
+    assert_eq!(tree(a.path()), a_tree_while_away, "the absent primary must not be written to");
+
+    // vdev 0 returns, stale: its superblock and its index are both behind.
+    {
+        let pool = Pool::open_replicated(&[a.path(), b.path()]).unwrap();
+        let [(0, report)] = pool.mount_resilver() else {
+            panic!("expected vdev 0 to be resilvered, got {:?}", pool.mount_resilver());
+        };
+        assert!(report.missing > 0 && report.healed == report.missing, "{report:?}");
+        assert_eq!(read_file(&pool, "before", before.len()), before);
+        assert_eq!(read_file(&pool, "during", during.len()), during);
+        pool.checkpoint().unwrap();
+    }
+
+    // Everything -- including what was written while it was away -- is
+    // now on vdev 0, which is the primary again.
+    let pool = Pool::open_degraded(&[a.path()]).unwrap();
+    assert_eq!(read_file(&pool, "before", before.len()), before);
+    assert_eq!(read_file(&pool, "during", during.len()), during);
 }
 
 /// Order is derived from the superblocks in a degraded open, so a device
@@ -171,18 +211,25 @@ fn a_foreign_device_is_refused_from_a_degraded_open_too() {
     assert!(err.contains("different pool"), "{err}");
 }
 
-/// The primary holds the index and serves every default read, so a pool
-/// whose *primary* fell behind cannot be mounted honestly yet: the newer
-/// root lives on a device nothing would read from. Refuse, and say so.
+/// A primary whose superblock trails another device's is simply a stale
+/// member: the newest superblock in the set is the truth, and the primary
+/// is resilvered at mount like anyone else.
 #[test]
-fn a_primary_behind_another_device_is_refused_with_a_reason() {
+fn a_primary_behind_another_device_is_resilvered_not_refused() {
     let a = tempfile::tempdir().unwrap();
     let b = tempfile::tempdir().unwrap();
-    drop(Pool::create_replicated(&[a.path(), b.path()], small_params()).unwrap());
+    let data = payload(7);
+    let ino = {
+        let pool = Pool::create_replicated(&[a.path(), b.path()], small_params()).unwrap();
+        let ino = pool.create_file(1, "f", 0o644).unwrap();
+        pool.write(ino, 0, &data).unwrap();
+        pool.checkpoint().unwrap();
+        ino
+    };
     let a_ring_at_creation = std::fs::read(a.path().join("SUPERBLOCK")).unwrap();
 
     // Advance both devices, then roll only the primary's ring back. a now
-    // says vdev 0 at the creation generation; b says vdev 1, two ahead.
+    // says vdev 0 at the creation generation; b says vdev 1, ahead.
     {
         let pool = Pool::open_replicated(&[a.path(), b.path()]).unwrap();
         pool.checkpoint().unwrap();
@@ -190,7 +237,12 @@ fn a_primary_behind_another_device_is_refused_with_a_reason() {
     }
     std::fs::write(a.path().join("SUPERBLOCK"), &a_ring_at_creation).unwrap();
 
-    let err = Pool::open_replicated(&[a.path(), b.path()]).unwrap_err().to_string();
-    assert!(err.contains("cannot mount from a stale primary"), "{err}");
-    assert!(err.contains("vdev 1"), "should name the device that is ahead: {err}");
+    let pool = Pool::open_replicated(&[a.path(), b.path()]).unwrap();
+    assert_eq!(pool.mount_resilver().len(), 1, "{:?}", pool.mount_resilver());
+    assert_eq!(pool.mount_resilver()[0].0, 0);
+    assert_eq!(pool.read(ino, 0, data.len() as u32).unwrap(), data);
+    pool.checkpoint().unwrap();
+    drop(pool);
+    let pool = Pool::open_replicated(&[a.path(), b.path()]).unwrap();
+    assert!(pool.mount_resilver().is_empty(), "a should be current again");
 }

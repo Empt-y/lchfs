@@ -155,3 +155,33 @@ fn an_interrupted_attach_is_finished_by_running_it_again() {
     let pool = Pool::open_replicated(&[a.path(), b.path()]).unwrap();
     assert_eq!(read_file(&pool, "f", data.len()), data);
 }
+
+/// Losing the primary is no different from losing any other device now:
+/// the blank replacement takes slot 0, becomes the primary again by virtue
+/// of being the lowest slot, and is filled from the survivor.
+#[test]
+fn a_dead_primary_is_replaced_the_same_way() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let a2 = tempfile::tempdir().unwrap();
+    let data = payload(8);
+    {
+        let pool = Pool::create_replicated(&[a.path(), b.path()], small_params()).unwrap();
+        let ino = pool.create_file(1, "f", 0o644).unwrap();
+        pool.write(ino, 0, &data).unwrap();
+        pool.checkpoint().unwrap();
+    }
+    assert_eq!(Pool::attach_vdev(&[b.path()], a2.path()).unwrap(), 0);
+
+    let pool = Pool::open_replicated(&[a2.path(), b.path()]).unwrap();
+    assert_eq!(pool.mount_resilver().len(), 1);
+    assert_eq!(pool.mount_resilver()[0].0, 0);
+    assert_eq!(read_file(&pool, "f", data.len()), data);
+    assert!(a2.path().join("INDEX.redb").exists(), "the new primary built its own index");
+    pool.checkpoint().unwrap();
+    drop(pool);
+
+    // And it can now carry the pool alone.
+    let pool = Pool::open_degraded(&[a2.path()]).unwrap();
+    assert_eq!(read_file(&pool, "f", data.len()), data);
+}

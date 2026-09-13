@@ -234,11 +234,10 @@ fn index_path(pool_root: &Path) -> PathBuf {
     pool_root.join("INDEX.redb")
 }
 
-/// The vdev whose copy of everything is read by default. It holds the
-/// pool's `INDEX.redb` (ARCHITECTURE.md §15.10), `ChunkLocationCache`'s
-/// entries are *its* locations, and the mount path, GC mark and the
-/// coalesce/dedup daemons all read from it. Read failover (§15.2) is what
-/// consults the other vdevs, and only when this one fails.
+/// The slot a brand-new pool's first device gets, and the primary of any
+/// mount that has it. See `PoolShared::primary_id` for what "primary"
+/// means at runtime -- it is the lowest *online* vdev, which is this one
+/// whenever vdev 0 is present.
 pub(crate) const PRIMARY_VDEV_ID: u16 = 0;
 
 /// Open readers keyed by `(vdev_id, segment_id, stream)`. A segment_id is
@@ -409,6 +408,14 @@ struct PoolShared {
     pool_uuid: [u8; 16],
     vdev_id: u16,
     vdev_count: u16,
+    /// The vdev whose copy of everything is read by default: the lowest
+    /// online slot, `vdevs[0].id`. It holds the pool's `INDEX.redb`
+    /// (ARCHITECTURE.md §15.10), `ChunkLocationCache`'s entries are *its*
+    /// locations, and GC mark and the coalesce/dedup daemons read from it.
+    /// Read failover (§15.2) consults the others only when it fails. Vdev 0
+    /// whenever vdev 0 is present; when a mount runs without it (§15.8),
+    /// the next device up takes the role, rebuilding an index of its own.
+    primary_id: u16,
     /// Every vdev *online* in this mount, ascending by `Vdev::id`
     /// (ARCHITECTURE.md §15.10). `vdevs[0]` is always vdev 0, whose root is
     /// `pool_root`. In a degraded mount (§15.8) this is shorter than
@@ -622,6 +629,7 @@ impl Pool {
             pool_uuid: lchfs_format::generate_pool_uuid()?,
             vdev_id: 0,
             vdev_count: vdevs.len() as u16,
+            primary_id: PRIMARY_VDEV_ID,
             vdevs,
             superblock_backends,
             missing_vdevs: Vec::new(),
@@ -645,7 +653,6 @@ impl Pool {
             shard_delta_logs,
             checkpoint_lock: Mutex::new(()),
             coalesce: Mutex::new(coalesce::CoalesceDaemon::new(
-                pool_root.to_path_buf(),
                 daemon_targets.clone(),
                 Arc::clone(&dedup_index),
                 Arc::clone(&dedup_pins),
@@ -701,10 +708,11 @@ impl Pool {
     /// primary's and resilvers them before the pool starts serving.
     ///
     /// Devices may be given in any order -- each one's superblock says
-    /// which slot it occupies -- but vdev 0 must be among them. It holds
-    /// `INDEX.redb` (§15.10) and is where every default read goes; mounting
-    /// without it would mean electing a new primary and rebuilding the
-    /// index onto it, which this does not yet do.
+    /// which slot it occupies. Vdev 0 need not be among them: the lowest
+    /// device present becomes the primary for the mount, rebuilding an
+    /// index of its own from every device it can see. When vdev 0 returns
+    /// it is stale, and the next full mount rebuilds its index and
+    /// resilvers it like any other member that missed writes.
     pub fn open_degraded(vdev_roots: &[&Path]) -> Result<Self, PoolError> {
         Self::open_set(vdev_roots, true)
     }
@@ -809,7 +817,16 @@ impl Pool {
             .map(|(s, r)| Vdev::new(s.vdev_id, r.to_path_buf()))
             .collect();
         let vdev_root_paths: Vec<PathBuf> = vdevs.iter().map(|v| v.root.clone()).collect();
-        let slot = members[0].0;
+        let primary_id = vdevs[0].id;
+        // §15.5: the newest superblock in the set is the truth, whichever
+        // device holds it. The primary's own may be behind -- it missed
+        // writes while it was away -- in which case its index is stale
+        // too, and the slow path below rebuilds one from every device.
+        let slot = members
+            .iter()
+            .map(|(s, _)| *s)
+            .max_by_key(|s| s.generation)
+            .expect("at least one member");
 
         let index_file = index_path(pool_root);
         let fresh_index = index_file
@@ -821,14 +838,31 @@ impl Pool {
 
         let (mut readers, mut locations, max_segment_id, persisted_index, took_fast_path) =
             if let Some(index) = fresh_index {
-                let (readers, max_segment_id) = open_all_segment_readers(pool_root)?;
+                let (readers, max_segment_id) = open_all_segment_readers(pool_root, primary_id)?;
                 let locations: HashMap<Hash32, ExtentLocation> =
                     index.iter_chunk_locations()?.into_iter().collect();
                 (readers, locations, max_segment_id, index, true)
             } else {
                 let mut readers = HashMap::new();
                 let mut locations = HashMap::new();
-                let max_segment_id = scan_segments(pool_root, &mut readers, &mut locations)?;
+                let max_segment_id =
+                    scan_segments(pool_root, primary_id, &mut readers, &mut locations)?;
+                // A record the primary lacks -- because it was away when
+                // the record was written -- is still needed to mount: the
+                // root, the InoMap, an inode. Every other device's scan
+                // fills in what the primary's scan did not have, and
+                // `mount_read` finds the right device for a location that
+                // is not the primary's.
+                for vdev in &vdevs[1..] {
+                    let (others, _) = open_all_segment_readers(&vdev.root, vdev.id)?;
+                    let mut theirs = HashMap::new();
+                    for (&(_, segment_id, _), reader) in &others {
+                        scan_one_segment(reader, segment_id, &mut theirs)?;
+                    }
+                    for (hash, loc) in theirs {
+                        locations.entry(hash).or_insert(loc);
+                    }
+                }
                 let index = rebuild_index(&index_file, &locations, &vdevs, slot.generation)?;
                 // The slow path's full scan already covers every segment
                 // unconditionally, so it has no analog of the fast path's
@@ -1094,6 +1128,7 @@ impl Pool {
             pool_uuid: slot.pool_uuid,
             vdev_id: slot.vdev_id,
             vdev_count: slot.vdev_count,
+            primary_id,
             vdevs,
             superblock_backends,
             missing_vdevs,
@@ -1117,7 +1152,6 @@ impl Pool {
             shard_delta_logs,
             checkpoint_lock: Mutex::new(()),
             coalesce: Mutex::new(coalesce::CoalesceDaemon::new(
-                pool_root.to_path_buf(),
                 daemon_targets.clone(),
                 Arc::clone(&dedup_index),
                 Arc::clone(&dedup_pins),
@@ -1941,7 +1975,7 @@ impl PoolShared {
             let reader = get_reader(
                 &mut readers,
                 &self.pool_root,
-                PRIMARY_VDEV_ID,
+                self.primary_id,
                 preferred.segment_id,
                 kind,
             );
@@ -1954,13 +1988,14 @@ impl PoolShared {
             return Err(primary_err);
         }
         tracing::warn!(
-            "{what} {hash:?} unreadable on vdev {PRIMARY_VDEV_ID} ({primary_err}); trying other replicas"
+            "{what} {hash:?} unreadable on vdev {} ({primary_err}); trying other replicas",
+            self.primary_id
         );
 
         let replicas = self.persisted_index.read().chunk_locations(hash)?;
-        let mut failed = vec![PRIMARY_VDEV_ID];
+        let mut failed = vec![self.primary_id];
         for (vdev_id, loc) in replicas {
-            if vdev_id == PRIMARY_VDEV_ID {
+            if vdev_id == self.primary_id || !self.is_online(vdev_id) {
                 continue;
             }
             match self.read_raw_from_vdev(vdev_id, loc, kind) {
@@ -2000,6 +2035,10 @@ impl PoolShared {
         let mut readers = self.readers.lock();
         let reader = get_reader(&mut readers, root, vdev_id, loc.segment_id, kind)?;
         Ok(reader.read_record_raw(loc)?)
+    }
+
+    fn is_online(&self, vdev_id: u16) -> bool {
+        self.vdevs.iter().any(|v| v.id == vdev_id)
     }
 
     fn vdev_root(&self, vdev_id: u16) -> Result<&Path, PoolError> {
@@ -2107,7 +2146,7 @@ impl PoolShared {
             index.flush()?;
         }
         for &(vdev_id, _, hash, loc) in healed {
-            if vdev_id == PRIMARY_VDEV_ID {
+            if vdev_id == self.primary_id {
                 self.dedup_index.put(hash, loc);
             }
         }
@@ -2246,7 +2285,7 @@ impl PoolShared {
             &live
         }];
         for candidates in attempts {
-            for &(src, loc) in candidates.iter().filter(|(v, _)| *v != target) {
+            for &(src, loc) in candidates.iter().filter(|(v, _)| *v != target && self.is_online(*v)) {
                 let Some(kind) = self.stream_kind_of(src, loc.segment_id) else { continue };
                 let Ok((header, raw)) = self.read_raw_from_vdev(src, loc, kind) else { continue };
                 let new_loc = self.heal_append(target, kind, &header, &raw)?;
@@ -4054,7 +4093,7 @@ fn highest_segment_id_on(vdev_root: &Path) -> Result<u64, PoolError> {
 /// `Pool::open`'s fast mount path, which needs the readers and the next
 /// segment_id to allocate but not a record-by-record rebuild of
 /// `locations` when the persisted index already has it.
-fn open_all_segment_readers(pool_root: &Path) -> Result<(SegmentReaders, u64), PoolError> {
+fn open_all_segment_readers(pool_root: &Path, vdev_id: u16) -> Result<(SegmentReaders, u64), PoolError> {
     let mut readers = HashMap::new();
     let mut max_segment_id = 0u64;
     for kind in [StreamKind::Data, StreamKind::Meta] {
@@ -4082,7 +4121,7 @@ fn open_all_segment_readers(pool_root: &Path) -> Result<(SegmentReaders, u64), P
             };
             max_segment_id = max_segment_id.max(segment_id);
             let reader = SegmentReader::open(pool_root, segment_id, kind)?;
-            readers.insert((PRIMARY_VDEV_ID, segment_id, kind), reader);
+            readers.insert((vdev_id, segment_id, kind), reader);
         }
     }
     Ok((readers, max_segment_id))
@@ -4090,10 +4129,11 @@ fn open_all_segment_readers(pool_root: &Path) -> Result<(SegmentReaders, u64), P
 
 fn scan_segments(
     pool_root: &Path,
+    vdev_id: u16,
     readers: &mut SegmentReaders,
     locations: &mut HashMap<Hash32, ExtentLocation>,
 ) -> Result<u64, PoolError> {
-    let (opened, max_segment_id) = open_all_segment_readers(pool_root)?;
+    let (opened, max_segment_id) = open_all_segment_readers(pool_root, vdev_id)?;
     for (&(_vdev, segment_id, _kind), reader) in &opened {
         scan_one_segment(reader, segment_id, locations)?;
     }
@@ -4120,18 +4160,14 @@ fn rebuild_index(
             RedbIndex::create(index_file)?
         }
     };
-    // The primary's scan is already in hand; every other device gets its
-    // own, because its copies sit at its own offsets and an index that
-    // knew only the primary's would leave read failover with nothing to
-    // fail over to (§15.1).
+    // Every device gets its own scan, because its copies sit at its own
+    // offsets and an index that knew only the primary's would leave read
+    // failover with nothing to fail over to (§15.1). `primary_locations`
+    // is a merged map the mount path also uses, so it is not trusted as
+    // any one device's view here.
+    let _ = primary_locations;
     for vdev in vdevs {
-        if vdev.id == PRIMARY_VDEV_ID {
-            for (&hash, &loc) in primary_locations {
-                index.put_chunk_location(hash, vdev.id, loc)?;
-            }
-            continue;
-        }
-        let (readers, _) = open_all_segment_readers(&vdev.root)?;
+        let (readers, _) = open_all_segment_readers(&vdev.root, vdev.id)?;
         let mut locations = HashMap::new();
         for (&(_, segment_id, _), reader) in &readers {
             scan_one_segment(reader, segment_id, &mut locations)?;
@@ -4223,9 +4259,8 @@ struct Membership<'a> {
 
 /// Reads every superblock and judges membership on what the devices say
 /// about themselves, not on the order they were named in: same
-/// `pool_uuid`, same `vdev_count`, distinct `vdev_id`s, vdev 0 present and
-/// holding the newest generation. With `allow_missing` false the set must
-/// also be complete and given in `vdev_id` order.
+/// `pool_uuid`, same `vdev_count`, distinct `vdev_id`s. With `allow_missing`
+/// false the set must also be complete and given in `vdev_id` order.
 fn check_membership<'a>(given_roots: &[&'a Path], allow_missing: bool) -> Result<Membership<'a>, PoolError> {
     if given_roots.is_empty() {
         return Err(PoolError::InvalidArgument(
@@ -4293,33 +4328,15 @@ fn check_membership<'a>(given_roots: &[&'a Path], allow_missing: bool) -> Result
             )));
         }
     }
-    if members[0].0.vdev_id != PRIMARY_VDEV_ID {
-        return Err(PoolError::Format(format!(
-            "vdev {PRIMARY_VDEV_ID} is not among the devices given — it holds the index and cannot be absent yet"
-        )));
-    }
     let present: HashSet<u16> = members.iter().map(|(s, _)| s.vdev_id).collect();
     let missing_vdevs: Vec<u16> = (0..vdev_count).filter(|id| !present.contains(id)).collect();
 
-    // §15.5: the highest generation across the set is the truth. The
-    // primary must hold it, because the index and every default read live
-    // there; a primary that is *behind* another device would need that
-    // device promoted, which is not done yet. Refusing is the honest
-    // answer -- mounting would serve an old root while newer data sits on
-    // the other device, unreachable.
+    // §15.5: the highest generation across the set is the truth, and any
+    // member behind it -- the primary included -- missed writes and gets
+    // resilvered at mount. Nothing about the primary role requires it to
+    // be current: it holds the index, and a stale index is rebuilt from
+    // every device before anything reads through it.
     let newest = members.iter().map(|(s, _)| s.generation).max().unwrap_or(0);
-    if members[0].0.generation < newest {
-        let ahead: Vec<String> = members
-            .iter()
-            .filter(|(s, _)| s.generation == newest)
-            .map(|(s, r)| format!("vdev {} at {}", s.vdev_id, r.display()))
-            .collect();
-        return Err(PoolError::Format(format!(
-            "vdev 0 is at generation {} but {} at generation {newest}: cannot mount from a stale primary",
-            members[0].0.generation,
-            ahead.join(", ")
-        )));
-    }
     let stale_vdevs: Vec<u16> = members
         .iter()
         .filter(|(s, _)| s.generation < newest)

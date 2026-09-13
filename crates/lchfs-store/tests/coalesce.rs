@@ -221,7 +221,6 @@ fn generation_change_mid_pass_blocks_deletion_even_without_a_pin() {
     let next_segment_id = AtomicU64::new(1_000_000);
 
     let mut daemon = CoalesceDaemon::new(
-        dir.path().to_path_buf(),
         vec![lchfs_store::Vdev::new(0, dir.path().to_path_buf())],
         Arc::clone(&locations),
         Arc::new(PendingDedupPins::new()),
