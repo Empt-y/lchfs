@@ -17,18 +17,26 @@ enum Command {
     CreatePool { path: PathBuf },
     /// Mount a pool at the given mountpoint via FUSE3.
     Mount {
-        /// vdev 0's root.
+        /// Any one of the pool's devices (vdev 0 unless --scan is given).
         pool: PathBuf,
         mountpoint: PathBuf,
         /// The pool's other vdev roots (ARCHITECTURE.md §15.10). A
         /// replicated pool must be given every device unless --degraded.
         #[arg(long = "vdev")]
         vdevs: Vec<PathBuf>,
+        /// Find the pool's other devices under these directories instead
+        /// of naming them: each directory and its immediate children are
+        /// checked for a superblock carrying <POOL>'s uuid.
+        #[arg(long = "scan")]
+        scan: Vec<PathBuf>,
         /// Mount with devices absent (ARCHITECTURE.md §15.8). Explicit on
         /// purpose: running one device down should be a decision.
         #[arg(long)]
         degraded: bool,
     },
+    /// List the pools whose devices can be found under the given
+    /// directories, with which slots are present and which are missing.
+    Discover { dirs: Vec<PathBuf> },
     /// Walk the DAG and verify integrity (ARCHITECTURE.md §10).
     Fsck {
         /// vdev 0's root.
@@ -38,6 +46,10 @@ enum Command {
         /// says which slot it is.
         #[arg(long = "vdev")]
         vdevs: Vec<PathBuf>,
+        /// Find the pool's other devices under these directories instead
+        /// of naming them; the pool is the one `<POOL>` belongs to.
+        #[arg(long = "scan")]
+        scan: Vec<PathBuf>,
         #[arg(long)]
         verify_index: bool,
         #[arg(long)]
@@ -86,10 +98,25 @@ pub fn run() -> anyhow::Result<()> {
 
     match cli.command {
         Command::CreatePool { path } => create_pool(&path),
-        Command::Mount { pool, mountpoint, vdevs, degraded } => {
-            mount(&pool, &vdevs, degraded, &mountpoint)
+        Command::Mount { pool, mountpoint, vdevs, scan, degraded } => {
+            mount(&pool, &vdevs, &scan, degraded, &mountpoint)
         }
-        Command::Fsck { pool, vdevs, verify_index, rebuild_index } => {
+        Command::Discover { dirs } => discover(&dirs),
+        Command::Fsck { pool, vdevs, scan, verify_index, rebuild_index } => {
+            let mut vdevs = vdevs;
+            if !scan.is_empty() {
+                let uuid = lchfs_fsck::read_superblock(&pool)?.pool_uuid;
+                let candidates: Vec<&std::path::Path> = scan.iter().map(|p| p.as_path()).collect();
+                let found = lchfs_store::Pool::discover(&candidates, Some(uuid))?;
+                let pool_abs = std::fs::canonicalize(&pool).unwrap_or(pool.clone());
+                for p in &found.pools {
+                    for (_, _, root) in &p.members {
+                        if std::fs::canonicalize(root).unwrap_or(root.clone()) != pool_abs {
+                            vdevs.push(root.clone());
+                        }
+                    }
+                }
+            }
             fsck(&pool, &vdevs, verify_index, rebuild_index)
         }
         Command::AttachVdev { pool, vdevs, new_device } => {
@@ -115,22 +142,59 @@ pub fn run() -> anyhow::Result<()> {
 }
 
 fn create_pool(path: &std::path::Path) -> anyhow::Result<()> {
-    lchfs_store::Pool::create(path, lchfs_format::PoolParams::default())?;
+    let pool = lchfs_store::Pool::create(path, lchfs_format::PoolParams::default())?;
+    println!("pool {} created at {}", lchfs_format::pool_uuid_hex(&pool.pool_uuid()), path.display());
+    Ok(())
+}
+
+fn discover(dirs: &[PathBuf]) -> anyhow::Result<()> {
+    let candidates: Vec<&std::path::Path> = dirs.iter().map(|p| p.as_path()).collect();
+    let found = lchfs_store::Pool::discover(&candidates, None)?;
+    if found.pools.is_empty() {
+        println!("No pool devices found.");
+        return Ok(());
+    }
+    for pool in &found.pools {
+        println!(
+            "pool {}: {} slot(s){}",
+            lchfs_format::pool_uuid_hex(&pool.uuid),
+            pool.count,
+            if pool.missing.is_empty() {
+                String::new()
+            } else {
+                format!(", missing {:?}", pool.missing)
+            }
+        );
+        for (id, generation, root) in &pool.members {
+            println!("  vdev {id}  generation {generation}  {}", root.display());
+        }
+    }
     Ok(())
 }
 
 fn mount(
     pool: &std::path::Path,
     other_vdevs: &[PathBuf],
+    scan: &[PathBuf],
     degraded: bool,
     mountpoint: &std::path::Path,
 ) -> anyhow::Result<()> {
-    let mut roots: Vec<&std::path::Path> = vec![pool];
-    roots.extend(other_vdevs.iter().map(|p| p.as_path()));
-    let pool = if degraded {
-        lchfs_store::Pool::open_degraded(&roots)?
+    let pool = if !scan.is_empty() {
+        if !other_vdevs.is_empty() {
+            anyhow::bail!("--scan finds the other devices; do not also name them with --vdev");
+        }
+        let uuid = lchfs_fsck::read_superblock(pool)?.pool_uuid;
+        let mut candidates: Vec<&std::path::Path> = vec![pool];
+        candidates.extend(scan.iter().map(|p| p.as_path()));
+        lchfs_store::Pool::open_discovered(&candidates, Some(uuid), degraded)?
     } else {
-        lchfs_store::Pool::open_replicated(&roots)?
+        let mut roots: Vec<&std::path::Path> = vec![pool];
+        roots.extend(other_vdevs.iter().map(|p| p.as_path()));
+        if degraded {
+            lchfs_store::Pool::open_degraded(&roots)?
+        } else {
+            lchfs_store::Pool::open_replicated(&roots)?
+        }
     };
     if pool.is_degraded() {
         eprintln!("WARNING: mounted degraded; vdevs {:?} are absent", pool.missing_vdevs());
@@ -262,6 +326,8 @@ fn stats(pool: &std::path::Path) -> anyhow::Result<()> {
     use lchfs_index::IndexStore;
 
     let slot = lchfs_fsck::read_superblock(pool)?;
+    println!("pool_uuid: {}", lchfs_format::pool_uuid_hex(&slot.pool_uuid));
+    println!("vdev: {} of {}", slot.vdev_id, slot.vdev_count);
     println!("generation: {}", slot.generation);
     println!("root_hash: {:?}", slot.root_hash);
     // SuperblockStats is denormalized/informational only (never used for

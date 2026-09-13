@@ -134,3 +134,36 @@ pub fn generate_pool_uuid() -> std::io::Result<[u8; 16]> {
     std::fs::File::open("/dev/urandom")?.read_exact(&mut buf)?;
     Ok(buf)
 }
+
+/// A pool uuid as 32 lowercase hex digits -- how the CLI shows it and
+/// how `--pool` takes it.
+pub fn pool_uuid_hex(uuid: &[u8; 16]) -> String {
+    let mut out = String::with_capacity(32);
+    for b in uuid {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+/// The inverse of `pool_uuid_hex`. Accepts upper or lower case and
+/// ignores dashes, so a uuid pasted in canonical 8-4-4-4-12 form works.
+pub fn parse_pool_uuid(text: &str) -> Option<[u8; 16]> {
+    let digits: Vec<u8> = text
+        .bytes()
+        .filter(|b| *b != b'-')
+        .map(|b| match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        })
+        .collect::<Option<Vec<u8>>>()?;
+    if digits.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for (i, pair) in digits.chunks(2).enumerate() {
+        out[i] = (pair[0] << 4) | pair[1];
+    }
+    Some(out)
+}

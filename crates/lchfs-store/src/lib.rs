@@ -261,6 +261,23 @@ pub(crate) const INDEX_PAGE: usize = 8192;
 /// resilvering a large device take as long as writing it record by record.
 const HEAL_BATCH: usize = 256;
 
+/// What `Pool::discover` found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Discovered {
+    pub pools: Vec<DiscoveredPool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredPool {
+    pub uuid: [u8; 16],
+    /// The highest `vdev_count` any member claims (see `check_membership`
+    /// for why the highest wins).
+    pub count: u16,
+    /// `(vdev_id, generation, root)`, ascending by id.
+    pub members: Vec<(u16, u64, PathBuf)>,
+    pub missing: Vec<u16>,
+}
+
 /// What a resilver found and did. `examined` counts distinct hashes, the
 /// rest count replicas on the resilvered vdev.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -893,6 +910,117 @@ impl Pool {
         Ok(leaving)
     }
 
+    /// Finds pool devices under `candidates` (ARCHITECTURE.md §15.10's
+    /// open item: where the device list lives). Each candidate, and each
+    /// immediate child of it, is a device if it holds a readable
+    /// superblock; devices are grouped by `pool_uuid`, which is what the
+    /// identity field was put there for. `uuid` narrows the result to one
+    /// pool. Nothing is created by looking, and nothing that is not a
+    /// superblock is read.
+    pub fn discover(candidates: &[&Path], uuid: Option<[u8; 16]>) -> Result<Discovered, PoolError> {
+        let mut found: Vec<([u8; 16], u16, u16, u64, PathBuf)> = Vec::new();
+        // A device can be reached more than once -- named directly and as
+        // a child of a directory also named -- and must count once.
+        let mut seen: HashSet<PathBuf> = HashSet::new();
+        let mut probe = |dir: &Path| -> Result<(), PoolError> {
+            if !backend::superblock_path(dir).exists() {
+                return Ok(());
+            }
+            let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+            if !seen.insert(canonical) {
+                return Ok(());
+            }
+            let backend = FileBackend::open(dir)?;
+            match read_superblock(&backend) {
+                Ok(Some(slot)) => found.push((
+                    slot.pool_uuid,
+                    slot.vdev_id,
+                    slot.vdev_count,
+                    slot.generation,
+                    dir.to_path_buf(),
+                )),
+                Ok(None) => {}
+                Err(e) => tracing::warn!("discover: {} has a superblock file this build cannot read: {e}", dir.display()),
+            }
+            Ok(())
+        };
+        for candidate in candidates {
+            probe(candidate)?;
+            if let Ok(children) = std::fs::read_dir(candidate) {
+                let mut dirs: Vec<PathBuf> = children
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.is_dir())
+                    .collect();
+                dirs.sort();
+                for dir in dirs {
+                    probe(&dir)?;
+                }
+            }
+        }
+        found.sort_by_key(|(u, id, _, _, _)| (*u, *id));
+
+        let mut pools: Vec<DiscoveredPool> = Vec::new();
+        for (u, id, count, generation, path) in found {
+            if uuid.is_some_and(|want| want != u) {
+                continue;
+            }
+            match pools.last_mut() {
+                Some(p) if p.uuid == u => {
+                    p.count = p.count.max(count);
+                    p.members.push((id, generation, path));
+                }
+                _ => pools.push(DiscoveredPool {
+                    uuid: u,
+                    count,
+                    members: vec![(id, generation, path)],
+                    missing: Vec::new(),
+                }),
+            }
+        }
+        for pool in &mut pools {
+            let present: HashSet<u16> = pool.members.iter().map(|(id, _, _)| *id).collect();
+            pool.missing = (0..pool.count).filter(|id| !present.contains(id)).collect();
+        }
+        Ok(Discovered { pools })
+    }
+
+    /// `discover` followed by the right open. With several pools found and
+    /// no `uuid`, refuses rather than guessing.
+    pub fn open_discovered(
+        candidates: &[&Path],
+        uuid: Option<[u8; 16]>,
+        allow_degraded: bool,
+    ) -> Result<Self, PoolError> {
+        let discovered = Self::discover(candidates, uuid)?;
+        let pool = match discovered.pools.as_slice() {
+            [] => {
+                return Err(PoolError::NotFound("no pool devices found under the given paths".into()));
+            }
+            [one] => one,
+            many => {
+                let uuids: Vec<String> = many.iter().map(|p| lchfs_format::pool_uuid_hex(&p.uuid)).collect();
+                return Err(PoolError::InvalidArgument(format!(
+                    "{} pools found ({}); pass the uuid of the one to open",
+                    many.len(),
+                    uuids.join(", ")
+                )));
+            }
+        };
+        let roots: Vec<&Path> = pool.members.iter().map(|(_, _, p)| p.as_path()).collect();
+        if pool.missing.is_empty() {
+            Self::open_replicated(&roots)
+        } else if allow_degraded {
+            Self::open_degraded(&roots)
+        } else {
+            Err(PoolError::Format(format!(
+                "pool {} is missing vdevs {:?}; mount degraded to proceed without them",
+                lchfs_format::pool_uuid_hex(&pool.uuid),
+                pool.missing
+            )))
+        }
+    }
+
     fn open_set(given_roots: &[&Path], allow_missing: bool) -> Result<Self, PoolError> {
         let Membership {
             members,
@@ -1346,6 +1474,12 @@ impl Pool {
     /// One entry per slot: online, catching up, faulted or absent.
     pub fn vdev_status(&self) -> Vec<vdevs::VdevStatus> {
         self.0.vdevs.status()
+    }
+
+    /// The identity every device of this pool carries (ARCHITECTURE.md
+    /// §15.6), and what `discover` groups devices by.
+    pub fn pool_uuid(&self) -> [u8; 16] {
+        self.0.pool_uuid
     }
 
     /// The slot serving as this mount's primary (ARCHITECTURE.md §15.10).
