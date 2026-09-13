@@ -607,3 +607,145 @@ impl SegmentReader {
         Some((header, next_offset))
     }
 }
+
+/// How a sequential scan of a segment ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanEnd {
+    /// The sealed segment's footer was reached: a clean end.
+    Footer,
+    /// End of file with no footer: an open (still being written) segment,
+    /// or one whose seal never landed. Also clean, as far as scanning goes.
+    Eof,
+    /// Nothing parseable from `at` to the end of the file.
+    Damaged { at: u32 },
+}
+
+/// A sequential walk over a segment's records that survives damage in the
+/// middle. `scan_next` stops at the first unparseable header, which is the
+/// right thing for a torn tail after a crash and the wrong thing for a run
+/// of rotted bytes with perfectly good records behind it -- a scan that
+/// stopped there would report every later record as missing from a device
+/// that still has them. On a failed header this checks whether the bytes
+/// are the footer (clean end) or EOF (open segment), and otherwise searches
+/// forward for the next header whose magic and checksum both hold, noting
+/// the range it skipped. Healthy segments never pay for any of this: the
+/// resync only runs once a header has already failed to parse.
+pub struct Scan<'a> {
+    reader: &'a SegmentReader,
+    offset: u32,
+    len: u64,
+    /// Byte ranges `[from, to)` that held nothing parseable and were
+    /// skipped. Empty for an undamaged segment.
+    pub damaged: Vec<(u32, u32)>,
+    pub end: Option<ScanEnd>,
+}
+
+impl SegmentReader {
+    /// Iterates every record `(header, offset)` from the first record page
+    /// on, resyncing past damage. See [`Scan`].
+    pub fn scan(&self) -> Scan<'_> {
+        Scan {
+            reader: self,
+            offset: SEGMENT_HEADER_PAGE_SIZE as u32,
+            len: self.file.metadata().map(|m| m.len()).unwrap_or(0),
+            damaged: Vec::new(),
+            end: None,
+        }
+    }
+
+    /// Whether `offset` holds the sealed segment's footer.
+    fn footer_at(&self, offset: u32) -> bool {
+        let mut len_buf = [0u8; 4];
+        if self.file.read_exact_at(&mut len_buf, offset as u64).is_err() {
+            return false;
+        }
+        let len = u32::from_le_bytes(len_buf) as usize;
+        if len == 0 || len > 4096 {
+            return false;
+        }
+        let mut buf = vec![0u8; len];
+        if self.file.read_exact_at(&mut buf, offset as u64 + 4).is_err() {
+            return false;
+        }
+        match lchfs_format::decode::<SegmentFooter>(&buf) {
+            Ok(footer) => {
+                lchfs_format::compute_segment_footer_checksum(&footer) == footer.footer_checksum
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// The next offset at or after `from + 1` where a record header parses
+    /// with its magic and checksum intact, together with that header and
+    /// the offset after the record. The magic sits four bytes into a record
+    /// (after the header length prefix), so candidates are found by looking
+    /// for it and only then paying for a full parse.
+    fn resync(&self, from: u32, file_len: u64) -> Option<(ExtentRecordHeader, u32, u32)> {
+        let start = from as u64 + 1;
+        if start + 8 > file_len {
+            return None;
+        }
+        let mut buf = vec![0u8; (file_len - start) as usize];
+        self.file.read_exact_at(&mut buf, start).ok()?;
+        let magic = lchfs_format::EXTENT_RECORD_MAGIC.to_le_bytes();
+        let mut i = 0usize;
+        while i + 8 <= buf.len() {
+            if buf[i + 4..i + 8] == magic
+                && let Some((header, _consumed)) = parse_record_header(&buf[i..])
+                && header.record_len != 0
+                && header.record_len as u64 <= 512 * 1024 * 1024
+                && start + i as u64 + header.record_len as u64 <= file_len
+            {
+                let at = (start + i as u64) as u32;
+                let next = at + header.record_len;
+                return Some((header, at, next));
+            }
+            i += 1;
+        }
+        None
+    }
+}
+
+impl Iterator for Scan<'_> {
+    type Item = (ExtentRecordHeader, u32);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.end.is_some() {
+            return None;
+        }
+        if let Some((header, next)) = self.reader.scan_next(self.offset) {
+            if next as u64 > self.len {
+                // The header parsed but the record runs past the end of
+                // the file: a tail torn by a crash mid-append. Nothing can
+                // follow it, so this is a clean end -- registering the
+                // record would only point the index at bytes that cannot
+                // be read.
+                self.end = Some(ScanEnd::Eof);
+                return None;
+            }
+            let at = self.offset;
+            self.offset = next;
+            return Some((header, at));
+        }
+        if self.offset as u64 >= self.len {
+            self.end = Some(ScanEnd::Eof);
+            return None;
+        }
+        if self.reader.footer_at(self.offset) {
+            self.end = Some(ScanEnd::Footer);
+            return None;
+        }
+        match self.reader.resync(self.offset, self.len) {
+            Some((header, at, next)) => {
+                self.damaged.push((self.offset, at));
+                self.offset = next;
+                Some((header, at))
+            }
+            None => {
+                self.damaged.push((self.offset, self.len as u32));
+                self.end = Some(ScanEnd::Damaged { at: self.offset });
+                None
+            }
+        }
+    }
+}

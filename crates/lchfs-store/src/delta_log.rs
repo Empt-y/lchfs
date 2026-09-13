@@ -267,8 +267,7 @@ impl ShardDeltaLog {
                 let Ok(reader) = SegmentReader::open_delta(root, self.shard_id, segment_id) else {
                     continue;
                 };
-                let mut offset = crate::segment::SEGMENT_HEADER_PAGE_SIZE as u32;
-                while let Some((header, next_offset)) = reader.scan_next(offset) {
+                for (header, offset) in reader.scan() {
                     let loc = ExtentLocation {
                         segment_id,
                         offset,
@@ -290,7 +289,6 @@ impl ShardDeltaLog {
                             seen.insert(offset);
                         }
                     }
-                    offset = next_offset;
                 }
             }
         }

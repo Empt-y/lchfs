@@ -16,7 +16,19 @@ enum Command {
     /// Initialize a new pool at the given path.
     CreatePool { path: PathBuf },
     /// Mount a pool at the given mountpoint via FUSE3.
-    Mount { pool: PathBuf, mountpoint: PathBuf },
+    Mount {
+        /// vdev 0's root.
+        pool: PathBuf,
+        mountpoint: PathBuf,
+        /// The pool's other vdev roots (ARCHITECTURE.md §15.10). A
+        /// replicated pool must be given every device unless --degraded.
+        #[arg(long = "vdev")]
+        vdevs: Vec<PathBuf>,
+        /// Mount with devices absent (ARCHITECTURE.md §15.8). Explicit on
+        /// purpose: running one device down should be a decision.
+        #[arg(long)]
+        degraded: bool,
+    },
     /// Walk the DAG and verify integrity (ARCHITECTURE.md §10).
     Fsck {
         /// vdev 0's root.
@@ -64,7 +76,9 @@ pub fn run() -> anyhow::Result<()> {
 
     match cli.command {
         Command::CreatePool { path } => create_pool(&path),
-        Command::Mount { pool, mountpoint } => mount(&pool, &mountpoint),
+        Command::Mount { pool, mountpoint, vdevs, degraded } => {
+            mount(&pool, &vdevs, degraded, &mountpoint)
+        }
         Command::Fsck { pool, vdevs, verify_index, rebuild_index } => {
             fsck(&pool, &vdevs, verify_index, rebuild_index)
         }
@@ -88,8 +102,32 @@ fn create_pool(path: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn mount(pool: &std::path::Path, mountpoint: &std::path::Path) -> anyhow::Result<()> {
-    let pool = std::sync::Arc::new(lchfs_store::Pool::open(pool)?);
+fn mount(
+    pool: &std::path::Path,
+    other_vdevs: &[PathBuf],
+    degraded: bool,
+    mountpoint: &std::path::Path,
+) -> anyhow::Result<()> {
+    let mut roots: Vec<&std::path::Path> = vec![pool];
+    roots.extend(other_vdevs.iter().map(|p| p.as_path()));
+    let pool = if degraded {
+        lchfs_store::Pool::open_degraded(&roots)?
+    } else {
+        lchfs_store::Pool::open_replicated(&roots)?
+    };
+    if pool.is_degraded() {
+        eprintln!("WARNING: mounted degraded; vdevs {:?} are absent", pool.missing_vdevs());
+    }
+    for (id, report) in pool.mount_resilver() {
+        eprintln!(
+            "resilvered vdev {id}: {} of {} records were missing, {} healed, {} unrecoverable",
+            report.missing,
+            report.examined,
+            report.healed,
+            report.unrecoverable.len()
+        );
+    }
+    let pool = std::sync::Arc::new(pool);
     let fs = lchfs_fuse::LchfsFilesystem::new(pool);
     // `DefaultPermissions`: the kernel enforces normal read/write/traverse
     // permission checks against each inode's reported mode/uid/gid (lchfs
@@ -158,11 +196,20 @@ fn fsck(
         println!("No errors found.");
         Ok(())
     } else {
-        eprintln!("{} error(s) found:", report.errors.len());
-        for e in &report.errors {
-            eprintln!("  - {e}");
+        // The replica pass scans vdev 0 again, so a damaged region there
+        // would be reported by both passes; one line per finding.
+        let mut seen = std::collections::HashSet::new();
+        let findings: Vec<String> = report
+            .errors
+            .iter()
+            .map(|e| e.to_string())
+            .filter(|line| seen.insert(line.clone()))
+            .collect();
+        eprintln!("{} error(s) found:", findings.len());
+        for line in &findings {
+            eprintln!("  - {line}");
         }
-        anyhow::bail!("fsck found {} error(s)", report.errors.len());
+        anyhow::bail!("fsck found {} error(s)", findings.len());
     }
 }
 

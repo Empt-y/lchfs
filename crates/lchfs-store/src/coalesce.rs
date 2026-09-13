@@ -141,8 +141,7 @@ impl CoalesceDaemon {
         // didn't cover, for the pin recheck right below.
         let mut live_records = Vec::new();
         let mut dropped = Vec::new();
-        let mut offset = segment::SEGMENT_HEADER_PAGE_SIZE as u32;
-        while let Some((header, next_offset)) = reader.scan_next(offset) {
+        for (header, offset) in reader.scan() {
             if live_bitmap.contains(offset) {
                 let loc = ExtentLocation {
                     segment_id: old_id,
@@ -154,7 +153,6 @@ impl CoalesceDaemon {
             } else {
                 dropped.push((offset, header));
             }
-            offset = next_offset;
         }
 
         // Pull in anything currently pinned among what mark() missed: a

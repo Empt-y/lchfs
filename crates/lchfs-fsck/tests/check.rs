@@ -332,3 +332,42 @@ fn rebuild_index_refuses_a_foreign_device() {
     let err = lchfs_fsck::rebuild_index(a.path(), &[other.path()]).unwrap_err();
     assert!(matches!(err, lchfs_fsck::FsckError::ForeignVdev { .. }), "{err}");
 }
+
+/// Rot in the middle of a segment used to hide every record behind it
+/// from fsck, which then reported perfectly good records as missing. Now
+/// the damage itself is the finding, and the records behind it are seen.
+#[test]
+fn damage_mid_segment_is_reported_without_hiding_what_follows() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    setup_replicated_pool(a.path(), b.path());
+
+    // Scribble over the middle third of b's real data segments.
+    for path in data_segments(b.path()) {
+        let mut bytes = std::fs::read(&path).unwrap();
+        if bytes.len() > 8192 {
+            let third = bytes.len() / 3;
+            for x in &mut bytes[third..2 * third] {
+                *x = 0xEE;
+            }
+            std::fs::write(&path, &bytes).unwrap();
+        }
+    }
+
+    let report = lchfs_fsck::check_replicas(&[a.path(), b.path()]);
+    assert!(
+        report.errors.iter().any(|e| matches!(e, lchfs_fsck::FsckError::DamagedRegion { .. })),
+        "{:?}",
+        report.errors
+    );
+    let missing_on_b = report
+        .errors
+        .iter()
+        .filter(|e| matches!(e, lchfs_fsck::FsckError::ReplicaMissing { vdev_id: 1, .. }))
+        .count();
+    let total = report.objects_visited as usize;
+    assert!(
+        missing_on_b > 0 && missing_on_b < total / 2,
+        "only the records inside the damaged third should be missing from b, not everything after it: {missing_on_b} of {total}"
+    );
+}

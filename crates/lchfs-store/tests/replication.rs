@@ -211,3 +211,93 @@ fn opening_a_two_vdev_pool_with_one_device_is_refused() {
         "expected a vdev-count refusal, got: {err}"
     );
 }
+
+// ---- Scanning past damage ----------------------------------------------
+
+/// `scan_next` stops at the first unparseable header, which is right for a
+/// torn tail and wrong for rot in the middle of a segment: every good
+/// record behind the damage would be reported missing from a device that
+/// still has it. `scan` resyncs on the next intact header instead.
+#[test]
+fn a_scan_recovers_the_records_behind_a_damaged_stretch() {
+    use lchfs_store::segment::ScanEnd;
+    use std::io::{Seek, SeekFrom, Write};
+
+    let dir = tempfile::tempdir().unwrap();
+    let payloads: Vec<Vec<u8>> = (0..12u8).map(|i| vec![i; 3000 + i as usize * 7]).collect();
+    let mut w = SegmentWriter::create(&[dir.path()], 7, StreamKind::Data, 0).unwrap();
+    let locs = append_records(&mut w, &payloads.iter().map(|p| p.as_slice()).collect::<Vec<_>>());
+    w.seal().unwrap();
+
+    // Scribble over records 4 and 5 entirely, header and all.
+    let path = dir.path().join("segments/data/7.aseg");
+    let from = locs[4].offset as u64;
+    let to = locs[6].offset as u64;
+    {
+        let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.seek(SeekFrom::Start(from)).unwrap();
+        f.write_all(&vec![0xAB; (to - from) as usize]).unwrap();
+    }
+
+    let reader = SegmentReader::open(dir.path(), 7, StreamKind::Data).unwrap();
+
+    // The old primitive gives up at the damage.
+    let mut n = 0;
+    let mut off = lchfs_store::segment::SEGMENT_HEADER_PAGE_SIZE as u32;
+    while let Some((_, next)) = reader.scan_next(off) {
+        n += 1;
+        off = next;
+    }
+    assert_eq!(n, 4, "scan_next should stop at the first damaged header");
+
+    // The scan carries on.
+    let mut scan = reader.scan();
+    let found: Vec<u32> = (&mut scan).map(|(_, offset)| offset).collect();
+    let expected: Vec<u32> = locs
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != 4 && *i != 5)
+        .map(|(_, l)| l.offset)
+        .collect();
+    assert_eq!(found, expected, "every intact record, at its real offset");
+    assert_eq!(scan.damaged, vec![(locs[4].offset, locs[6].offset)]);
+    assert_eq!(scan.end, Some(ScanEnd::Footer), "the sealed footer is a clean end, not damage");
+
+    // And every recovered record reads back and verifies.
+    for (i, &offset) in expected.iter().enumerate() {
+        let src = if i < 4 { i } else { i + 2 };
+        let (_, bytes) = reader.read_record(locs[src]).unwrap();
+        assert_eq!(bytes, payloads[src], "record at {offset}");
+    }
+}
+
+/// An open (unsealed) segment ends at EOF, and one whose tail was torn by
+/// a crash ends at the tear -- neither is reported as damage.
+#[test]
+fn a_clean_tail_is_not_mistaken_for_damage() {
+    use lchfs_store::segment::ScanEnd;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut w = SegmentWriter::create(&[dir.path()], 8, StreamKind::Data, 0).unwrap();
+    append_records(&mut w, &[b"one", b"two", b"three"]);
+    w.fsync().unwrap();
+    drop(w); // never sealed
+
+    let reader = SegmentReader::open(dir.path(), 8, StreamKind::Data).unwrap();
+    let mut scan = reader.scan();
+    assert_eq!((&mut scan).count(), 3);
+    assert!(scan.damaged.is_empty());
+    assert_eq!(scan.end, Some(ScanEnd::Eof));
+
+    // Tear the last record in half.
+    let path = dir.path().join("segments/data/8.aseg");
+    let len = std::fs::metadata(&path).unwrap().len();
+    std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(len - 5).unwrap();
+    let reader = SegmentReader::open(dir.path(), 8, StreamKind::Data).unwrap();
+    let mut scan = reader.scan();
+    assert_eq!((&mut scan).count(), 2, "the torn record is dropped, the rest kept");
+    // Its header still parses but the record runs past EOF; nothing can
+    // follow it, so that is a clean end and not damage.
+    assert!(scan.damaged.is_empty(), "{:?}", scan.damaged);
+    assert_eq!(scan.end, Some(ScanEnd::Eof));
+}

@@ -81,6 +81,8 @@ pub enum FsckError {
     ReplicaDivergent { hash: Hash32, vdev_id: u16, reference: u16, detail: String },
     #[error("I/O error: {0}")]
     Io(String),
+    #[error("{stream} segment {segment_id}: bytes {from}..{to} are unparseable and were skipped over")]
+    DamagedRegion { segment_id: u64, stream: &'static str, from: u32, to: u32 },
 }
 
 /// Aggregated results of a full fsck run.
@@ -103,7 +105,23 @@ impl FsckReport {
 /// documented layout directly: `segments/data/*.aseg`,
 /// `segments/meta/*.mseg`.
 pub fn scan_all_segments(pool_root: &Path) -> Result<HashMap<Hash32, ExtentLocation>, FsckError> {
+    Ok(scan_all_segments_reporting(pool_root)?.locations)
+}
+
+/// What `scan_all_segments_reporting` found: the locations, plus a
+/// `DamagedRegion` finding for every stretch of bytes the scan had to skip
+/// past. A damaged stretch is a finding in its own right even when every
+/// record behind it was recovered, because whatever *was* in that stretch
+/// is not in `locations` and will show up downstream as missing.
+pub struct Scanned {
+    pub locations: HashMap<Hash32, ExtentLocation>,
+    pub damaged: Vec<FsckError>,
+}
+
+/// `scan_all_segments`, also reporting the damage it scanned past.
+pub fn scan_all_segments_reporting(pool_root: &Path) -> Result<Scanned, FsckError> {
     let mut locations = HashMap::new();
+    let mut damaged = Vec::new();
     for (sub, kind) in [("data", StreamKind::Data), ("meta", StreamKind::Meta)] {
         let dir = pool_root.join("segments").join(sub);
         let Ok(read_dir) = std::fs::read_dir(&dir) else {
@@ -122,17 +140,24 @@ pub fn scan_all_segments(pool_root: &Path) -> Result<HashMap<Hash32, ExtentLocat
         for segment_id in ids {
             let reader = SegmentReader::open(pool_root, segment_id, kind)
                 .map_err(|e| FsckError::Io(format!("opening segment {segment_id}: {e}")))?;
-            let mut offset = lchfs_store::segment::SEGMENT_HEADER_PAGE_SIZE as u32;
-            while let Some((header, next_offset)) = reader.scan_next(offset) {
+            let mut scan = reader.scan();
+            for (header, offset) in &mut scan {
                 locations.insert(
                     header.content_hash,
                     ExtentLocation { segment_id, offset, len: header.record_len },
                 );
-                offset = next_offset;
+            }
+            for &(from, to) in &scan.damaged {
+                damaged.push(FsckError::DamagedRegion {
+                    segment_id,
+                    stream: sub,
+                    from,
+                    to,
+                });
             }
         }
     }
-    Ok(locations)
+    Ok(Scanned { locations, damaged })
 }
 
 /// Independently reads and validates the global superblock ring (same
@@ -437,7 +462,7 @@ impl Walker {
 /// snapshot) and verify content hashes and structural well-formedness.
 /// ARCHITECTURE.md §10.
 pub fn check(pool_root: &Path, live_roots: &[Hash32]) -> FsckReport {
-    let locations = match scan_all_segments(pool_root) {
+    let scanned = match scan_all_segments_reporting(pool_root) {
         Ok(m) => m,
         Err(e) => {
             let mut report = FsckReport::default();
@@ -445,7 +470,8 @@ pub fn check(pool_root: &Path, live_roots: &[Hash32]) -> FsckReport {
             return report;
         }
     };
-    let mut walker = Walker::new(pool_root.to_path_buf(), locations);
+    let mut walker = Walker::new(pool_root.to_path_buf(), scanned.locations);
+    walker.report.errors.extend(scanned.damaged);
     for &root in live_roots {
         walker.walk_root(root);
     }
@@ -457,7 +483,7 @@ pub fn check(pool_root: &Path, live_roots: &[Hash32]) -> FsckReport {
 /// and agree on location. Structural/content-hash problems the walk
 /// itself finds are reported the same as `check`.
 pub fn verify_index(pool_root: &Path, live_roots: &[Hash32]) -> FsckReport {
-    let locations = match scan_all_segments(pool_root) {
+    let scanned = match scan_all_segments_reporting(pool_root) {
         Ok(m) => m,
         Err(e) => {
             let mut report = FsckReport::default();
@@ -474,7 +500,8 @@ pub fn verify_index(pool_root: &Path, live_roots: &[Hash32]) -> FsckReport {
         }
     };
 
-    let mut walker = Walker::new(pool_root.to_path_buf(), locations);
+    let mut walker = Walker::new(pool_root.to_path_buf(), scanned.locations);
+    walker.report.errors.extend(scanned.damaged);
     for &root in live_roots {
         walker.walk_root(root);
     }
@@ -625,8 +652,11 @@ pub fn check_replicas(vdev_roots: &[&Path]) -> FsckReport {
     // Records: scan each device independently, then compare.
     let mut scans: Vec<(u16, &Path, HashMap<Hash32, ExtentLocation>)> = Vec::with_capacity(members.len());
     for (id, root, _) in &members {
-        match scan_all_segments(root) {
-            Ok(m) => scans.push((*id, root, m)),
+        match scan_all_segments_reporting(root) {
+            Ok(scanned) => {
+                report.errors.extend(scanned.damaged);
+                scans.push((*id, root, scanned.locations));
+            }
             Err(e) => {
                 report.errors.push(e);
                 return report;

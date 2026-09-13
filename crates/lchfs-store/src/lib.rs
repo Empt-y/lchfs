@@ -4149,8 +4149,8 @@ fn scan_one_segment(
     segment_id: u64,
     locations: &mut HashMap<Hash32, ExtentLocation>,
 ) -> Result<(), PoolError> {
-    let mut offset = segment::SEGMENT_HEADER_PAGE_SIZE as u32;
-    while let Some((header, next_offset)) = reader.scan_next(offset) {
+    let mut scan = reader.scan();
+    for (header, offset) in &mut scan {
         locations.insert(
             header.content_hash,
             ExtentLocation {
@@ -4159,7 +4159,9 @@ fn scan_one_segment(
                 len: header.record_len,
             },
         );
-        offset = next_offset;
+    }
+    for (from, to) in &scan.damaged {
+        tracing::warn!("segment {segment_id}: skipped unparseable bytes {from}..{to} while scanning");
     }
     Ok(())
 }

@@ -126,8 +126,7 @@ impl DedupScanner {
             // advances past it (see scanned_up_to's doc comment): a still-
             // Open segment gets fully rescanned every future pass too,
             // since more records may land in it later.
-            let mut offset = crate::segment::SEGMENT_HEADER_PAGE_SIZE as u32;
-            while let Some((rec_header, next_offset)) = reader.scan_next(offset) {
+            for (rec_header, offset) in reader.scan() {
                 let loc = ExtentLocation {
                     segment_id: id,
                     offset,
@@ -137,7 +136,6 @@ impl DedupScanner {
                     .entry(rec_header.content_hash)
                     .or_default()
                     .push(loc);
-                offset = next_offset;
             }
 
             if header.state == SegmentState::Open {
