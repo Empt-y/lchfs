@@ -34,6 +34,18 @@ pub const SEGMENT_HEADER_PAGE_SIZE: u64 = 4096;
 /// (32 bytes each); 16MiB is already far beyond any header this codebase
 /// ever legitimately writes.
 const MAX_HEADER_LEN: usize = 16 * 1024 * 1024;
+/// The largest record any stream can hold; a header claiming more is
+/// corrupt, whatever its checksum says.
+pub const MAX_RECORD_LEN: u32 = 512 * 1024 * 1024;
+/// `header_len` a resync will consider. A real header is a few dozen
+/// bytes plus 32 per backpointer, and nothing writes more than a handful;
+/// `MAX_HEADER_LEN` is the read path's generous ceiling, but a resync
+/// walks byte by byte through bytes that may be anything, and letting each
+/// false magic cost a 16 MiB read would make a hostile segment take hours
+/// to scan.
+const RESYNC_MAX_HEADER_LEN: usize = 64 * 1024;
+/// How much of a damaged segment a resync reads at a time.
+const RESYNC_WINDOW: usize = 1024 * 1024;
 
 /// Parses the `[u32 LE header_len][bincode(ExtentRecordHeader)]` prefix
 /// shared by every Extent Record's framing, from a buffer that starts
@@ -454,6 +466,19 @@ pub fn decode_payload(
     if header.codec_id == CodecId::None {
         return Ok(payload);
     }
+    // The decompressor allocates `uncompressed_len` up front, and that
+    // field is a u32 off the disk. A checksum catches a bit flip; it does
+    // not stop a deliberately written 4 GiB, and one such header must not
+    // be able to take the whole process down on a read.
+    if header.uncompressed_len > MAX_RECORD_LEN {
+        return Err(SegmentError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "corrupted record: uncompressed_len {} exceeds the {MAX_RECORD_LEN}-byte record limit",
+                header.uncompressed_len
+            ),
+        )));
+    }
     use lchfs_compress::{Codec, ZstdCodec};
     ZstdCodec
         .decompress(&payload, header.uncompressed_len as usize)
@@ -643,10 +668,10 @@ impl SegmentReader {
         let mut buf = vec![0u8; 4 + header_len];
         self.file.read_exact_at(&mut buf, offset as u64).ok()?;
         let (header, _consumed) = parse_record_header(&buf)?;
-        if header.record_len == 0 || header.record_len > 512 * 1024 * 1024 {
+        if header.record_len == 0 || header.record_len > MAX_RECORD_LEN {
             return None;
         }
-        let next_offset = offset + header.record_len;
+        let next_offset = offset.checked_add(header.record_len)?;
         Some((header, next_offset))
     }
 }
@@ -722,30 +747,58 @@ impl SegmentReader {
     /// with its magic and checksum intact, together with that header and
     /// the offset after the record. The magic sits four bytes into a record
     /// (after the header length prefix), so candidates are found by looking
-    /// for it and only then paying for a full parse.
+    /// for it and only then paying for a parse. Reads the file in
+    /// `RESYNC_WINDOW` pieces, so a segment that has been extended with
+    /// garbage costs a window of memory, not its own size; a candidate's
+    /// header is read on its own, bounded by `RESYNC_MAX_HEADER_LEN`.
     fn resync(&self, from: u32, file_len: u64) -> Option<(ExtentRecordHeader, u32, u32)> {
-        let start = from as u64 + 1;
-        if start + 8 > file_len {
-            return None;
-        }
-        let mut buf = vec![0u8; (file_len - start) as usize];
-        self.file.read_exact_at(&mut buf, start).ok()?;
         let magic = lchfs_format::EXTENT_RECORD_MAGIC.to_le_bytes();
-        let mut i = 0usize;
-        while i + 8 <= buf.len() {
-            if buf[i + 4..i + 8] == magic
-                && let Some((header, _consumed)) = parse_record_header(&buf[i..])
-                && header.record_len != 0
-                && header.record_len as u64 <= 512 * 1024 * 1024
-                && start + i as u64 + header.record_len as u64 <= file_len
-            {
-                let at = (start + i as u64) as u32;
-                let next = at + header.record_len;
-                return Some((header, at, next));
+        let mut window_start = from as u64 + 1;
+        let mut window = vec![0u8; RESYNC_WINDOW];
+        // A magic can straddle two windows; overlap by its length.
+        while window_start + 8 <= file_len {
+            let len = ((file_len - window_start) as usize).min(RESYNC_WINDOW);
+            let buf = &mut window[..len];
+            self.file.read_exact_at(buf, window_start).ok()?;
+            let mut i = 0usize;
+            while i + 8 <= len {
+                if buf[i + 4..i + 8] == magic
+                    && let Some(found) = self.try_header_at(window_start + i as u64, file_len)
+                {
+                    return Some(found);
+                }
+                i += 1;
             }
-            i += 1;
+            if window_start + len as u64 >= file_len {
+                break;
+            }
+            window_start += (len - 7) as u64;
         }
         None
+    }
+
+    /// Parses the record header at `at` if there is a sound one there:
+    /// sane length prefix, magic, checksum, and a `record_len` that fits
+    /// in the file.
+    fn try_header_at(&self, at: u64, file_len: u64) -> Option<(ExtentRecordHeader, u32, u32)> {
+        let mut len_buf = [0u8; 4];
+        self.file.read_exact_at(&mut len_buf, at).ok()?;
+        let header_len = u32::from_le_bytes(len_buf) as usize;
+        if header_len == 0 || header_len > RESYNC_MAX_HEADER_LEN || at + 4 + header_len as u64 > file_len {
+            return None;
+        }
+        let mut buf = vec![0u8; 4 + header_len];
+        self.file.read_exact_at(&mut buf, at).ok()?;
+        let (header, _consumed) = parse_record_header(&buf)?;
+        if header.record_len == 0 || header.record_len > MAX_RECORD_LEN {
+            return None;
+        }
+        let at32 = u32::try_from(at).ok()?;
+        let next = at32.checked_add(header.record_len)?;
+        if next as u64 > file_len {
+            return None;
+        }
+        Some((header, at32, next))
     }
 }
 

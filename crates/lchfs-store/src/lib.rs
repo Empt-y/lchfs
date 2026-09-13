@@ -521,13 +521,11 @@ impl Pool {
         for (id, root) in vdev_roots.iter().enumerate() {
             std::fs::create_dir_all(root)?;
             let lock = acquire_pool_lock(root)?;
+            // None of them may already hold a pool or a segment tree --
+            // checked for every device, not just vdev 0, so a half-built
+            // set cannot be silently absorbed.
+            require_blank_device(root)?;
             let backend = FileBackend::open(root)?;
-            // None of them may already hold a pool -- checked for every
-            // device, not just vdev 0, so a half-built set cannot be
-            // silently absorbed.
-            if read_superblock(&backend)?.is_some() {
-                return Err(PoolError::AlreadyExists(root.display().to_string()));
-            }
             members.push(VdevSet::member(Vdev::new(id as u16, root.to_path_buf()), backend, lock));
         }
         let vdev_set = Arc::new(VdevSet::new(members, vdev_roots.len() as u16));
@@ -745,10 +743,8 @@ impl Pool {
         }
         std::fs::create_dir_all(new_root)?;
         locks.push(acquire_pool_lock(new_root)?);
+        require_blank_device(new_root)?;
         let new_backend = FileBackend::open(new_root)?;
-        if read_superblock(&new_backend)?.is_some() {
-            return Err(PoolError::AlreadyExists(new_root.display().to_string()));
-        }
 
         // Existing members first. If this is interrupted part-way, the
         // pool reads as "N+1 vdevs with slot N missing", which is exactly
@@ -2595,10 +2591,8 @@ impl PoolShared {
         };
         std::fs::create_dir_all(new_root)?;
         let lock = acquire_pool_lock(new_root)?;
+        require_blank_device(new_root)?;
         let backend = FileBackend::open(new_root)?;
-        if read_superblock(&backend)?.is_some() {
-            return Err(PoolError::AlreadyExists(new_root.display().to_string()));
-        }
         // A replacement inherits a slot whose index entries describe a
         // device that is gone; see `attach_vdev`. Done before the slot is
         // online, so no live write can record into it in between.
@@ -4454,6 +4448,15 @@ fn check_membership<'a>(given_roots: &[&'a Path], allow_missing: bool) -> Result
     }
     let mut members: Vec<(SuperblockSlot, &Path)> = Vec::with_capacity(given_roots.len());
     for root in given_roots {
+        // `FileBackend::open` creates a directory and an empty ring where
+        // there is none; a path that is merely wrong must not gain a pool
+        // skeleton for having been named.
+        if !backend::superblock_path(root).exists() {
+            return Err(PoolError::Format(format!(
+                "no valid superblock found at {} — was create-pool run?",
+                root.display()
+            )));
+        }
         let backend = FileBackend::open(root)?;
         let slot = read_superblock(&backend)?.ok_or_else(|| {
             PoolError::Format(format!(
@@ -4534,6 +4537,29 @@ fn check_membership<'a>(given_roots: &[&'a Path], allow_missing: bool) -> Result
         missing_vdevs,
         stale_vdevs,
     })
+}
+
+/// A device joining a pool must hold nothing: no superblock and no segment
+/// tree. Segments left by a previous life -- another pool, or this one
+/// before a detach -- would otherwise be scanned into the index or shown
+/// by fsck as records the rest of the pool is missing, and a colliding id
+/// would be truncated by the next fresh writer. The caller wipes; this
+/// refuses.
+fn require_blank_device(root: &Path) -> Result<(), PoolError> {
+    if backend::superblock_path(root).exists() {
+        let backend = FileBackend::open(root)?;
+        if read_superblock(&backend)?.is_some() {
+            return Err(PoolError::AlreadyExists(root.display().to_string()));
+        }
+    }
+    let segments = root.join("segments");
+    if segments.is_dir() && std::fs::read_dir(&segments)?.next().is_some() {
+        return Err(PoolError::AlreadyExists(format!(
+            "{} has a segments/ tree; a device joining a pool must be blank",
+            root.display()
+        )));
+    }
+    Ok(())
 }
 
 fn acquire_pool_lock(pool_root: &Path) -> Result<Flock<std::fs::File>, PoolError> {

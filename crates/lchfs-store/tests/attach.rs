@@ -337,3 +337,37 @@ fn a_live_attach_refuses_a_device_that_already_holds_a_pool() {
     assert!(pool.missing_vdevs().is_empty());
     assert!(!pool.is_degraded());
 }
+
+/// "Blank" means blank: a device carrying a segment tree from some other
+/// life is refused, offline and live, so its records cannot be adopted.
+#[test]
+fn a_device_with_leftover_segments_is_not_blank() {
+    let a = tempfile::tempdir().unwrap();
+    let stale = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(stale.path().join("segments/data")).unwrap();
+    std::fs::write(stale.path().join("segments/data/0.aseg"), b"leftovers").unwrap();
+    {
+        let pool = Pool::create(a.path(), small_params()).unwrap();
+        let err = pool.attach_vdev_live(stale.path()).unwrap_err().to_string();
+        assert!(err.contains("must be blank"), "{err}");
+        assert!(pool.missing_vdevs().is_empty());
+    }
+    let err = Pool::attach_vdev(&[a.path()], stale.path()).unwrap_err().to_string();
+    assert!(err.contains("must be blank"), "{err}");
+    assert!(Pool::open(a.path()).is_ok(), "the pool's count must be untouched");
+    let err = Pool::create(stale.path(), small_params()).unwrap_err().to_string();
+    assert!(err.contains("must be blank"), "{err}");
+}
+
+/// Naming a path that holds no pool must not conjure one.
+#[test]
+fn opening_a_wrong_path_leaves_nothing_behind() {
+    let nowhere = tempfile::tempdir().unwrap();
+    let missing = nowhere.path().join("typo");
+    assert!(Pool::open(&missing).is_err());
+    assert!(!missing.exists(), "open created a directory for a path that held no pool");
+    let empty = nowhere.path().join("empty");
+    std::fs::create_dir(&empty).unwrap();
+    assert!(Pool::open(&empty).is_err());
+    assert!(!empty.join("SUPERBLOCK").exists(), "open created a superblock ring in an empty dir");
+}

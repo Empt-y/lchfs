@@ -301,3 +301,83 @@ fn a_clean_tail_is_not_mistaken_for_damage() {
     assert!(scan.damaged.is_empty(), "{:?}", scan.damaged);
     assert_eq!(scan.end, Some(ScanEnd::Eof));
 }
+
+// ---- Hostile bytes on disk ---------------------------------------------
+
+/// A header whose `uncompressed_len` says 4 GiB must be an error, not a
+/// 4 GiB allocation. The checksum is recomputed so the header is
+/// structurally valid: this is the deliberate case, not a bit flip.
+#[test]
+fn a_forged_uncompressed_len_is_refused_rather_than_allocated() {
+    use lchfs_format::{ExtentRecordHeader, finalize_header_checksum};
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut w = SegmentWriter::create(&[dir.path()], 5, StreamKind::Data, 0).unwrap();
+    // Compressible enough to be stored as zstd.
+    let payload = vec![0u8; 8192];
+    use lchfs_compress::{Codec, ZstdCodec};
+    let compressed = ZstdCodec.compress(&payload, 3);
+    let loc = w
+        .append(
+            ExtentKind::RawChunk,
+            Hash32::of(&payload),
+            CodecId::Zstd,
+            payload.len() as u32,
+            &compressed,
+            Vec::new(),
+        )
+        .unwrap();
+    w.seal().unwrap();
+
+    // Rewrite the header in place with a huge uncompressed_len and a
+    // matching checksum.
+    let path = dir.path().join("segments/data/5.aseg");
+    let mut bytes = std::fs::read(&path).unwrap();
+    let off = loc.offset as usize;
+    let header_len = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
+    let mut header: ExtentRecordHeader =
+        lchfs_format::decode(&bytes[off + 4..off + 4 + header_len]).unwrap();
+    header.uncompressed_len = u32::MAX;
+    finalize_header_checksum(&mut header);
+    let encoded = lchfs_format::encode(&header).unwrap();
+    assert_eq!(encoded.len(), header_len, "same header layout, same length");
+    bytes[off + 4..off + 4 + header_len].copy_from_slice(&encoded);
+    std::fs::write(&path, &bytes).unwrap();
+
+    let reader = SegmentReader::open(dir.path(), 5, StreamKind::Data).unwrap();
+    let err = reader.read_record(loc).unwrap_err().to_string();
+    assert!(err.contains("uncompressed_len"), "{err}");
+}
+
+/// A segment extended with a great deal of garbage costs a resync a
+/// window of memory and a bounded amount of time, not the garbage's size.
+#[test]
+fn a_resync_through_megabytes_of_garbage_is_bounded() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let mut w = SegmentWriter::create(&[dir.path()], 6, StreamKind::Data, 0).unwrap();
+    let first = append_records(&mut w, &[b"before the garbage"]);
+    drop(w);
+    let path = dir.path().join("segments/data/6.aseg");
+    {
+        // 8 MiB of bytes dense with fake magics and huge fake header lengths.
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut junk = Vec::with_capacity(8 << 20);
+        let magic = lchfs_format::EXTENT_RECORD_MAGIC.to_le_bytes();
+        while junk.len() < 8 << 20 {
+            junk.extend_from_slice(&(16u32 * 1024 * 1024 - 1).to_le_bytes());
+            junk.extend_from_slice(&magic);
+        }
+        f.write_all(&junk).unwrap();
+    }
+    // Then one real record after it all, appended by a fresh writer at
+    // the right offset would need the writer's cursor; instead check that
+    // the scan terminates quickly and finds only the record before.
+    let reader = SegmentReader::open(dir.path(), 6, StreamKind::Data).unwrap();
+    let t = std::time::Instant::now();
+    let mut scan = reader.scan();
+    let found: Vec<u32> = (&mut scan).map(|(_, o)| o).collect();
+    assert_eq!(found, vec![first[0].offset]);
+    assert_eq!(scan.damaged.len(), 1);
+    assert!(t.elapsed() < std::time::Duration::from_secs(5), "took {:?}", t.elapsed());
+}
