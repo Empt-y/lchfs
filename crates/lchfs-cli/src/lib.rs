@@ -36,6 +36,22 @@ enum Command {
         #[arg(long)]
         degraded: bool,
     },
+    /// Serve a pool over NFSv3 (ARCHITECTURE.md §5a's second adapter).
+    /// Mount it with e.g.
+    /// `mount -t nfs -o vers=3,tcp,port=P,mountport=P,nolock 127.0.0.1:/ /mnt`.
+    ServeNfs {
+        /// Any one of the pool's devices.
+        pool: PathBuf,
+        /// "ip:port" to listen on; port 0 picks one and prints it.
+        #[arg(default_value = "127.0.0.1:11111")]
+        listen: String,
+        #[arg(long = "vdev")]
+        vdevs: Vec<PathBuf>,
+        #[arg(long = "scan")]
+        scan: Vec<PathBuf>,
+        #[arg(long)]
+        degraded: bool,
+    },
     /// List the pools whose devices can be found under the given
     /// directories, with which slots are present and which are missing.
     Discover { dirs: Vec<PathBuf> },
@@ -137,6 +153,9 @@ pub fn run() -> anyhow::Result<()> {
             mount(&pool, &vdevs, &scan, degraded, &mountpoint)
         }
         Command::Discover { dirs } => discover(&dirs),
+        Command::ServeNfs { pool, listen, vdevs, scan, degraded } => {
+            serve_nfs(&pool, &vdevs, &scan, degraded, &listen)
+        }
         Command::Fsck { pool, vdevs, scan, verify_index, rebuild_index } => {
             let mut vdevs = vdevs;
             if !scan.is_empty() {
@@ -208,13 +227,14 @@ fn discover(dirs: &[PathBuf]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn mount(
+/// Opens the pool the way `mount` and `serve-nfs` both do, reports what
+/// mount-time recovery did, and starts the control socket.
+fn open_for_serving(
     pool: &std::path::Path,
     other_vdevs: &[PathBuf],
     scan: &[PathBuf],
     degraded: bool,
-    mountpoint: &std::path::Path,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<(std::sync::Arc<lchfs_store::Pool>, control::ControlServer)> {
     let pool = if !scan.is_empty() {
         if !other_vdevs.is_empty() {
             anyhow::bail!("--scan finds the other devices; do not also name them with --vdev");
@@ -245,8 +265,19 @@ fn mount(
         );
     }
     let pool = std::sync::Arc::new(pool);
-    let _control = control::ControlServer::start(std::sync::Arc::clone(&pool), control::socket_path(&pool))?;
+    let control = control::ControlServer::start(std::sync::Arc::clone(&pool), control::socket_path(&pool))?;
     eprintln!("control socket: {}", control::socket_path(&pool).display());
+    Ok((pool, control))
+}
+
+fn mount(
+    pool: &std::path::Path,
+    other_vdevs: &[PathBuf],
+    scan: &[PathBuf],
+    degraded: bool,
+    mountpoint: &std::path::Path,
+) -> anyhow::Result<()> {
+    let (pool, _control) = open_for_serving(pool, other_vdevs, scan, degraded)?;
     let fs = lchfs_fuse::LchfsFilesystem::new(pool);
     // `DefaultPermissions`: the kernel enforces normal read/write/traverse
     // permission checks against each inode's reported mode/uid/gid (lchfs
@@ -261,6 +292,31 @@ fn mount(
         .mount_options
         .push(fuser::MountOption::DefaultPermissions);
     fuser::mount(fs, mountpoint, &config)?;
+    Ok(())
+}
+
+fn serve_nfs(
+    pool: &std::path::Path,
+    other_vdevs: &[PathBuf],
+    scan: &[PathBuf],
+    degraded: bool,
+    listen: &str,
+) -> anyhow::Result<()> {
+    let (pool, _control) = open_for_serving(pool, other_vdevs, scan, degraded)?;
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async {
+        let (port, task) = lchfs_nfs::LchfsNfs::serve(std::sync::Arc::clone(&pool), listen).await?;
+        eprintln!(
+            "serving NFSv3 on port {port}; mount with: mount -t nfs -o vers=3,tcp,port={port},mountport={port},nolock <host>:/ <dir>"
+        );
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = task => {}
+        }
+        anyhow::Ok(())
+    })?;
+    // No FUSE destroy() here: the checkpoint on shutdown is ours to run.
+    pool.checkpoint()?;
     Ok(())
 }
 

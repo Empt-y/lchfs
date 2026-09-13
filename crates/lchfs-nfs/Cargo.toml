@@ -1,0 +1,17 @@
+[package]
+name = "lchfs-nfs"
+description = "LCHFS NFSv3 frontend: a second thin protocol adapter over Pool (ARCHITECTURE.md §5a), no filesystem logic."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+lchfs-store = { workspace = true }
+lchfs-format = { workspace = true }
+nfsserve = "0.11"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros"] }
+async-trait = "0.1"
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
