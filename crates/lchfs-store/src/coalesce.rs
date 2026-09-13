@@ -14,7 +14,7 @@
 
 use crate::gc::GcEngine;
 use crate::segment::{self, SegmentReader, SegmentWriter};
-use crate::StreamKind;
+use crate::{PRIMARY_VDEV_ID, StreamKind, Vdev};
 use lchfs_format::{ExtentLocation, Hash32};
 use lchfs_index::{ChunkLocationCache, IndexStore, PendingDedupPins, RedbIndex};
 use parking_lot::RwLock;
@@ -30,24 +30,28 @@ fn to_io_err(e: impl std::fmt::Display) -> io::Error {
 }
 
 pub struct CoalesceDaemon {
-    pool_root: PathBuf,
-    /// The vdev this daemon repacks. Coalescing rewrites extents into new
-    /// segments *on this device*, so the relocations it records belong to
-    /// this vdev's replica set and no other (ARCHITECTURE.md §15.7: mark is
-    /// pool-global, sweep is per-vdev).
-    vdev_id: u16,
+    /// The devices this daemon repacks, each on its own: coalescing
+    /// rewrites extents into new segments *on one device*, so the
+    /// relocations it records belong to that vdev's replica set and no
+    /// other (ARCHITECTURE.md §15.7: mark is pool-global, sweep is
+    /// per-vdev). Forcing the devices into lockstep would need distributed
+    /// coordination for no correctness gain -- per-vdev locations already
+    /// make divergence the represented normal case.
+    targets: Vec<Vdev>,
+    /// Marks on the primary. One walk serves every target, because the DAG
+    /// is content-addressed and identical on every device.
     gc: GcEngine,
 }
 
 impl CoalesceDaemon {
     pub fn new(
         pool_root: PathBuf,
-        vdev_id: u16,
+        targets: Vec<Vdev>,
         locations: Arc<ChunkLocationCache>,
         pins: Arc<PendingDedupPins>,
     ) -> Self {
-        let gc = GcEngine::new(pool_root.clone(), locations, pins);
-        Self { pool_root, vdev_id, gc }
+        let gc = GcEngine::new(pool_root, locations, pins);
+        Self { targets, gc }
     }
 
     /// One idle-cycle pass: mark, find segments below the liveness
@@ -85,21 +89,34 @@ impl CoalesceDaemon {
             return Ok(());
         }
 
-        for segment_id in self.gc.sweep_candidates(&live) {
-            self.repack_segment(
-                segment_id,
-                &live,
-                generation_at_mark,
-                published_generation,
-                persisted_index,
-                next_segment_id,
-            )?;
+        let targets = self.targets.clone();
+        for vdev in &targets {
+            // The primary's bitmaps come straight out of mark; any other
+            // device's are the same hashes at that device's own offsets.
+            let bitmaps = if vdev.id == PRIMARY_VDEV_ID {
+                live.by_segment.clone()
+            } else {
+                live.resolve_on(vdev.id, &persisted_index.read()).map_err(to_io_err)?
+            };
+            for segment_id in self.gc.sweep_candidates_on(&vdev.root, &bitmaps) {
+                self.repack_segment(
+                    vdev,
+                    segment_id,
+                    &bitmaps,
+                    generation_at_mark,
+                    published_generation,
+                    persisted_index,
+                    next_segment_id,
+                )?;
+            }
         }
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn repack_segment(
         &mut self,
+        vdev: &Vdev,
         old_id: u64,
         live: &HashMap<u64, RoaringBitmap>,
         generation_at_mark: u64,
@@ -107,7 +124,8 @@ impl CoalesceDaemon {
         persisted_index: &RwLock<RedbIndex>,
         next_segment_id: &AtomicU64,
     ) -> io::Result<()> {
-        let reader = SegmentReader::open(&self.pool_root, old_id, StreamKind::Data)?;
+        let root = vdev.root.as_path();
+        let reader = SegmentReader::open(root, old_id, StreamKind::Data)?;
         let old_header = reader.read_header().map_err(to_io_err)?;
         let owner_shard = old_header.owner_shard;
 
@@ -164,13 +182,13 @@ impl CoalesceDaemon {
             if published_generation.load(Ordering::Acquire) != generation_at_mark {
                 return Ok(());
             }
-            segment::mark_coalesced(&self.pool_root, old_id, StreamKind::Data)?;
-            std::fs::remove_file(segment::segment_path(&self.pool_root, old_id, StreamKind::Data))?;
+            segment::mark_coalesced(root, old_id, StreamKind::Data)?;
+            std::fs::remove_file(segment::segment_path(root, old_id, StreamKind::Data))?;
             return Ok(());
         }
 
         let new_id = next_segment_id.fetch_add(1, Ordering::Relaxed);
-        let mut writer = SegmentWriter::create(&[&self.pool_root], new_id, StreamKind::Data, owner_shard)?;
+        let mut writer = SegmentWriter::create(&[root], new_id, StreamKind::Data, owner_shard)?;
         let mut relocations = Vec::with_capacity(live_records.len());
         for (header, raw_payload) in &live_records {
             let new_loc = writer.append(
@@ -193,12 +211,17 @@ impl CoalesceDaemon {
         {
             let mut index = persisted_index.write();
             for (hash, loc) in &relocations {
-                index.put_chunk_location(*hash, self.vdev_id, *loc).map_err(to_io_err)?;
+                index.put_chunk_location(*hash, vdev.id, *loc).map_err(to_io_err)?;
             }
             index.flush().map_err(to_io_err)?;
         }
-        for (hash, loc) in &relocations {
-            self.gc_locations().put(*hash, *loc);
+        // The cache holds the primary's locations and nobody else's
+        // (§15.1); a relocation on another device is the index's business
+        // alone.
+        if vdev.id == PRIMARY_VDEV_ID {
+            for (hash, loc) in &relocations {
+                self.gc_locations().put(*hash, *loc);
+            }
         }
 
         // Final freshness gate: if a checkpoint published a new root while
@@ -215,8 +238,8 @@ impl CoalesceDaemon {
             return Ok(());
         }
 
-        segment::mark_coalesced(&self.pool_root, old_id, StreamKind::Data)?;
-        std::fs::remove_file(segment::segment_path(&self.pool_root, old_id, StreamKind::Data))?;
+        segment::mark_coalesced(root, old_id, StreamKind::Data)?;
+        std::fs::remove_file(segment::segment_path(root, old_id, StreamKind::Data))?;
         Ok(())
     }
 

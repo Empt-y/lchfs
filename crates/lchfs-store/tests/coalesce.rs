@@ -222,7 +222,7 @@ fn generation_change_mid_pass_blocks_deletion_even_without_a_pin() {
 
     let mut daemon = CoalesceDaemon::new(
         dir.path().to_path_buf(),
-        0,
+        vec![lchfs_store::Vdev::new(0, dir.path().to_path_buf())],
         Arc::clone(&locations),
         Arc::new(PendingDedupPins::new()),
     );

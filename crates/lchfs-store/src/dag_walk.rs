@@ -18,14 +18,63 @@
 use crate::segment::SegmentReader;
 use crate::{PRIMARY_VDEV_ID, PoolError, SegmentReaders, StreamKind, get_reader};
 use lchfs_format::{ContentRef, ExtentKind, ExtentLocation, Hash32, InoMap, InodeObject, IndirectHashList, RootObject};
-use lchfs_index::ChunkLocationCache;
+use lchfs_index::{ChunkLocationCache, IndexStore, RedbIndex};
 use roaring::RoaringBitmap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-/// Marks `loc`'s byte range live in `live`'s per-segment bitmap. Exposed to
-/// `gc.rs` so it can mark a pinned hash's current location live the same
-/// way a DAG-reachable one is marked (see `PendingDedupPins`).
+/// What a mark pass found live. Two views of the same set: the primary
+/// vdev's byte ranges per segment, which is what sweeping the primary
+/// needs and what every existing caller consumed, and the content hashes
+/// themselves, which is what sweeping *any other* vdev needs -- its copies
+/// sit at its own offsets (ARCHITECTURE.md §15.7: "mark once, sweep N
+/// times"). The DAG is content-addressed and identical on every device,
+/// so one walk of the primary is enough to know what is live everywhere.
+#[derive(Debug, Default)]
+pub struct LiveSet {
+    pub by_segment: HashMap<u64, RoaringBitmap>,
+    pub hashes: HashSet<Hash32>,
+}
+
+impl LiveSet {
+    pub fn is_empty(&self) -> bool {
+        self.hashes.is_empty()
+    }
+
+    /// Marks `hash`, found at `loc` on the primary, live.
+    pub(crate) fn mark(&mut self, hash: Hash32, loc: ExtentLocation) {
+        self.hashes.insert(hash);
+        mark_location(loc, &mut self.by_segment);
+    }
+
+    /// The live byte ranges on `vdev_id`, resolved through that device's
+    /// own index entries. A hash with no entry there is simply not on that
+    /// device (it missed the write, or has since been reclaimed) and
+    /// contributes nothing -- there are no bytes to keep. Costs one index
+    /// range read per live hash, which idle-cycle work can afford.
+    pub fn resolve_on(&self, vdev_id: u16, index: &RedbIndex) -> Result<HashMap<u64, RoaringBitmap>, PoolError> {
+        let mut out = HashMap::new();
+        for &hash in &self.hashes {
+            for (v, loc) in index.chunk_locations(hash)? {
+                if v == vdev_id {
+                    mark_location(loc, &mut out);
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// The primary's per-segment view, which is what sweeping the primary
+/// consumes and what every pre-replication caller already expected.
+impl std::ops::Deref for LiveSet {
+    type Target = HashMap<u64, RoaringBitmap>;
+    fn deref(&self) -> &Self::Target {
+        &self.by_segment
+    }
+}
+
+/// Marks `loc`'s byte range live in a per-segment bitmap.
 pub(crate) fn mark_location(loc: ExtentLocation, live: &mut HashMap<u64, RoaringBitmap>) {
     live.entry(loc.segment_id)
         .or_default()
@@ -45,12 +94,12 @@ fn resolve_and_read(
     pool_root: &Path,
     locations: &ChunkLocationCache,
     readers: &mut SegmentReaders,
-    live: &mut HashMap<u64, RoaringBitmap>,
+    live: &mut LiveSet,
 ) -> Result<(ExtentKind, Vec<u8>), PoolError> {
     let loc = locations
         .get(hash)
         .ok_or_else(|| PoolError::Format(format!("GC mark: {hash:?} not found in index")))?;
-    mark_location(loc, live);
+    live.mark(hash, loc);
     let reader: &SegmentReader = get_reader(readers, pool_root, PRIMARY_VDEV_ID, loc.segment_id, stream)?;
     let (header, bytes) = reader.read_record(loc)?;
     Ok((header.kind, bytes))
@@ -66,7 +115,7 @@ pub(crate) fn walk_reachable(
     pool_root: &Path,
     locations: &ChunkLocationCache,
     readers: &mut SegmentReaders,
-    live: &mut HashMap<u64, RoaringBitmap>,
+    live: &mut LiveSet,
 ) -> Result<(), PoolError> {
     let (kind, bytes) = resolve_and_read(hash, StreamKind::Meta, pool_root, locations, readers, live)?;
     match kind {
@@ -106,7 +155,7 @@ fn walk_inomap(
     pool_root: &Path,
     locations: &ChunkLocationCache,
     readers: &mut SegmentReaders,
-    live: &mut HashMap<u64, RoaringBitmap>,
+    live: &mut LiveSet,
 ) -> Result<(), PoolError> {
     let (_kind, bytes) = resolve_and_read(hash, StreamKind::Meta, pool_root, locations, readers, live)?;
     let ino_map: InoMap =
@@ -122,7 +171,7 @@ fn walk_inode(
     pool_root: &Path,
     locations: &ChunkLocationCache,
     readers: &mut SegmentReaders,
-    live: &mut HashMap<u64, RoaringBitmap>,
+    live: &mut LiveSet,
 ) -> Result<(), PoolError> {
     let (_kind, bytes) = resolve_and_read(hash, StreamKind::Meta, pool_root, locations, readers, live)?;
     let inode: InodeObject =

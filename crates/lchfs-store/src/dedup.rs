@@ -25,13 +25,12 @@
 //! special-casing.
 
 use crate::segment::SegmentReader;
-use crate::StreamKind;
+use crate::{PRIMARY_VDEV_ID, StreamKind, Vdev};
 use lchfs_format::{ExtentLocation, Hash32, SegmentState};
 use lchfs_index::{ChunkLocationCache, IndexStore, RedbIndex};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::io;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 fn to_io_err(e: impl std::fmt::Display) -> io::Error {
@@ -39,11 +38,12 @@ fn to_io_err(e: impl std::fmt::Display) -> io::Error {
 }
 
 pub struct DedupScanner {
-    pool_root: PathBuf,
-    /// The vdev whose segments this scanner repoints (see CoalesceDaemon).
-    vdev_id: u16,
+    /// The devices scanned, each on its own: duplicate physical copies are
+    /// a per-device fact, and the canonical chosen for a hash belongs to
+    /// that device's replica set (ARCHITECTURE.md §15.7).
+    targets: Vec<Vdev>,
     locations: Arc<ChunkLocationCache>,
-    /// In-memory only, per stream (today only ever `StreamKind::Data` is
+    /// In-memory only, per (vdev, stream) (today only ever `StreamKind::Data` is
     /// scanned -- see `run_pass`). Losing this on restart is fine: the
     /// scan is idempotent and self-correcting, just re-scans from
     /// scratch. Deliberately advances only up to the *first* still-`Open`
@@ -53,14 +53,13 @@ pub struct DedupScanner {
     /// (a different, busier shard) is already sealed -- advancing the
     /// cursor past that gap would permanently skip the lower one once it
     /// does seal.
-    scanned_up_to: HashMap<StreamKind, u64>,
+    scanned_up_to: HashMap<(u16, StreamKind), u64>,
 }
 
 impl DedupScanner {
-    pub fn new(pool_root: PathBuf, vdev_id: u16, locations: Arc<ChunkLocationCache>) -> Self {
+    pub fn new(targets: Vec<Vdev>, locations: Arc<ChunkLocationCache>) -> Self {
         Self {
-            pool_root,
-            vdev_id,
+            targets,
             locations,
             scanned_up_to: HashMap::new(),
         }
@@ -73,7 +72,15 @@ impl DedupScanner {
     /// (always tied to a specific inode's own field values) essentially
     /// never collides in practice, unlike bulk chunk data.
     pub fn run_pass(&mut self, persisted_index: &RwLock<RedbIndex>) -> io::Result<Vec<DedupMerge>> {
-        let dir = self.pool_root.join("segments").join("data");
+        let mut merges = Vec::new();
+        for vdev in self.targets.clone() {
+            merges.extend(self.run_pass_on(&vdev, persisted_index)?);
+        }
+        Ok(merges)
+    }
+
+    fn run_pass_on(&mut self, vdev: &Vdev, persisted_index: &RwLock<RedbIndex>) -> io::Result<Vec<DedupMerge>> {
+        let dir = vdev.root.join("segments").join("data");
         let Ok(read_dir) = std::fs::read_dir(&dir) else {
             return Ok(Vec::new());
         };
@@ -88,7 +95,7 @@ impl DedupScanner {
             .collect();
         segment_ids.sort_unstable();
 
-        let cursor = self.scanned_up_to.get(&StreamKind::Data).copied().unwrap_or(0);
+        let cursor = self.scanned_up_to.get(&(vdev.id, StreamKind::Data)).copied().unwrap_or(0);
         let mut seen_this_pass: HashMap<Hash32, Vec<ExtentLocation>> = HashMap::new();
         // The cursor must stop at the *lowest* still-open id (if any), not
         // just "one past whatever sealed id we happened to process last":
@@ -103,7 +110,7 @@ impl DedupScanner {
             if id < cursor {
                 continue;
             }
-            let Ok(reader) = SegmentReader::open(&self.pool_root, id, StreamKind::Data) else {
+            let Ok(reader) = SegmentReader::open(&vdev.root, id, StreamKind::Data) else {
                 continue;
             };
             let Ok(header) = reader.read_header() else {
@@ -140,7 +147,7 @@ impl DedupScanner {
             }
         }
         let next_cursor = lowest_still_open.unwrap_or(highest_sealed_processed);
-        self.scanned_up_to.insert(StreamKind::Data, next_cursor);
+        self.scanned_up_to.insert((vdev.id, StreamKind::Data), next_cursor);
 
         let mut merges = Vec::new();
         for (hash, mut locs) in seen_this_pass {
@@ -148,7 +155,21 @@ impl DedupScanner {
             // catches a collision that spans "already indexed from a
             // previous pass or the inline fast path" vs "newly seen this
             // pass", not just two duplicates both freshly seen together.
-            if let Some(existing) = self.locations.get(hash) {
+            // That is the cache for the primary and the index for any
+            // other device (§15.1: the cache holds the primary's locations
+            // only).
+            let existing = if vdev.id == PRIMARY_VDEV_ID {
+                self.locations.get(hash)
+            } else {
+                persisted_index
+                    .read()
+                    .chunk_locations(hash)
+                    .map_err(to_io_err)?
+                    .into_iter()
+                    .find(|(v, _)| *v == vdev.id)
+                    .map(|(_, loc)| loc)
+            };
+            if let Some(existing) = existing {
                 locs.push(existing);
             }
             locs.sort_by_key(|l| (l.segment_id, l.offset));
@@ -157,15 +178,25 @@ impl DedupScanner {
                 continue;
             }
 
-            let canonical = locs[0];
-            self.locations.put(hash, canonical);
+            // The copy the engine already reads from stays canonical when
+            // it is among the candidates. Read failover and heal repoint a
+            // hash at a fresh copy precisely because the older one failed
+            // verification; picking the lowest offset here would hand the
+            // hash straight back to the bad copy, and the next read would
+            // fail over and heal it all over again. With no current copy
+            // among them, lowest `(segment_id, offset)` keeps the choice
+            // deterministic.
+            let canonical = existing.filter(|e| locs.contains(e)).unwrap_or(locs[0]);
+            if vdev.id == PRIMARY_VDEV_ID {
+                self.locations.put(hash, canonical);
+            }
             {
                 let mut index = persisted_index.write();
                 index
-                    .put_chunk_location(hash, self.vdev_id, canonical)
+                    .put_chunk_location(hash, vdev.id, canonical)
                     .map_err(to_io_err)?;
             }
-            for &loser in &locs[1..] {
+            for &loser in locs.iter().filter(|&&l| l != canonical) {
                 merges.push(DedupMerge {
                     content_hash: hash,
                     canonical,

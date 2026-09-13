@@ -15,6 +15,8 @@
 
 use crate::segment::SegmentReader;
 use crate::{SegmentReaders, StreamKind, dag_walk};
+use crate::dag_walk::LiveSet;
+use std::path::Path;
 use lchfs_format::{Hash32, SegmentState};
 use lchfs_index::{ChunkLocationCache, PendingDedupPins};
 use roaring::RoaringBitmap;
@@ -83,8 +85,8 @@ impl GcEngine {
     /// resolution failure here means either genuine corruption or a bug,
     /// neither of which idle-cycle maintenance should paper over by
     /// guessing.
-    pub fn mark(&mut self, live_roots: &[Hash32]) -> HashMap<u64, RoaringBitmap> {
-        let mut live = HashMap::new();
+    pub fn mark(&mut self, live_roots: &[Hash32]) -> LiveSet {
+        let mut live = LiveSet::default();
         for &root in live_roots {
             if let Err(e) = dag_walk::walk_reachable(
                 root,
@@ -94,7 +96,7 @@ impl GcEngine {
                 &mut live,
             ) {
                 tracing::error!("GC mark pass aborted: failed to walk root {root:?}: {e}");
-                return HashMap::new();
+                return LiveSet::default();
             }
         }
 
@@ -120,7 +122,7 @@ impl GcEngine {
         // this snapshot's resolution, still protects it independently.
         for hash in self.pins.snapshot() {
             match self.locations.get(hash) {
-                Some(loc) => dag_walk::mark_location(loc, &mut live),
+                Some(loc) => live.mark(hash, loc),
                 None => tracing::warn!("GC mark: pinned hash {hash:?} not found in index, skipping"),
             }
         }
@@ -136,7 +138,18 @@ impl GcEngine {
     /// actual space to reclaim) lives; Meta-stream segments are far
     /// smaller and churn differently, not addressed by this pass.
     pub fn sweep_candidates(&self, live_sets: &HashMap<u64, RoaringBitmap>) -> Vec<u64> {
-        let dir = self.pool_root.join("segments").join("data");
+        self.sweep_candidates_on(&self.pool_root, live_sets)
+    }
+
+    /// `sweep_candidates` for an arbitrary vdev root, given that device's
+    /// own live bitmaps (`LiveSet::resolve_on`). Sweep is per-vdev; only
+    /// mark is pool-wide (ARCHITECTURE.md §15.7).
+    pub fn sweep_candidates_on(
+        &self,
+        vdev_root: &Path,
+        live_sets: &HashMap<u64, RoaringBitmap>,
+    ) -> Vec<u64> {
+        let dir = vdev_root.join("segments").join("data");
         let Ok(entries) = std::fs::read_dir(&dir) else {
             return Vec::new();
         };
@@ -158,7 +171,7 @@ impl GcEngine {
         let sealed_ids: Vec<u64> = segment_ids
             .into_iter()
             .filter(|&id| {
-                SegmentReader::open(&self.pool_root, id, StreamKind::Data)
+                SegmentReader::open(vdev_root, id, StreamKind::Data)
                     .ok()
                     .and_then(|r| r.read_header().ok())
                     .map(|h| h.state != SegmentState::Open)
@@ -173,7 +186,7 @@ impl GcEngine {
             .copied()
             .filter(|&id| {
                 let Ok(meta) = std::fs::metadata(crate::segment::segment_path(
-                    &self.pool_root,
+                    vdev_root,
                     id,
                     StreamKind::Data,
                 )) else {

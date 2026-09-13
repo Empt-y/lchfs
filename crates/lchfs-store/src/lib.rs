@@ -610,6 +610,9 @@ impl Pool {
             root_hash: Hash32([0; 32]),
         };
 
+        // Every online device gets swept and scanned (§15.7); the daemons
+        // hold their own copy of the list.
+        let daemon_targets: Vec<Vdev> = vdevs.clone();
         let shared = Arc::new(PoolShared {
             pool_root: pool_root.to_path_buf(),
             pool_params: params,
@@ -643,13 +646,12 @@ impl Pool {
             checkpoint_lock: Mutex::new(()),
             coalesce: Mutex::new(coalesce::CoalesceDaemon::new(
                 pool_root.to_path_buf(),
-                0,
+                daemon_targets.clone(),
                 Arc::clone(&dedup_index),
                 Arc::clone(&dedup_pins),
             )),
             dedup: Mutex::new(dedup::DedupScanner::new(
-                pool_root.to_path_buf(),
-                0,
+                daemon_targets,
                 Arc::clone(&dedup_index),
             )),
             checkpoint_task: Mutex::new(None),
@@ -1103,6 +1105,9 @@ impl Pool {
             root_hash: slot.root_hash,
         };
 
+        // Every online device gets swept and scanned (§15.7); the daemons
+        // hold their own copy of the list.
+        let daemon_targets: Vec<Vdev> = vdevs.clone();
         let shared = Arc::new(PoolShared {
             pool_root: pool_root.to_path_buf(),
             pool_params: root.pool_params,
@@ -1135,13 +1140,12 @@ impl Pool {
             checkpoint_lock: Mutex::new(()),
             coalesce: Mutex::new(coalesce::CoalesceDaemon::new(
                 pool_root.to_path_buf(),
-                slot.vdev_id,
+                daemon_targets.clone(),
                 Arc::clone(&dedup_index),
                 Arc::clone(&dedup_pins),
             )),
             dedup: Mutex::new(dedup::DedupScanner::new(
-                pool_root.to_path_buf(),
-                slot.vdev_id,
+                daemon_targets,
                 Arc::clone(&dedup_index),
             )),
             checkpoint_task: Mutex::new(None),

@@ -128,7 +128,7 @@ fn shared_chunk_survives_when_only_one_referencing_root_is_live() {
 
     // The shared chunk itself must be live in *both* cases -- it's still
     // referenced by B regardless of which generation's root is considered.
-    for (seg, live_set) in &live_gen2_only {
+    for (seg, live_set) in &live_gen2_only.by_segment {
         assert!(live_both.get(seg).unwrap().len() >= live_set.len());
     }
 }
