@@ -4,7 +4,8 @@
 //! missing segment, or bytes that no longer hash to what the header claims
 //! -- the read is served from another replica and the bad one is healed
 //! from those bytes. Resilver is the same heal applied to every record a
-//! vdev is missing or holding corrupt.
+//! vdev is missing; scrub is it applied to every record a vdev holds but
+//! can no longer read back.
 //!
 //! Every test damages a real on-disk tree and then asserts on what a read
 //! returns *and* on what ended up on disk, because the two can disagree:
@@ -178,7 +179,6 @@ fn resilver_recreates_replicas_a_device_never_received() {
     let pool = Pool::open_replicated(&[a.path(), b.path()]).unwrap();
     let report = pool.resilver(1).unwrap();
     assert_eq!(report.missing, expected_missing, "{report:?}");
-    assert_eq!(report.corrupt, 0, "{report:?}");
     assert_eq!(report.healed, expected_missing, "{report:?}");
     assert!(report.unrecoverable.is_empty(), "{report:?}");
     assert!(!segment_files(b.path(), "data").is_empty());
@@ -186,7 +186,7 @@ fn resilver_recreates_replicas_a_device_never_received() {
 
     // A second pass has nothing left to do.
     let again = pool.resilver(1).unwrap();
-    assert_eq!((again.missing, again.corrupt, again.healed), (0, 0, 0), "{again:?}");
+    assert_eq!((again.missing, again.healed), (0, 0), "{again:?}");
 
     // Proof the resilvered copies are real: lose vdev a's data and read.
     // Reopened first, because the pool holds its segment files open and an
@@ -201,8 +201,21 @@ fn resilver_recreates_replicas_a_device_never_received() {
     assert!(pool.repair_stats().failovers >= 1);
 }
 
+/// Resilver is the cheap catch-up and deliberately trusts what the index
+/// says a device has; rot in records it already holds is scrub's job.
 #[test]
-fn resilver_repairs_replicas_that_went_bad_in_place() {
+fn resilver_does_not_look_for_corruption() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    write_and_checkpoint(a.path(), b.path());
+    corrupt_data_segments(b.path());
+    let pool = Pool::open_replicated(&[a.path(), b.path()]).unwrap();
+    let report = pool.resilver(1).unwrap();
+    assert_eq!((report.missing, report.healed), (0, 0), "{report:?}");
+}
+
+#[test]
+fn scrub_repairs_replicas_that_went_bad_in_place() {
     let a = tempfile::tempdir().unwrap();
     let b = tempfile::tempdir().unwrap();
     let ino = write_and_checkpoint(a.path(), b.path());
@@ -210,14 +223,18 @@ fn resilver_repairs_replicas_that_went_bad_in_place() {
     corrupt_data_segments(b.path());
 
     let pool = Pool::open_replicated(&[a.path(), b.path()]).unwrap();
-    let report = pool.resilver(1).unwrap();
-    assert!(report.corrupt >= 1, "{report:?}");
-    assert_eq!(report.missing, 0, "{report:?}");
-    assert_eq!(report.healed, report.corrupt, "{report:?}");
-    assert!(report.unrecoverable.is_empty(), "{report:?}");
+    let reports = pool.scrub().unwrap();
+    assert_eq!(reports.len(), 2);
+    let [ra, rb] = [&reports[0], &reports[1]];
+    assert_eq!((ra.vdev_id, rb.vdev_id), (0, 1));
+    assert_eq!(ra.corrupt, 0, "vdev a was not touched: {ra:?}");
+    assert!(ra.verified > 0, "{ra:?}");
+    assert!(rb.corrupt >= 1, "{rb:?}");
+    assert_eq!(rb.healed, rb.corrupt, "{rb:?}");
+    assert!(rb.unrecoverable.is_empty(), "{rb:?}");
 
-    let again = pool.resilver(1).unwrap();
-    assert_eq!((again.missing, again.corrupt, again.healed), (0, 0, 0), "{again:?}");
+    let again = pool.scrub().unwrap();
+    assert!(again.iter().all(|r| r.corrupt == 0 && r.healed == 0), "{again:?}");
 
     drop(pool);
     for f in segment_files(a.path(), "data") {
@@ -229,7 +246,7 @@ fn resilver_repairs_replicas_that_went_bad_in_place() {
 }
 
 #[test]
-fn resilver_reports_what_no_replica_can_supply() {
+fn scrub_reports_what_no_replica_can_supply() {
     let a = tempfile::tempdir().unwrap();
     let b = tempfile::tempdir().unwrap();
     let _ino = write_and_checkpoint(a.path(), b.path());
@@ -241,10 +258,32 @@ fn resilver_reports_what_no_replica_can_supply() {
         }
     }
     let pool = Pool::open_replicated(&[a.path(), b.path()]).unwrap();
-    let report = pool.resilver(1).unwrap();
-    assert!(!report.unrecoverable.is_empty(), "{report:?}");
-    assert_eq!(report.healed, 0, "{report:?}");
+    let reports = pool.scrub().unwrap();
+    for r in &reports {
+        assert!(!r.unrecoverable.is_empty(), "{r:?}");
+        assert_eq!(r.healed, 0, "{r:?}");
+    }
     assert_eq!(pool.repair_stats().heals, 0);
+}
+
+/// A single-vdev pool has nowhere to heal from, but scrub still says what
+/// it found -- silent rot on the only copy is worth knowing about early.
+#[test]
+fn scrub_on_a_single_vdev_reports_without_healing() {
+    let a = tempfile::tempdir().unwrap();
+    {
+        let pool = Pool::create(a.path(), small_params()).unwrap();
+        let ino = pool.create_file(1, "big", 0o644).unwrap();
+        pool.write(ino, 0, &payload()).unwrap();
+        pool.checkpoint().unwrap();
+    }
+    corrupt_data_segments(a.path());
+    let pool = Pool::open(a.path()).unwrap();
+    let reports = pool.scrub().unwrap();
+    assert_eq!(reports.len(), 1);
+    assert!(reports[0].corrupt >= 1, "{reports:?}");
+    assert_eq!(reports[0].healed, 0);
+    assert_eq!(reports[0].unrecoverable.len() as u64, reports[0].corrupt);
 }
 
 #[test]
@@ -274,8 +313,8 @@ fn a_heal_segment_that_exists_on_one_vdev_survives_a_remount_and_new_writes() {
     corrupt_data_segments(b.path());
     {
         let pool = Pool::open_replicated(&[a.path(), b.path()]).unwrap();
-        let report = pool.resilver(1).unwrap();
-        assert!(report.healed >= 1, "{report:?}");
+        let reports = pool.scrub().unwrap();
+        assert!(reports[1].healed >= 1, "{reports:?}");
     }
     // New files on b that hold records. (Mounting also opens a fresh,
     // header-only active data segment on every vdev; that is not a heal.)

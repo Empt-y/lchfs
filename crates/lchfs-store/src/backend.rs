@@ -32,18 +32,29 @@ use std::path::{Path, PathBuf};
 /// remaining Phase 3 work.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Vdev {
+    /// The slot this device occupies in the pool (§15.6) -- what its
+    /// superblock's `vdev_id` says, and what its index entries are keyed
+    /// by. Carried here rather than implied by position in a list, so a
+    /// degraded mount (§15.8) can hold just the online devices without the
+    /// ids of the ones after a gap being off by one.
+    pub id: u16,
     pub root: PathBuf,
 }
 
 impl Vdev {
-    pub fn new(root: PathBuf) -> Self {
-        Self { root }
+    pub fn new(id: u16, root: PathBuf) -> Self {
+        Self { id, root }
     }
 
     /// This vdev's superblock ring. Each vdev carries its own (§15.5).
     pub fn superblock_path(&self) -> PathBuf {
-        self.root.join("SUPERBLOCK")
+        superblock_path(&self.root)
     }
+}
+
+/// Where a vdev root keeps its superblock ring.
+pub fn superblock_path(vdev_root: &Path) -> PathBuf {
+    vdev_root.join("SUPERBLOCK")
 }
 
 /// Abstraction over where pool bytes actually live. `FileBackend` (plain
@@ -59,19 +70,20 @@ pub trait StorageBackend: Send + Sync {
 /// layout). Fixed size — `SUPERBLOCK_SLOT_COUNT * SUPERBLOCK_SLOT_SIZE`
 /// bytes — created on first open and never resized after.
 pub struct FileBackend {
-    /// The vdev this backend's superblock belongs to. Previously a
+    /// The vdev root this backend's superblock lives in. A backend is
+    /// opened before its superblock has been read, so it cannot know which
+    /// slot the device occupies -- only where it is. (Previously a
     /// `_`-prefixed `Vec<Vdev>` that was always length 1 and never read —
     /// dead weight that made the abstraction look more ready for
-    /// replication than it was.
-    vdev: Vdev,
+    /// replication than it was.)
+    root: PathBuf,
     file: std::fs::File,
 }
 
 impl FileBackend {
     pub fn open(vdev_root: &Path) -> io::Result<Self> {
         std::fs::create_dir_all(vdev_root)?;
-        let vdev = Vdev::new(vdev_root.to_path_buf());
-        let path = vdev.superblock_path();
+        let path = superblock_path(vdev_root);
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -82,12 +94,15 @@ impl FileBackend {
         if file.metadata()?.len() < total_size {
             file.set_len(total_size)?;
         }
-        Ok(Self { vdev, file })
+        Ok(Self {
+            root: vdev_root.to_path_buf(),
+            file,
+        })
     }
 
-    /// The vdev this backend reads and writes.
-    pub fn vdev(&self) -> &Vdev {
-        &self.vdev
+    /// The vdev root this backend reads and writes.
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 }
 

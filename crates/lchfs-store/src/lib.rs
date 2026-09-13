@@ -225,6 +225,10 @@ const COALESCE_INTERVAL: Duration = Duration::from_secs(60);
 /// physical rewrite), and faster convergence bounds how long duplicate
 /// space sits around before Coalesce/GC can reclaim it.
 const DEDUP_INTERVAL: Duration = Duration::from_secs(30);
+/// Scrub reads every record on every vdev, so it is the most expensive
+/// background pass by far; once a day is the conventional cadence and
+/// tests call `Pool::scrub` directly rather than waiting on it.
+const SCRUB_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 fn index_path(pool_root: &Path) -> PathBuf {
     pool_root.join("INDEX.redb")
@@ -242,6 +246,12 @@ pub(crate) const PRIMARY_VDEV_ID: u16 = 0;
 /// and not another, so the vdev is part of the identity.
 pub(crate) type SegmentReaders = HashMap<(u16, u64, StreamKind), SegmentReader>;
 
+/// Every replica of one hash: `(vdev_id, location)`, ascending by vdev.
+type Replicas = Vec<(u16, ExtentLocation)>;
+/// A heal that has been appended but not yet fsync'd and indexed:
+/// `(vdev_id, stream, hash, new location)` -- what `heal_commit` takes.
+type PendingHeal = (u16, StreamKind, Hash32, ExtentLocation);
+
 /// Heal appends per fsync during a resilver. One fsync per record would make
 /// resilvering a large device take as long as writing it record by record.
 const HEAL_BATCH: usize = 256;
@@ -253,10 +263,21 @@ pub struct ResilverReport {
     pub examined: u64,
     /// No index entry for this vdev at all: the device missed the write.
     pub missing: u64,
-    /// Indexed but the record did not read back and verify.
-    pub corrupt: u64,
     pub healed: u64,
     /// Hashes with no healthy replica anywhere -- genuine data loss.
+    pub unrecoverable: Vec<Hash32>,
+}
+
+/// What a scrub found and did on one vdev.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ScrubReport {
+    pub vdev_id: u16,
+    /// Replicas on this vdev that were read and checked.
+    pub verified: u64,
+    /// Of those, the ones that did not read back and verify.
+    pub corrupt: u64,
+    pub healed: u64,
+    /// Corrupt here and with no healthy replica anywhere else.
     pub unrecoverable: Vec<Hash32>,
 }
 
@@ -388,13 +409,24 @@ struct PoolShared {
     pool_uuid: [u8; 16],
     vdev_id: u16,
     vdev_count: u16,
-    /// Every vdev backing this pool, indexed by `vdev_id` (ARCHITECTURE.md
-    /// §15.10). `vdevs[0]`'s root is `pool_root`.
+    /// Every vdev *online* in this mount, ascending by `Vdev::id`
+    /// (ARCHITECTURE.md §15.10). `vdevs[0]` is always vdev 0, whose root is
+    /// `pool_root`. In a degraded mount (§15.8) this is shorter than
+    /// `vdev_count`; `missing_vdevs` names the gaps.
     vdevs: Vec<Vdev>,
-    /// One superblock ring per vdev (§15.5), index-aligned with `vdevs`.
-    /// Each carries its own `vdev_id` and its own `root_location`, since a
-    /// root object's offset can differ per device after a repair.
+    /// One superblock ring per online vdev (§15.5), index-aligned with
+    /// `vdevs`. Each carries its own `vdev_id` and its own
+    /// `root_location`, since a root object's offset can differ per device
+    /// after a repair.
     superblock_backends: Vec<FileBackend>,
+    /// Slots with no device present in this mount. Writes do not reach
+    /// them, their superblocks are not advanced, and so their generation
+    /// falls behind -- which is exactly how the next full mount knows to
+    /// resilver them (§15.5).
+    missing_vdevs: Vec<u16>,
+    /// What the mount-time resilver did for each vdev found behind the
+    /// primary's generation, in the order it ran.
+    mount_resilver: Vec<(u16, ResilverReport)>,
     /// Advisory single-writer guard on `<pool_root>/LOCK` (ARCHITECTURE.md
     /// §1's pool layout). Never read -- held purely for its lifetime, and
     /// released by `Flock`'s `Drop` when the `Pool` goes away. `flock(2)` is
@@ -466,6 +498,7 @@ struct PoolShared {
     checkpoint_task: Mutex<Option<background::PeriodicTask>>,
     coalesce_task: Mutex<Option<background::PeriodicTask>>,
     dedup_task: Mutex<Option<background::PeriodicTask>>,
+    scrub_task: Mutex<Option<background::PeriodicTask>>,
 }
 
 impl Pool {
@@ -499,7 +532,11 @@ impl Pool {
             pool_locks.push(acquire_pool_lock(root)?);
             superblock_backends.push(FileBackend::open(root)?);
         }
-        let vdevs: Vec<Vdev> = vdev_roots.iter().map(|r| Vdev::new(r.to_path_buf())).collect();
+        let vdevs: Vec<Vdev> = vdev_roots
+            .iter()
+            .enumerate()
+            .map(|(id, r)| Vdev::new(id as u16, r.to_path_buf()))
+            .collect();
         let vdev_root_paths: Vec<PathBuf> = vdevs.iter().map(|v| v.root.clone()).collect();
         // None of them may already hold a pool -- checked for every device,
         // not just vdev 0, so a half-built set cannot be silently absorbed.
@@ -584,6 +621,8 @@ impl Pool {
             vdev_count: vdevs.len() as u16,
             vdevs,
             superblock_backends,
+            missing_vdevs: Vec::new(),
+            mount_resilver: Vec::new(),
             _pool_locks: pool_locks,
             namespace: Mutex::new(namespace),
             file_state: Mutex::new(HashMap::new()),
@@ -616,6 +655,7 @@ impl Pool {
             checkpoint_task: Mutex::new(None),
             coalesce_task: Mutex::new(None),
             dedup_task: Mutex::new(None),
+            scrub_task: Mutex::new(None),
         });
 
         shared.run_checkpoint()?;
@@ -634,7 +674,7 @@ impl Pool {
     }
 
     /// Opens a pool spanning `vdev_roots`, which must be given in `vdev_id`
-    /// order with vdev 0 first.
+    /// order with vdev 0 first, and must be the complete set.
     ///
     /// The device list is supplied by the caller rather than discovered:
     /// §15.10 records that where to store it is still open, since a path
@@ -644,57 +684,147 @@ impl Pool {
     /// `vdev_count`, and occupy its expected slot. A foreign or stale device
     /// is refused rather than mounted as if it were a member, which is the
     /// whole reason the identity fields exist.
+    ///
+    /// A short list is refused here on purpose: mounting with a device
+    /// missing is `open_degraded`'s job, and it should never happen because
+    /// someone left a path off the command line (§15.8).
     pub fn open_replicated(vdev_roots: &[&Path]) -> Result<Self, PoolError> {
-        if vdev_roots.is_empty() {
+        Self::open_set(vdev_roots, false)
+    }
+
+    /// Opens a pool with some of its devices absent (ARCHITECTURE.md §15.8).
+    /// Read-write: writes fan out to the devices that are present, and the
+    /// absent ones simply fall behind. When they return, the next
+    /// `open_replicated` sees their superblock generation trailing the
+    /// primary's and resilvers them before the pool starts serving.
+    ///
+    /// Devices may be given in any order -- each one's superblock says
+    /// which slot it occupies -- but vdev 0 must be among them. It holds
+    /// `INDEX.redb` (§15.10) and is where every default read goes; mounting
+    /// without it would mean electing a new primary and rebuilding the
+    /// index onto it, which this does not yet do.
+    pub fn open_degraded(vdev_roots: &[&Path]) -> Result<Self, PoolError> {
+        Self::open_set(vdev_roots, true)
+    }
+
+    fn open_set(given_roots: &[&Path], allow_missing: bool) -> Result<Self, PoolError> {
+        if given_roots.is_empty() {
             return Err(PoolError::InvalidArgument(
                 "a pool needs at least one vdev".into(),
             ));
         }
-        let pool_root = vdev_roots[0];
-        let mut pool_locks = Vec::with_capacity(vdev_roots.len());
-        let mut superblock_backends = Vec::with_capacity(vdev_roots.len());
-        for root in vdev_roots {
-            pool_locks.push(acquire_pool_lock(root)?);
-            superblock_backends.push(FileBackend::open(root)?);
-        }
-        let vdevs: Vec<Vdev> = vdev_roots.iter().map(|r| Vdev::new(r.to_path_buf())).collect();
-        let vdev_root_paths: Vec<PathBuf> = vdevs.iter().map(|v| v.root.clone()).collect();
-
-        let mut slots = Vec::with_capacity(vdev_roots.len());
-        for (backend, root) in superblock_backends.iter().zip(vdev_roots) {
-            slots.push(read_superblock(backend)?.ok_or_else(|| {
+        // Read every superblock first, so membership is judged on what the
+        // devices say about themselves and not on the order they were
+        // named in.
+        let mut members: Vec<(SuperblockSlot, &Path)> = Vec::with_capacity(given_roots.len());
+        for root in given_roots {
+            let backend = FileBackend::open(root)?;
+            let slot = read_superblock(&backend)?.ok_or_else(|| {
                 PoolError::Format(format!(
                     "no valid superblock found at {} — was create-pool run?",
                     root.display()
                 ))
-            })?);
+            })?;
+            members.push((slot, root));
         }
+
         // Membership check (§15.6), before anything trusts these devices.
-        let expected_uuid = slots[0].pool_uuid;
-        for (idx, (s, root)) in slots.iter().zip(vdev_roots).enumerate() {
+        let expected_uuid = members[0].0.pool_uuid;
+        let vdev_count = members[0].0.vdev_count;
+        for (s, root) in &members {
             if s.pool_uuid != expected_uuid {
                 return Err(PoolError::Format(format!(
-                    "{} belongs to a different pool — refusing to mount it as vdev {idx}",
+                    "{} belongs to a different pool — refusing to mount it as a member",
                     root.display()
                 )));
             }
-            if s.vdev_count as usize != vdev_roots.len() {
+            if s.vdev_count != vdev_count {
                 return Err(PoolError::Format(format!(
-                    "{} says the pool has {} vdevs but {} were given",
+                    "{} says the pool has {} vdevs but {} says {}",
                     root.display(),
                     s.vdev_count,
-                    vdev_roots.len()
-                )));
-            }
-            if s.vdev_id as usize != idx {
-                return Err(PoolError::Format(format!(
-                    "{} is vdev {} but was given in position {idx} — devices must be passed in vdev_id order",
-                    root.display(),
-                    s.vdev_id
+                    members[0].1.display(),
+                    vdev_count
                 )));
             }
         }
-        let slot = slots[0];
+        if !allow_missing {
+            if members.len() != vdev_count as usize {
+                return Err(PoolError::Format(format!(
+                    "{} says the pool has {} vdevs but {} were given",
+                    members[0].1.display(),
+                    vdev_count,
+                    members.len()
+                )));
+            }
+            for (idx, (s, root)) in members.iter().enumerate() {
+                if s.vdev_id as usize != idx {
+                    return Err(PoolError::Format(format!(
+                        "{} is vdev {} but was given in position {idx} — devices must be passed in vdev_id order",
+                        root.display(),
+                        s.vdev_id
+                    )));
+                }
+            }
+        }
+        members.sort_by_key(|(s, _)| s.vdev_id);
+        for pair in members.windows(2) {
+            if pair[0].0.vdev_id == pair[1].0.vdev_id {
+                return Err(PoolError::Format(format!(
+                    "{} and {} both claim to be vdev {}",
+                    pair[0].1.display(),
+                    pair[1].1.display(),
+                    pair[0].0.vdev_id
+                )));
+            }
+        }
+        if members[0].0.vdev_id != PRIMARY_VDEV_ID {
+            return Err(PoolError::Format(format!(
+                "vdev {PRIMARY_VDEV_ID} is not among the devices given — it holds the index and cannot be absent yet"
+            )));
+        }
+        let present: HashSet<u16> = members.iter().map(|(s, _)| s.vdev_id).collect();
+        let missing_vdevs: Vec<u16> = (0..vdev_count).filter(|id| !present.contains(id)).collect();
+
+        // §15.5: the highest generation across the set is the truth. The
+        // primary must hold it, because the index and every default read
+        // live there; a primary that is *behind* another device would need
+        // that device promoted, which is not done yet. Refusing is the
+        // honest answer -- mounting would serve an old root while newer
+        // data sits on the other device, unreachable.
+        let newest = members.iter().map(|(s, _)| s.generation).max().unwrap_or(0);
+        if members[0].0.generation < newest {
+            let ahead: Vec<String> = members
+                .iter()
+                .filter(|(s, _)| s.generation == newest)
+                .map(|(s, r)| format!("vdev {} at {}", s.vdev_id, r.display()))
+                .collect();
+            return Err(PoolError::Format(format!(
+                "vdev 0 is at generation {} but {} at generation {newest}: cannot mount from a stale primary",
+                members[0].0.generation,
+                ahead.join(", ")
+            )));
+        }
+        let stale_vdevs: Vec<u16> = members
+            .iter()
+            .filter(|(s, _)| s.generation < newest)
+            .map(|(s, _)| s.vdev_id)
+            .collect();
+
+        let vdev_roots: Vec<&Path> = members.iter().map(|(_, r)| *r).collect();
+        let pool_root = vdev_roots[0];
+        let mut pool_locks = Vec::with_capacity(vdev_roots.len());
+        let mut superblock_backends = Vec::with_capacity(vdev_roots.len());
+        for root in &vdev_roots {
+            pool_locks.push(acquire_pool_lock(root)?);
+            superblock_backends.push(FileBackend::open(root)?);
+        }
+        let vdevs: Vec<Vdev> = members
+            .iter()
+            .map(|(s, r)| Vdev::new(s.vdev_id, r.to_path_buf()))
+            .collect();
+        let vdev_root_paths: Vec<PathBuf> = vdevs.iter().map(|v| v.root.clone()).collect();
+        let slot = members[0].0;
 
         let index_file = index_path(pool_root);
         let fresh_index = index_file
@@ -799,7 +929,7 @@ impl Pool {
         // and `SegmentWriter::create` would truncate that heal segment on
         // its way to fanning the new one out.
         let mut max_segment_id = max_segment_id;
-        for vdev in &vdevs[1..] {
+        for vdev in &vdevs {
             max_segment_id = max_segment_id.max(highest_segment_id_on(&vdev.root)?);
         }
         let next_segment_id = Arc::new(AtomicU64::new(max_segment_id + 1));
@@ -983,6 +1113,8 @@ impl Pool {
             vdev_count: slot.vdev_count,
             vdevs,
             superblock_backends,
+            missing_vdevs,
+            mount_resilver: Vec::new(),
             _pool_locks: pool_locks,
             namespace: Mutex::new(namespace),
             file_state: Mutex::new(file_state_from_replay),
@@ -1015,7 +1147,29 @@ impl Pool {
             checkpoint_task: Mutex::new(None),
             coalesce_task: Mutex::new(None),
             dedup_task: Mutex::new(None),
+            scrub_task: Mutex::new(None),
         });
+
+        // A device that trailed the primary's generation missed writes
+        // (a degraded mount ran without it, or a crash landed between two
+        // superblock updates). Catch it up *before* the pool serves or any
+        // daemon runs, so nothing can observe it half-repaired. Only
+        // missing replicas are copied -- the delta -- not everything
+        // re-verified; that is scrub's job.
+        let mut shared = shared;
+        if !stale_vdevs.is_empty() {
+            let mut reports = Vec::with_capacity(stale_vdevs.len());
+            for id in stale_vdevs {
+                tracing::info!("vdev {id} is behind the primary; resilvering");
+                reports.push((id, shared.resilver(id)?));
+            }
+            // Nothing else holds the Arc yet -- background threads are what
+            // clone it, and they start below -- so this is the one moment
+            // the field can be set without a lock.
+            Arc::get_mut(&mut shared)
+                .ok_or_else(|| PoolError::Format("pool shared before mount finished".into()))?
+                .mount_resilver = reports;
+        }
 
         shared.spawn_background_threads();
 
@@ -1027,10 +1181,37 @@ impl Pool {
         self.0.read(ino, offset, len)
     }
 
-    /// Repairs `vdev_id` from the other replicas (ARCHITECTURE.md §15.4).
-    /// Safe to run on a live pool; concurrent reads and writes proceed.
+    /// Copies onto `vdev_id` every record it is missing (ARCHITECTURE.md
+    /// §15.4). Runs automatically at mount for a device whose generation
+    /// trails the primary's; exposed so it can also be run on demand. Safe
+    /// on a live pool.
     pub fn resilver(&self, vdev_id: u16) -> Result<ResilverReport, PoolError> {
         self.0.resilver(vdev_id)
+    }
+
+    /// Verifies every record on every online vdev and heals what fails
+    /// (ARCHITECTURE.md §15.8). The background scrub task calls this same
+    /// path on its own timer; exposed so tests and tooling can run one
+    /// pass synchronously.
+    pub fn scrub(&self) -> Result<Vec<ScrubReport>, PoolError> {
+        self.0.scrub()
+    }
+
+    /// True when this mount is running without some of the pool's devices
+    /// (`open_degraded`).
+    pub fn is_degraded(&self) -> bool {
+        !self.0.missing_vdevs.is_empty()
+    }
+
+    /// The vdev slots with no device present in this mount.
+    pub fn missing_vdevs(&self) -> &[u16] {
+        &self.0.missing_vdevs
+    }
+
+    /// What mount-time resilvering did, per vdev that needed it. Empty when
+    /// every device was already at the primary's generation.
+    pub fn mount_resilver(&self) -> &[(u16, ResilverReport)] {
+        &self.0.mount_resilver
     }
 
     /// Counters for what read failover and heal have done so far.
@@ -1315,6 +1496,7 @@ impl Drop for Pool {
         self.0.checkpoint_task.lock().take();
         self.0.coalesce_task.lock().take();
         self.0.dedup_task.lock().take();
+        self.0.scrub_task.lock().take();
     }
 }
 
@@ -1349,6 +1531,22 @@ impl PoolShared {
             let _ = dedup_shared.run_dedup_pass();
         });
         *self.dedup_task.lock() = Some(dedup_task);
+
+        let scrub_shared = Arc::clone(self);
+        let scrub_task = background::PeriodicTask::spawn("lchfs-scrub", SCRUB_INTERVAL, move || {
+            match scrub_shared.scrub() {
+                Ok(reports) => {
+                    for r in reports.iter().filter(|r| r.corrupt > 0) {
+                        tracing::warn!(
+                            "scrub: vdev {} had {} corrupt of {} records, healed {}, {} unrecoverable",
+                            r.vdev_id, r.corrupt, r.verified, r.healed, r.unrecoverable.len()
+                        );
+                    }
+                }
+                Err(e) => tracing::error!("scrub pass failed: {e}"),
+            }
+        });
+        *self.scrub_task.lock() = Some(scrub_task);
     }
 
     /// One idle-cycle GC-mark-and-coalesce pass (ARCHITECTURE.md §6):
@@ -1824,9 +2022,16 @@ impl PoolShared {
 
     fn vdev_root(&self, vdev_id: u16) -> Result<&Path, PoolError> {
         self.vdevs
-            .get(vdev_id as usize)
+            .iter()
+            .find(|v| v.id == vdev_id)
             .map(|v| v.root.as_path())
-            .ok_or_else(|| PoolError::InvalidArgument(format!("no vdev {vdev_id} in this pool")))
+            .ok_or_else(|| {
+                if self.missing_vdevs.contains(&vdev_id) {
+                    PoolError::InvalidArgument(format!("vdev {vdev_id} is not present in this mount"))
+                } else {
+                    PoolError::InvalidArgument(format!("no vdev {vdev_id} in this pool"))
+                }
+            })
     }
 
     /// Heals a single record onto `vdev_id` and makes the new location
@@ -1897,10 +2102,7 @@ impl PoolShared {
     /// never points at bytes that could vanish in a crash. A healed
     /// primary replica is also repointed in the cache, so the next read
     /// goes straight to the good copy instead of failing over again.
-    fn heal_commit(
-        &self,
-        healed: &[(u16, StreamKind, Hash32, ExtentLocation)],
-    ) -> Result<(), PoolError> {
+    fn heal_commit(&self, healed: &[PendingHeal]) -> Result<(), PoolError> {
         if healed.is_empty() {
             return Ok(());
         }
@@ -1945,12 +2147,12 @@ impl PoolShared {
     }
 
     /// Brings `vdev_id` up to date with the rest of the pool
-    /// (ARCHITECTURE.md §15.4): every hash the pool knows is checked on
-    /// that device, and any replica that is missing from the index *or*
-    /// present but failing verification is re-created from a healthy
-    /// replica elsewhere. The first covers a device that missed writes;
-    /// the second covers one that lost or corrupted what it had. Both are
-    /// the same heal, in bulk, batched under one fsync per `HEAL_BATCH`.
+    /// (ARCHITECTURE.md §15.4): every hash with no index entry for that
+    /// device is copied there from a healthy replica. That is the whole
+    /// delta a device that missed writes needs, and it costs an index walk
+    /// plus one read and one append per missing record -- nothing is
+    /// re-read that the device already has. Records it holds but has since
+    /// corrupted are `scrub`'s concern.
     fn resilver(&self, vdev_id: u16) -> Result<ResilverReport, PoolError> {
         if self.vdevs.len() == 1 {
             return Err(PoolError::InvalidArgument(
@@ -1958,46 +2160,15 @@ impl PoolShared {
             ));
         }
         self.vdev_root(vdev_id)?;
-        let all = self.persisted_index.read().iter_all_chunk_locations()?;
-
         let mut report = ResilverReport::default();
-        let mut pending: Vec<(u16, StreamKind, Hash32, ExtentLocation)> = Vec::new();
-        let mut i = 0;
-        while i < all.len() {
-            let hash = all[i].0;
-            let mut j = i;
-            while j < all.len() && all[j].0 == hash {
-                j += 1;
-            }
-            let replicas = &all[i..j];
-            i = j;
+        let mut pending: Vec<PendingHeal> = Vec::new();
+        for (hash, replicas) in self.replica_groups()? {
             report.examined += 1;
-
-            let own = replicas.iter().find(|(_, v, _)| *v == vdev_id).map(|r| r.2);
-            let own_kind = own.and_then(|loc| self.stream_kind_of(vdev_id, loc.segment_id));
-            let own_ok = match (own, own_kind) {
-                (Some(loc), Some(kind)) => self.read_raw_from_vdev(vdev_id, loc, kind).is_ok(),
-                _ => false,
-            };
-            if own_ok {
+            if replicas.iter().any(|(v, _)| *v == vdev_id) {
                 continue;
             }
-            if own.is_some() {
-                report.corrupt += 1;
-            } else {
-                report.missing += 1;
-            }
-
-            let mut healed = false;
-            for &(_, src, loc) in replicas.iter().filter(|(_, v, _)| *v != vdev_id) {
-                let Some(kind) = self.stream_kind_of(src, loc.segment_id) else { continue };
-                let Ok((header, raw)) = self.read_raw_from_vdev(src, loc, kind) else { continue };
-                let new_loc = self.heal_append(vdev_id, kind, &header, &raw)?;
-                pending.push((vdev_id, kind, hash, new_loc));
-                healed = true;
-                break;
-            }
-            if !healed {
+            report.missing += 1;
+            if !self.heal_from_any_replica(hash, vdev_id, &replicas, &mut pending)? {
                 report.unrecoverable.push(hash);
             }
             if pending.len() >= HEAL_BATCH {
@@ -2010,6 +2181,98 @@ impl PoolShared {
         report.healed += pending.len() as u64;
         self.seal_heal_writers()?;
         Ok(report)
+    }
+
+    /// Reads and verifies every record on every online vdev, healing what
+    /// fails from a replica that passes (ARCHITECTURE.md §15.8). The slow,
+    /// thorough counterpart to `resilver`: it finds rot that no read has
+    /// tripped over yet, which on a replicated pool is the only kind that
+    /// can still turn into data loss -- a bad replica nobody has noticed is
+    /// one more failure away from being the last copy.
+    ///
+    /// On a single-vdev pool it still verifies and reports; it just has
+    /// nowhere to heal from.
+    fn scrub(&self) -> Result<Vec<ScrubReport>, PoolError> {
+        let groups = self.replica_groups()?;
+        let mut reports = Vec::with_capacity(self.vdevs.len());
+        for vdev in &self.vdevs {
+            let mut report = ScrubReport {
+                vdev_id: vdev.id,
+                ..Default::default()
+            };
+            let mut pending: Vec<PendingHeal> = Vec::new();
+            for (hash, replicas) in &groups {
+                let Some(&(_, own)) = replicas.iter().find(|(v, _)| *v == vdev.id) else {
+                    continue;
+                };
+                report.verified += 1;
+                let ok = self
+                    .stream_kind_of(vdev.id, own.segment_id)
+                    .is_some_and(|kind| self.read_raw_from_vdev(vdev.id, own, kind).is_ok());
+                if ok {
+                    continue;
+                }
+                report.corrupt += 1;
+                if !self.heal_from_any_replica(*hash, vdev.id, replicas, &mut pending)? {
+                    report.unrecoverable.push(*hash);
+                }
+                if pending.len() >= HEAL_BATCH {
+                    self.heal_commit(&pending)?;
+                    report.healed += pending.len() as u64;
+                    pending.clear();
+                }
+            }
+            self.heal_commit(&pending)?;
+            report.healed += pending.len() as u64;
+            reports.push(report);
+        }
+        self.seal_heal_writers()?;
+        Ok(reports)
+    }
+
+    /// Every hash in the index with its replicas, hash-major. One snapshot
+    /// for a whole repair pass; `heal_from_any_replica` re-queries a hash
+    /// live before giving up on it, so a coalesce that moved a replica
+    /// mid-pass does not get it reported as lost.
+    fn replica_groups(&self) -> Result<Vec<(Hash32, Replicas)>, PoolError> {
+        let all = self.persisted_index.read().iter_all_chunk_locations()?;
+        let mut groups: Vec<(Hash32, Replicas)> = Vec::new();
+        for (hash, vdev_id, loc) in all {
+            match groups.last_mut() {
+                Some((h, replicas)) if *h == hash => replicas.push((vdev_id, loc)),
+                _ => groups.push((hash, vec![(vdev_id, loc)])),
+            }
+        }
+        Ok(groups)
+    }
+
+    /// Appends `hash` onto `target` from the first replica elsewhere that
+    /// reads and verifies, queueing the new location in `pending`. `false`
+    /// if no replica anywhere could supply it -- checked twice, the second
+    /// time against the live index, because `replicas` is a snapshot and
+    /// a concurrent coalesce may have moved the only good copy since.
+    fn heal_from_any_replica(
+        &self,
+        hash: Hash32,
+        target: u16,
+        replicas: &[(u16, ExtentLocation)],
+        pending: &mut Vec<PendingHeal>,
+    ) -> Result<bool, PoolError> {
+        let live;
+        let attempts: [&[(u16, ExtentLocation)]; 2] = [replicas, {
+            live = self.persisted_index.read().chunk_locations(hash)?;
+            &live
+        }];
+        for candidates in attempts {
+            for &(src, loc) in candidates.iter().filter(|(v, _)| *v != target) {
+                let Some(kind) = self.stream_kind_of(src, loc.segment_id) else { continue };
+                let Ok((header, raw)) = self.read_raw_from_vdev(src, loc, kind) else { continue };
+                let new_loc = self.heal_append(target, kind, &header, &raw)?;
+                pending.push((target, kind, hash, new_loc));
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Which stream a segment belongs to on `vdev_id`, by which file exists.
@@ -2030,8 +2293,8 @@ impl PoolShared {
     /// that only works if every replica's entry exists to begin with.
     fn record_replicated_location(&self, hash: Hash32, loc: ExtentLocation) -> Result<(), PoolError> {
         let mut index = self.persisted_index.write();
-        for vdev_id in 0..self.vdevs.len() as u16 {
-            index.put_chunk_location(hash, vdev_id, loc)?;
+        for vdev in &self.vdevs {
+            index.put_chunk_location(hash, vdev.id, loc)?;
         }
         Ok(())
     }
@@ -3669,9 +3932,9 @@ impl PoolShared {
         };
         // One superblock per vdev (§15.5). Each records its own vdev_id, so
         // a device can still say which member it is when read on its own.
-        for (idx, backend) in self.superblock_backends.iter().enumerate() {
+        for (vdev, backend) in self.vdevs.iter().zip(&self.superblock_backends) {
             let mut per_vdev = slot;
-            per_vdev.vdev_id = idx as u16;
+            per_vdev.vdev_id = vdev.id;
             finalize_superblock_slot_checksum(&mut per_vdev);
             write_superblock_slot(backend, &per_vdev)?;
         }

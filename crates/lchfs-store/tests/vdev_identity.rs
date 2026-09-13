@@ -161,11 +161,13 @@ fn a_backend_knows_which_vdev_root_it_belongs_to() {
     let dir = tempfile::tempdir().unwrap();
     let backend = FileBackend::open(dir.path()).unwrap();
 
-    assert_eq!(backend.vdev().root, dir.path(), "vdev root should be the directory");
+    assert_eq!(backend.root(), dir.path(), "vdev root should be the directory");
     assert_eq!(
-        backend.vdev().superblock_path(),
+        Vdev::new(3, dir.path().to_path_buf()).superblock_path(),
         dir.path().join("SUPERBLOCK"),
         "the superblock lives inside the vdev root, per the §15.10 layout"
     );
-    assert_eq!(Vdev::new(dir.path().to_path_buf()), *backend.vdev());
+    // A backend is opened before the superblock is read, so it knows the
+    // root and not the slot; the slot is the Vdev's to carry.
+    assert_eq!(Vdev::new(3, dir.path().to_path_buf()).id, 3);
 }
