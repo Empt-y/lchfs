@@ -30,6 +30,40 @@ pub enum SegmentState {
     Open,
     Sealed,
     Coalesced,
+    /// This file is one shard of an erasure-coded segment (ARCHITECTURE.md
+    /// §17.2). The header page also carries a `StripeDescriptor` at
+    /// `STRIPE_DESCRIPTOR_OFFSET`. Appended after the v3 variants so their
+    /// encoding is unchanged.
+    Striped,
+}
+
+/// Where a shard file's `StripeDescriptor` sits inside the 4 KiB header
+/// page: beside the `SegmentHeader`, never inside it, so a v3 header still
+/// decodes as a v3 header.
+pub const STRIPE_DESCRIPTOR_OFFSET: usize = 1024;
+
+/// One shard's view of the stripe it belongs to. Every shard of a segment
+/// carries the same descriptor except `shard_index`, so any one of them
+/// read alone says where its siblings are and how to rebuild a missing
+/// one. `body_hash` is BLAKE3 over the whole logical segment body (after
+/// the header page), and `shard_hash` over this shard's own bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StripeDescriptor {
+    /// Data shards.
+    pub k: u8,
+    /// Parity shards.
+    pub m: u8,
+    /// Bytes per shard; data shard `i` holds logical bytes
+    /// `[i*shard_size, (i+1)*shard_size)` of the body, zero-padded.
+    pub shard_size: u64,
+    /// Which of the `k + m` shards this file is.
+    pub shard_index: u8,
+    /// The vdev holding each shard, indexed by shard number.
+    pub devices: Vec<u16>,
+    /// Bytes of real segment body (excluding padding and header page).
+    pub logical_len: u64,
+    pub body_hash: crate::Hash32,
+    pub shard_hash: crate::Hash32,
 }
 
 /// A segment file's header page (ARCHITECTURE.md §1).

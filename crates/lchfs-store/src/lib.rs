@@ -5340,6 +5340,15 @@ fn read_superblock(backend: &FileBackend) -> Result<Option<SuperblockSlot>, Pool
         // it. Skipping would silently fall back to an older, still-valid slot
         // written before the upgrade, i.e. mount a stale epoch and present it
         // as current: a far worse failure than refusing to open.
+        // A slot that decodes but says an older version: v3's layout is
+        // v4's, only the root object behind it differs (PoolParams grew
+        // its stripe policy), so the slot is the clearest place to refuse.
+        if slot.format_version < lchfs_format::FORMAT_VERSION {
+            return Err(PoolError::LegacyFormatVersion {
+                found: slot.format_version,
+                supported: lchfs_format::FORMAT_VERSION,
+            });
+        }
         if slot.format_version > lchfs_format::FORMAT_VERSION {
             return Err(PoolError::UnsupportedFormatVersion {
                 found: slot.format_version,

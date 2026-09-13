@@ -210,6 +210,15 @@ pub fn read_superblock(pool_root: &Path) -> Result<SuperblockSlot, FsckError> {
         // once magic and CRC vouch for the slot, then fail hard rather than
         // skipping to an older slot and diagnosing a stale epoch as if it
         // were current.
+        // A slot that decodes but says an older version: v3's layout is
+        // v4's, only the root object behind it differs (PoolParams grew
+        // its stripe policy), so the slot is the clearest place to refuse.
+        if slot.format_version < lchfs_format::FORMAT_VERSION {
+            return Err(FsckError::LegacyFormatVersion {
+                found: slot.format_version,
+                supported: lchfs_format::FORMAT_VERSION,
+            });
+        }
         if slot.format_version > lchfs_format::FORMAT_VERSION {
             return Err(FsckError::UnsupportedFormatVersion {
                 found: slot.format_version,

@@ -25,6 +25,9 @@ fn bench_params() -> PoolParams {
         // the sweep isolates "does throughput scale with writer count,"
         // not a confound from also varying shard count.
         logical_shard_count: 64,
+        stripe_k: 0,
+        stripe_m: 0,
+        stripe_min_age_segments: 8,
     }
 }
 

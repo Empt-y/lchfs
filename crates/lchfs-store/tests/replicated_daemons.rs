@@ -16,6 +16,9 @@ fn small_params() -> PoolParams {
         chunk_max_size: 4096,
         inline_threshold: 64,
         logical_shard_count: 1,
+        stripe_k: 0,
+        stripe_m: 0,
+        stripe_min_age_segments: 8,
     }
 }
 

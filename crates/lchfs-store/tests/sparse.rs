@@ -22,6 +22,9 @@ fn small_params() -> PoolParams {
         chunk_max_size: 4096,
         inline_threshold: 64,
         logical_shard_count: 1,
+        stripe_k: 0,
+        stripe_m: 0,
+        stripe_min_age_segments: 8,
     }
 }
 
@@ -321,13 +324,17 @@ fn punched_extents_become_gc_reclaimable() {
     );
 }
 
-/// A pool written before sparse support (format v1) must still open and read
-/// correctly: a v1 chunk list simply has no gaps, which the offset-placing
-/// hydrate handles as a special case of the general one. The version guard
-/// is deliberately one-directional -- it refuses versions *newer* than this
-/// build, never older ones.
+/// This used to assert that a pool labelled format v1 still opened under
+/// v2: the sparse change (v1 → v2) did not alter the on-disk layout, so
+/// the guard was one-directional and older labels were let through. That
+/// stopped being true at v3 (superblock identity fields; v2 refused by a
+/// decode-only mirror) and again at v4 (stripe policy in PoolParams, so a
+/// v3 root object does not decode). The guard now refuses *every* older
+/// version by name. A pool whose slot says an old version but whose bytes
+/// are current -- which is what this test manufactures -- is exactly the
+/// kind of thing that must not be guessed at.
 #[test]
-fn a_v1_pool_still_opens_and_reads_under_v2() {
+fn an_older_format_version_is_refused_by_name() {
     use std::io::{Read, Seek, SeekFrom, Write};
 
     let dir = tempfile::tempdir().unwrap();
@@ -379,11 +386,9 @@ fn a_v1_pool_still_opens_and_reads_under_v2() {
         file.sync_all().unwrap();
     }
 
-    let pool = Pool::open(dir.path()).expect("a v1 pool must still open");
-    let ino = pool.lookup(1, "f").unwrap().unwrap();
-    assert_eq!(&pool.read(ino, 0, 25_000).unwrap()[..], &content[..]);
-    // And partial reads, which is where offset placement would go wrong.
-    assert_eq!(&pool.read(ino, 9_876, 4_321).unwrap()[..], &content[9_876..14_197]);
+    let err = Pool::open(dir.path()).unwrap_err().to_string();
+    assert!(err.contains("version 1"), "{err}");
+    let _ = content;
 }
 
 /// Appending to a sparse file seeds an incremental-append session from the

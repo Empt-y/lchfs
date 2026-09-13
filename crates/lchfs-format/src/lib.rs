@@ -23,7 +23,8 @@ pub use objects::{
 pub use segment::{
     SEGMENT_HEADER_MAGIC, SegmentFooter, SegmentHeader, SegmentState, StreamKind,
     compute_segment_footer_checksum, compute_segment_header_checksum,
-    finalize_segment_footer_checksum, finalize_segment_header_checksum,
+    finalize_segment_footer_checksum, finalize_segment_header_checksum, STRIPE_DESCRIPTOR_OFFSET,
+    StripeDescriptor,
 };
 pub use superblock::{
     parse_pool_uuid, pool_uuid_hex, SHARD_SUPERBLOCK_MAGIC, SUPERBLOCK_MAGIC, SUPERBLOCK_SLOT_COUNT, SUPERBLOCK_SLOT_SIZE,
@@ -46,4 +47,4 @@ pub use superblock::{
 ///   bump, so such a reader refuses the pool instead. A v2 reader handles v1
 ///   pools correctly with no migration, since a v1 chunk list simply has no
 ///   gaps.
-pub const FORMAT_VERSION: u32 = 3;
+pub const FORMAT_VERSION: u32 = 4;

@@ -196,6 +196,9 @@ prop_compose! {
         chunk_max_size in any::<u32>(),
         inline_threshold in any::<u32>(),
         logical_shard_count in any::<u32>(),
+        stripe_k in any::<u8>(),
+        stripe_m in any::<u8>(),
+        stripe_min_age_segments in any::<u32>(),
     ) -> PoolParams {
         PoolParams {
             data_segment_cap_bytes,
@@ -205,6 +208,9 @@ prop_compose! {
             chunk_max_size,
             inline_threshold,
             logical_shard_count,
+            stripe_k,
+            stripe_m,
+            stripe_min_age_segments,
         }
     }
 }

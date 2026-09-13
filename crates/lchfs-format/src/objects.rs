@@ -193,6 +193,14 @@ pub struct PoolParams {
     /// Number of logical shards, M in ARCHITECTURE.md §5. Deliberately
     /// much greater than core count.
     pub logical_shard_count: u32,
+    /// Erasure coding of cold data (ARCHITECTURE.md §17.2): data shards.
+    /// 0 means never stripe -- the default; striping is opt-in per pool.
+    pub stripe_k: u8,
+    /// Parity shards. A stripe survives `stripe_m` missing shards.
+    pub stripe_m: u8,
+    /// How many sealed segments past the sweep grace window a segment
+    /// must be before the conversion pass considers it cold.
+    pub stripe_min_age_segments: u32,
 }
 
 impl Default for PoolParams {
@@ -205,6 +213,9 @@ impl Default for PoolParams {
             chunk_max_size: 256 * 1024,
             inline_threshold: 512,
             logical_shard_count: 256,
+            stripe_k: 0,
+            stripe_m: 0,
+            stripe_min_age_segments: 8,
         }
     }
 }

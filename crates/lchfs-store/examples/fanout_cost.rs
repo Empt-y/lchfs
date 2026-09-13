@@ -9,6 +9,9 @@ fn main() {
     let total_mb: usize = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(256);
     let params = lchfs_format::PoolParams {
         logical_shard_count: 16,
+        stripe_k: 0,
+        stripe_m: 0,
+        stripe_min_age_segments: 8,
         ..Default::default()
     };
     // Incompressible, so the cost measured is I/O and framing, not zstd.
