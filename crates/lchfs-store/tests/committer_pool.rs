@@ -9,7 +9,7 @@ use lchfs_store::segment::SegmentReader;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
-fn make_op(inode_id: u64, logical_offset: u64, payload: &[u8]) -> (IngressOp, crossbeam::channel::Receiver<std::io::Result<lchfs_format::ExtentLocation>>) {
+fn make_op(inode_id: u64, logical_offset: u64, payload: &[u8]) -> (IngressOp, crossbeam::channel::Receiver<std::io::Result<lchfs_store::ingress::Appended>>) {
     let hash = lchfs_format::Hash32::of(payload);
     let (tx, rx) = crossbeam::channel::bounded(1);
     let op = IngressOp {
@@ -36,7 +36,7 @@ fn ops_land_in_the_correct_shard_and_are_readable() {
     let (op, rx) = make_op(inode_id, 0, payload);
     pool.push(op);
 
-    let loc = rx.recv().unwrap().unwrap();
+    let loc = rx.recv().unwrap().unwrap().location;
 
     // Read it back directly via a fresh SegmentReader against the shard's
     // Data stream to confirm it landed where routing said it would, and
@@ -68,7 +68,7 @@ fn per_producer_push_order_is_preserved_in_commit_order() {
 
     let mut prev_offset: Option<(u64, u32)> = None;
     for rx in receivers {
-        let loc = rx.recv().unwrap().unwrap();
+        let loc = rx.recv().unwrap().unwrap().location;
         if let Some((prev_seg, prev_off)) = prev_offset {
             // Either the same segment with a strictly later offset, or a
             // later segment (if rollover happened) — never earlier.
@@ -105,7 +105,7 @@ fn concurrent_producers_to_different_inodes_all_complete() {
                     receivers.push((payload, rx));
                 }
                 for (payload, rx) in receivers {
-                    let loc = rx.recv().unwrap().unwrap();
+                    let loc = rx.recv().unwrap().unwrap().location;
                     assert!(loc.len as usize > 0);
                     let _ = payload;
                 }

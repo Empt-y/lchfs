@@ -51,7 +51,13 @@ impl CoalesceDaemon {
     }
 
     fn primary_id(&self) -> u16 {
-        self.targets[0].id
+        self.gc.primary_id()
+    }
+
+    /// The online set changed (a live attach). Mark keeps reading from
+    /// the primary it was built on; only the sweep targets change.
+    pub fn set_targets(&mut self, targets: Vec<Vdev>) {
+        self.targets = targets;
     }
 
     /// One idle-cycle pass: mark, find segments below the liveness

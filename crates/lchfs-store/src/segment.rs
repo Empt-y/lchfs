@@ -15,6 +15,7 @@ use lchfs_format::{
     SegmentState, StreamKind, finalize_header_checksum, finalize_segment_footer_checksum,
     finalize_segment_header_checksum, validate_header,
 };
+use crate::backend::Vdev;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::fs::FileExt;
@@ -134,6 +135,11 @@ pub struct SegmentWriter {
     /// repair, when heal appends recovered bytes at a fresh offset on one
     /// device only.
     files: Vec<File>,
+    /// The slot each of `files` belongs to, in the same order. What the
+    /// index records a new record under: the devices this segment actually
+    /// fans out to, which after a live attach is not necessarily every
+    /// device the pool has.
+    vdev_ids: Vec<u16>,
     segment_id: u64,
     stream_kind: StreamKind,
     owner_shard: u32,
@@ -144,18 +150,37 @@ pub struct SegmentWriter {
 }
 
 impl SegmentWriter {
+    /// `create_on` with the slots taken from position: `vdev_roots[i]` is
+    /// vdev `i`. What every pre-replication caller and test expects.
     pub fn create(
         vdev_roots: &[&Path],
         segment_id: u64,
         kind: StreamKind,
         owner_shard: u32,
     ) -> io::Result<Self> {
-        let mut paths = Vec::with_capacity(vdev_roots.len());
-        for root in vdev_roots {
-            std::fs::create_dir_all(segment_dir(root, kind))?;
-            paths.push(segment_path(root, segment_id, kind));
+        let vdevs: Vec<Vdev> = vdev_roots
+            .iter()
+            .enumerate()
+            .map(|(i, r)| Vdev::new(i as u16, r.to_path_buf()))
+            .collect();
+        Self::create_on(&vdevs, segment_id, kind, owner_shard)
+    }
+
+    /// Opens a fresh segment fanning out to exactly `vdevs`, remembering
+    /// their slots (`vdev_ids`).
+    pub fn create_on(
+        vdevs: &[Vdev],
+        segment_id: u64,
+        kind: StreamKind,
+        owner_shard: u32,
+    ) -> io::Result<Self> {
+        let mut paths = Vec::with_capacity(vdevs.len());
+        for vdev in vdevs {
+            std::fs::create_dir_all(segment_dir(&vdev.root, kind))?;
+            paths.push(segment_path(&vdev.root, segment_id, kind));
         }
-        Self::create_at(&paths, segment_id, kind, owner_shard)
+        let ids: Vec<u16> = vdevs.iter().map(|v| v.id).collect();
+        Self::create_at(&paths, &ids, segment_id, kind, owner_shard)
     }
 
     /// Open a fresh segment in shard `shard_id`'s own Delta stream
@@ -170,16 +195,33 @@ impl SegmentWriter {
         shard_id: u32,
         segment_id: u64,
     ) -> io::Result<Self> {
-        let mut paths = Vec::with_capacity(vdev_roots.len());
-        for root in vdev_roots {
-            std::fs::create_dir_all(delta_segment_dir(root, shard_id))?;
-            paths.push(delta_segment_path(root, shard_id, segment_id));
+        let vdevs: Vec<Vdev> = vdev_roots
+            .iter()
+            .enumerate()
+            .map(|(i, r)| Vdev::new(i as u16, r.to_path_buf()))
+            .collect();
+        Self::create_delta_on(&vdevs, shard_id, segment_id)
+    }
+
+    /// `create_delta` for an explicit device set.
+    pub fn create_delta_on(vdevs: &[Vdev], shard_id: u32, segment_id: u64) -> io::Result<Self> {
+        let mut paths = Vec::with_capacity(vdevs.len());
+        for vdev in vdevs {
+            std::fs::create_dir_all(delta_segment_dir(&vdev.root, shard_id))?;
+            paths.push(delta_segment_path(&vdev.root, shard_id, segment_id));
         }
-        Self::create_at(&paths, segment_id, StreamKind::Delta, shard_id)
+        let ids: Vec<u16> = vdevs.iter().map(|v| v.id).collect();
+        Self::create_at(&paths, &ids, segment_id, StreamKind::Delta, shard_id)
+    }
+
+    /// The slots this segment fans out to.
+    pub fn vdev_ids(&self) -> &[u16] {
+        &self.vdev_ids
     }
 
     fn create_at(
         paths: &[PathBuf],
+        vdev_ids: &[u16],
         segment_id: u64,
         kind: StreamKind,
         owner_shard: u32,
@@ -217,6 +259,7 @@ impl SegmentWriter {
 
         Ok(Self {
             files,
+            vdev_ids: vdev_ids.to_vec(),
             segment_id,
             stream_kind: kind,
             owner_shard,

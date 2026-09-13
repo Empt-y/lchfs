@@ -41,6 +41,7 @@ pub mod gc;
 pub mod ingress;
 pub mod prep;
 pub mod segment;
+pub mod vdevs;
 
 use bytes::Bytes;
 use delta_log::{ShardCommitRecord, ShardDeltaLog};
@@ -58,6 +59,7 @@ use lchfs_index::{ChunkLocationCache, IndexError, IndexStore, PendingDedupPins, 
 use parking_lot::{Mutex, RwLock};
 use prep::{IngestPreparationPool, PrepTask, PreparedChunk, prepare_chunk};
 use segment::{SegmentError, SegmentReader, SegmentWriter};
+use vdevs::VdevSet;
 use std::collections::{HashMap, HashSet};
 use nix::errno::Errno;
 use nix::fcntl::{Flock, FlockArg};
@@ -407,43 +409,32 @@ struct PoolShared {
     /// the pool would stop matching its own vdevs.
     pool_uuid: [u8; 16],
     vdev_id: u16,
-    vdev_count: u16,
     /// The vdev whose copy of everything is read by default: the lowest
-    /// online slot, `vdevs[0].id`. It holds the pool's `INDEX.redb`
-    /// (ARCHITECTURE.md §15.10), `ChunkLocationCache`'s entries are *its*
-    /// locations, and GC mark and the coalesce/dedup daemons read from it.
-    /// Read failover (§15.2) consults the others only when it fails. Vdev 0
-    /// whenever vdev 0 is present; when a mount runs without it (§15.8),
-    /// the next device up takes the role, rebuilding an index of its own.
+    /// online slot at mount, `vdevs.online()[0].id`. It holds the pool's
+    /// `INDEX.redb` (ARCHITECTURE.md §15.10), `ChunkLocationCache`'s
+    /// entries are *its* locations, and GC mark and the coalesce/dedup
+    /// daemons read from it. Read failover (§15.2) consults the others
+    /// only when it fails. Vdev 0 whenever vdev 0 is present; when a mount
+    /// runs without it (§15.8), the next device up takes the role,
+    /// rebuilding an index of its own. Fixed for the mount's lifetime,
+    /// even if a lower slot is attached live.
     primary_id: u16,
-    /// Every vdev *online* in this mount, ascending by `Vdev::id`
-    /// (ARCHITECTURE.md §15.10). `vdevs[0]` is always vdev 0, whose root is
-    /// `pool_root`. In a degraded mount (§15.8) this is shorter than
-    /// `vdev_count`; `missing_vdevs` names the gaps.
-    vdevs: Vec<Vdev>,
-    /// One superblock ring per online vdev (§15.5), index-aligned with
-    /// `vdevs`. Each carries its own `vdev_id` and its own
-    /// `root_location`, since a root object's offset can differ per device
-    /// after a repair.
-    superblock_backends: Vec<FileBackend>,
-    /// Slots with no device present in this mount. Writes do not reach
-    /// them, their superblocks are not advanced, and so their generation
-    /// falls behind -- which is exactly how the next full mount knows to
-    /// resilver them (§15.5).
-    missing_vdevs: Vec<u16>,
+    /// The online device set (ARCHITECTURE.md §15.10), shared with every
+    /// fan-out writer so a device attached live reaches them. Also holds
+    /// each member's superblock ring and root lock, and knows the pool's
+    /// slot count and which slots have no device here.
+    vdevs: Arc<VdevSet>,
     /// What the mount-time resilver did for each vdev found behind the
     /// primary's generation, in the order it ran.
     mount_resilver: Vec<(u16, ResilverReport)>,
-    /// Advisory single-writer guard on `<pool_root>/LOCK` (ARCHITECTURE.md
-    /// §1's pool layout). Never read -- held purely for its lifetime, and
-    /// released by `Flock`'s `Drop` when the `Pool` goes away. `flock(2)` is
-    /// also released by the kernel if the process dies, so a killed mount
-    /// leaves no stale lock to clean up, matching §7's "inert, no active
-    /// cleanup required for correctness" philosophy.
-    /// One advisory guard per vdev root (§15.6), all held for the mount's
-    /// lifetime, so two mounts cannot share even a single device.
-    _pool_locks: Vec<Flock<std::fs::File>>,
-
+    /// One live attach at a time.
+    attach_lock: Mutex<()>,
+    /// Held for reading by every write from its append to its index
+    /// record; taken for writing (and released at once) by a live attach
+    /// after it has rolled every writer. That makes "every write that
+    /// could have landed on an old segment has recorded its entries" a
+    /// thing the attach can wait for rather than hope for.
+    in_flight_writes: RwLock<()>,
     namespace: Mutex<Namespace>,
     file_state: Mutex<HashMap<u64, FileWorkingState>>,
     open_files: Mutex<HashMap<u64, IncrementalWriteState>>,
@@ -532,26 +523,21 @@ impl Pool {
             ));
         }
         let pool_root = vdev_roots[0];
-        let mut pool_locks = Vec::with_capacity(vdev_roots.len());
-        let mut superblock_backends = Vec::with_capacity(vdev_roots.len());
-        for root in vdev_roots {
+        let mut members = Vec::with_capacity(vdev_roots.len());
+        for (id, root) in vdev_roots.iter().enumerate() {
             std::fs::create_dir_all(root)?;
-            pool_locks.push(acquire_pool_lock(root)?);
-            superblock_backends.push(FileBackend::open(root)?);
-        }
-        let vdevs: Vec<Vdev> = vdev_roots
-            .iter()
-            .enumerate()
-            .map(|(id, r)| Vdev::new(id as u16, r.to_path_buf()))
-            .collect();
-        let vdev_root_paths: Vec<PathBuf> = vdevs.iter().map(|v| v.root.clone()).collect();
-        // None of them may already hold a pool -- checked for every device,
-        // not just vdev 0, so a half-built set cannot be silently absorbed.
-        for (backend, root) in superblock_backends.iter().zip(vdev_roots) {
-            if read_superblock(backend)?.is_some() {
+            let lock = acquire_pool_lock(root)?;
+            let backend = FileBackend::open(root)?;
+            // None of them may already hold a pool -- checked for every
+            // device, not just vdev 0, so a half-built set cannot be
+            // silently absorbed.
+            if read_superblock(&backend)?.is_some() {
                 return Err(PoolError::AlreadyExists(root.display().to_string()));
             }
+            members.push(VdevSet::member(Vdev::new(id as u16, root.to_path_buf()), backend, lock));
         }
+        let vdev_set = Arc::new(VdevSet::new(members, vdev_roots.len() as u16));
+        let vdevs = vdev_set.online();
 
         let mut inodes = HashMap::new();
         let (now_secs, now_nanos) = now_unix();
@@ -581,8 +567,8 @@ impl Pool {
 
         let next_segment_id = Arc::new(AtomicU64::new(0));
         let shard_count = params.logical_shard_count;
-        let committer_pool = CommitterPool::new(
-            &vdev_root_paths,
+        let committer_pool = CommitterPool::new_on(
+            Arc::clone(&vdev_set),
             shard_count,
             committer_thread_count(),
             SHARD_RING_CAPACITY,
@@ -590,10 +576,10 @@ impl Pool {
             Arc::clone(&next_segment_id),
         )?;
         let meta_id = next_segment_id.fetch_add(1, Ordering::Relaxed);
-        let meta_writer = SegmentWriter::create(&vdev_root_paths.iter().map(|p| p.as_path()).collect::<Vec<_>>(), meta_id, StreamKind::Meta, 0)?;
+        let meta_writer = SegmentWriter::create_on(&vdevs, meta_id, StreamKind::Meta, 0)?;
 
         let shard_delta_logs = (0..shard_count)
-            .map(|id| ShardDeltaLog::open(&vdev_root_paths, id).map(Mutex::new))
+            .map(|id| ShardDeltaLog::open_on(Arc::clone(&vdev_set), id).map(Mutex::new))
             .collect::<Result<Vec<_>, _>>()?;
 
         let dedup_index = Arc::new(ChunkLocationCache::new());
@@ -628,13 +614,11 @@ impl Pool {
             // created across several devices (ARCHITECTURE.md §15.6).
             pool_uuid: lchfs_format::generate_pool_uuid()?,
             vdev_id: 0,
-            vdev_count: vdevs.len() as u16,
             primary_id: PRIMARY_VDEV_ID,
-            vdevs,
-            superblock_backends,
-            missing_vdevs: Vec::new(),
+            vdevs: vdev_set,
             mount_resilver: Vec::new(),
-            _pool_locks: pool_locks,
+            attach_lock: Mutex::new(()),
+            in_flight_writes: RwLock::new(()),
             namespace: Mutex::new(namespace),
             file_state: Mutex::new(HashMap::new()),
             open_files: Mutex::new(HashMap::new()),
@@ -799,24 +783,20 @@ impl Pool {
     fn open_set(given_roots: &[&Path], allow_missing: bool) -> Result<Self, PoolError> {
         let Membership {
             members,
-            missing_vdevs,
+            vdev_count,
             stale_vdevs,
             ..
         } = check_membership(given_roots, allow_missing)?;
 
-        let vdev_roots: Vec<&Path> = members.iter().map(|(_, r)| *r).collect();
-        let pool_root = vdev_roots[0];
-        let mut pool_locks = Vec::with_capacity(vdev_roots.len());
-        let mut superblock_backends = Vec::with_capacity(vdev_roots.len());
-        for root in &vdev_roots {
-            pool_locks.push(acquire_pool_lock(root)?);
-            superblock_backends.push(FileBackend::open(root)?);
+        let pool_root = members[0].1;
+        let mut set_members = Vec::with_capacity(members.len());
+        for (slot, root) in &members {
+            let lock = acquire_pool_lock(root)?;
+            let backend = FileBackend::open(root)?;
+            set_members.push(VdevSet::member(Vdev::new(slot.vdev_id, root.to_path_buf()), backend, lock));
         }
-        let vdevs: Vec<Vdev> = members
-            .iter()
-            .map(|(s, r)| Vdev::new(s.vdev_id, r.to_path_buf()))
-            .collect();
-        let vdev_root_paths: Vec<PathBuf> = vdevs.iter().map(|v| v.root.clone()).collect();
+        let vdev_set = Arc::new(VdevSet::new(set_members, vdev_count));
+        let vdevs = vdev_set.online();
         let primary_id = vdevs[0].id;
         // §15.5: the newest superblock in the set is the truth, whichever
         // device holds it. The primary's own may be behind -- it missed
@@ -952,8 +932,8 @@ impl Pool {
         }
         let next_segment_id = Arc::new(AtomicU64::new(max_segment_id + 1));
         let shard_count = root.pool_params.logical_shard_count;
-        let committer_pool = CommitterPool::new(
-            &vdev_root_paths,
+        let committer_pool = CommitterPool::new_on(
+            Arc::clone(&vdev_set),
             shard_count,
             committer_thread_count(),
             SHARD_RING_CAPACITY,
@@ -961,7 +941,7 @@ impl Pool {
             Arc::clone(&next_segment_id),
         )?;
         let meta_id = next_segment_id.fetch_add(1, Ordering::Relaxed);
-        let meta_writer = SegmentWriter::create(&vdev_root_paths.iter().map(|p| p.as_path()).collect::<Vec<_>>(), meta_id, StreamKind::Meta, 0)?;
+        let meta_writer = SegmentWriter::create_on(&vdevs, meta_id, StreamKind::Meta, 0)?;
 
         // Two-tier crash recovery (ARCHITECTURE.md §7): the InoMap walk
         // above is tier one (the last full checkpoint's base state). Tier
@@ -990,7 +970,7 @@ impl Pool {
         // which exercised replay immediately followed by GC).
         let mut replayed_inos: HashSet<u64> = HashSet::new();
         for shard_id in 0..shard_count {
-            let shard_log = ShardDeltaLog::open(&vdev_root_paths, shard_id)?;
+            let shard_log = ShardDeltaLog::open_on(Arc::clone(&vdev_set), shard_id)?;
             let watermark = root
                 .shard_watermarks
                 .get(shard_id as usize)
@@ -1127,13 +1107,11 @@ impl Pool {
             // would make the pool stop matching its own vdevs.
             pool_uuid: slot.pool_uuid,
             vdev_id: slot.vdev_id,
-            vdev_count: slot.vdev_count,
             primary_id,
-            vdevs,
-            superblock_backends,
-            missing_vdevs,
+            vdevs: vdev_set,
             mount_resilver: Vec::new(),
-            _pool_locks: pool_locks,
+            attach_lock: Mutex::new(()),
+            in_flight_writes: RwLock::new(()),
             namespace: Mutex::new(namespace),
             file_state: Mutex::new(file_state_from_replay),
             open_files: Mutex::new(HashMap::new()),
@@ -1216,12 +1194,20 @@ impl Pool {
     /// True when this mount is running without some of the pool's devices
     /// (`open_degraded`).
     pub fn is_degraded(&self) -> bool {
-        !self.0.missing_vdevs.is_empty()
+        !self.0.vdevs.missing().is_empty()
     }
 
     /// The vdev slots with no device present in this mount.
-    pub fn missing_vdevs(&self) -> &[u16] {
-        &self.0.missing_vdevs
+    pub fn missing_vdevs(&self) -> Vec<u16> {
+        self.0.vdevs.missing()
+    }
+
+    /// Adds a blank device while mounted (ARCHITECTURE.md §15.10), into a
+    /// new slot or an empty one, and fills it before returning. The
+    /// offline `attach_vdev` is this without a running pool. Returns the
+    /// slot and what the fill copied.
+    pub fn attach_vdev_live(&self, new_root: &Path) -> Result<(u16, ResilverReport), PoolError> {
+        self.0.attach_vdev_live(new_root)
     }
 
     /// What mount-time resilvering did, per vdev that needed it. Empty when
@@ -2033,26 +2019,22 @@ impl PoolShared {
     ) -> Result<(ExtentRecordHeader, Vec<u8>), PoolError> {
         let root = self.vdev_root(vdev_id)?;
         let mut readers = self.readers.lock();
-        let reader = get_reader(&mut readers, root, vdev_id, loc.segment_id, kind)?;
+        let reader = get_reader(&mut readers, &root, vdev_id, loc.segment_id, kind)?;
         Ok(reader.read_record_raw(loc)?)
     }
 
     fn is_online(&self, vdev_id: u16) -> bool {
-        self.vdevs.iter().any(|v| v.id == vdev_id)
+        self.vdevs.is_online(vdev_id)
     }
 
-    fn vdev_root(&self, vdev_id: u16) -> Result<&Path, PoolError> {
-        self.vdevs
-            .iter()
-            .find(|v| v.id == vdev_id)
-            .map(|v| v.root.as_path())
-            .ok_or_else(|| {
-                if self.missing_vdevs.contains(&vdev_id) {
-                    PoolError::InvalidArgument(format!("vdev {vdev_id} is not present in this mount"))
-                } else {
-                    PoolError::InvalidArgument(format!("no vdev {vdev_id} in this pool"))
-                }
-            })
+    fn vdev_root(&self, vdev_id: u16) -> Result<PathBuf, PoolError> {
+        self.vdevs.root_of(vdev_id).ok_or_else(|| {
+            if self.vdevs.missing().contains(&vdev_id) {
+                PoolError::InvalidArgument(format!("vdev {vdev_id} is not present in this mount"))
+            } else {
+                PoolError::InvalidArgument(format!("no vdev {vdev_id} in this pool"))
+            }
+        })
     }
 
     /// Heals a single record onto `vdev_id` and makes the new location
@@ -2081,7 +2063,7 @@ impl PoolShared {
         header: &ExtentRecordHeader,
         raw_payload: &[u8],
     ) -> Result<ExtentLocation, PoolError> {
-        let root = self.vdev_root(vdev_id)?.to_path_buf();
+        let root = self.vdev_root(vdev_id)?;
         let cap = match kind {
             StreamKind::Data => self.pool_params.data_segment_cap_bytes,
             _ => self.pool_params.meta_segment_cap_bytes,
@@ -2215,8 +2197,9 @@ impl PoolShared {
     /// nowhere to heal from.
     fn scrub(&self) -> Result<Vec<ScrubReport>, PoolError> {
         let groups = self.replica_groups()?;
-        let mut reports = Vec::with_capacity(self.vdevs.len());
-        for vdev in &self.vdevs {
+        let online = self.vdevs.online();
+        let mut reports = Vec::with_capacity(online.len());
+        for vdev in &online {
             let mut report = ScrubReport {
                 vdev_id: vdev.id,
                 ..Default::default()
@@ -2303,19 +2286,22 @@ impl PoolShared {
         let root = self.vdev_root(vdev_id).ok()?;
         [StreamKind::Data, StreamKind::Meta]
             .into_iter()
-            .find(|&k| segment::segment_path(root, segment_id, k).exists())
+            .find(|&k| segment::segment_path(&root, segment_id, k).exists())
     }
 
-    /// Records `loc` for `hash` on every vdev. Fan-out writes land the
-    /// identical record at the identical offset on each replica (§15.3), so
-    /// one location is true of all of them -- but the index is keyed by
-    /// `(hash, vdev_id)` (§15.1) precisely so a later heal or per-vdev
-    /// coalesce can move one replica without the others' entries lying, and
-    /// that only works if every replica's entry exists to begin with.
-    fn record_replicated_location(&self, hash: Hash32, loc: ExtentLocation) -> Result<(), PoolError> {
+    /// Records `loc` for `hash` on each of `vdev_ids` -- the slots the
+    /// segment it landed in actually fans out to, as its writer reports.
+    /// Fan-out writes land the identical record at the identical offset on
+    /// each replica (§15.3), so one location is true of all of them -- but
+    /// the index is keyed by `(hash, vdev_id)` (§15.1) precisely so a later
+    /// heal or per-vdev coalesce can move one replica without the others'
+    /// entries lying, and that only works if every replica's entry exists
+    /// to begin with. Taking the slots from the writer rather than the
+    /// pool's current set is what keeps this true across a live attach.
+    fn record_replicated_location(&self, hash: Hash32, loc: ExtentLocation, vdev_ids: &[u16]) -> Result<(), PoolError> {
         let mut index = self.persisted_index.write();
-        for vdev in &self.vdevs {
-            index.put_chunk_location(hash, vdev.id, loc)?;
+        for &vdev_id in vdev_ids {
+            index.put_chunk_location(hash, vdev_id, loc)?;
         }
         Ok(())
     }
@@ -2330,6 +2316,7 @@ impl PoolShared {
         logical_offset: u64,
         raw_bytes: &[u8],
     ) -> Result<(Hash32, ExtentLocation), PoolError> {
+        let _in_flight = self.in_flight_writes.read();
         let prepared = self.prep_pool.submit(PrepTask {
             inode_id,
             logical_offset,
@@ -2356,11 +2343,11 @@ impl PoolShared {
                     logical_offset,
                     completion: tx,
                 });
-                let location = rx
+                let ingress::Appended { location, vdevs } = rx
                     .recv()
                     .map_err(|_| PoolError::Format("committer pool completion channel closed".into()))??;
                 self.dedup_index.put(content_hash, location);
-                self.record_replicated_location(content_hash, location)?;
+                self.record_replicated_location(content_hash, location, &vdevs)?;
                 Ok((content_hash, location))
             }
         }
@@ -2400,10 +2387,10 @@ impl PoolShared {
             logical_offset: 0,
             completion: tx,
         });
-        let location = rx
+        let appended = rx
             .recv()
             .map_err(|_| PoolError::Format("committer pool completion channel closed".into()))??;
-        Ok(location)
+        Ok(appended.location)
     }
 
     /// Writes any serde-encodable meta object to the (global, unsharded)
@@ -2421,6 +2408,7 @@ impl PoolShared {
         if let Some(loc) = self.dedup_index.get(hash) {
             return Ok((hash, loc));
         }
+        let _in_flight = self.in_flight_writes.read();
         let mut meta_writer = self.meta_writer.lock();
         self.ensure_meta_room(&mut meta_writer, encoded.len() as u64)?;
         let loc = meta_writer.append(
@@ -2431,9 +2419,10 @@ impl PoolShared {
             &encoded,
             Vec::new(),
         )?;
+        let on: Vec<u16> = meta_writer.vdev_ids().to_vec();
         drop(meta_writer);
         self.dedup_index.put(hash, loc);
-        self.record_replicated_location(hash, loc)?;
+        self.record_replicated_location(hash, loc, &on)?;
         Ok((hash, loc))
     }
 
@@ -2445,12 +2434,96 @@ impl PoolShared {
         if meta_writer.current_size() + additional + RECORD_OVERHEAD_ESTIMATE
             > self.pool_params.meta_segment_cap_bytes as u64
         {
-            let id = self.next_segment_id.fetch_add(1, Ordering::Relaxed);
-            let new_writer = SegmentWriter::create(&self.vdev_roots(), id, StreamKind::Meta, 0)?;
-            let old = std::mem::replace(meta_writer, new_writer);
-            old.seal()?;
+            self.roll_meta_writer(meta_writer)?;
         }
         Ok(())
+    }
+
+    /// Starts a fresh meta segment on the device set as it stands now.
+    fn roll_meta_writer(&self, meta_writer: &mut SegmentWriter) -> Result<(), PoolError> {
+        let id = self.next_segment_id.fetch_add(1, Ordering::Relaxed);
+        let new_writer = SegmentWriter::create_on(&self.vdevs.online(), id, StreamKind::Meta, 0)?;
+        let old = std::mem::replace(meta_writer, new_writer);
+        old.seal()?;
+        Ok(())
+    }
+
+    /// The live counterpart of `Pool::attach_vdev` (ARCHITECTURE.md
+    /// §15.10). The sequence is what makes it safe under load:
+    ///
+    /// 1. The device joins the online set, marked as catching up, so
+    ///    checkpoints leave its superblock alone until step 4.
+    /// 2. Every fan-out writer -- each shard's data writer, the meta
+    ///    writer, each shard's delta log -- is rolled to a fresh segment
+    ///    under its own lock. After this, nothing appended anywhere can
+    ///    miss the new device. An append that was in flight finished on
+    ///    its old segment, and is recorded under that segment's slots,
+    ///    which do not include the new one: true, and exactly what the
+    ///    resilver in step 3 is for.
+    /// 3. The in-flight write barrier is taken and released, so every
+    ///    such straggler has recorded its index entries, and then the
+    ///    device is resilvered from an index snapshot. Everything before
+    ///    the barrier is in the snapshot; everything after it fanned out
+    ///    to the device directly.
+    /// 4. The device stops catching up and a checkpoint publishes every
+    ///    member's superblock with the new slot count.
+    ///
+    /// A crash before step 4 leaves the device with no superblock and the
+    /// pool with its old count: the attach did not happen, and the
+    /// segments on the device are orphans a rerun overwrites.
+    fn attach_vdev_live(&self, new_root: &Path) -> Result<(u16, ResilverReport), PoolError> {
+        let _one_at_a_time = self.attach_lock.lock();
+        let new_id = match self.vdevs.missing().as_slice() {
+            [] => self.vdevs.count(),
+            [one] => *one,
+            many => {
+                return Err(PoolError::InvalidArgument(format!(
+                    "pool is missing vdevs {many:?}; attach replaces one device at a time"
+                )));
+            }
+        };
+        std::fs::create_dir_all(new_root)?;
+        let lock = acquire_pool_lock(new_root)?;
+        let backend = FileBackend::open(new_root)?;
+        if read_superblock(&backend)?.is_some() {
+            return Err(PoolError::AlreadyExists(new_root.display().to_string()));
+        }
+        // A replacement inherits a slot whose index entries describe a
+        // device that is gone; see `attach_vdev`. Done before the slot is
+        // online, so no live write can record into it in between.
+        self.persisted_index.write().delete_vdev_locations(new_id)?;
+
+        // 1.
+        self.vdevs
+            .attach(VdevSet::member(Vdev::new(new_id, new_root.to_path_buf()), backend, lock));
+
+        // 2.
+        self.committer_pool.roll_all_writers()?;
+        {
+            let mut meta_writer = self.meta_writer.lock();
+            self.roll_meta_writer(&mut meta_writer)?;
+        }
+        for log in &self.shard_delta_logs {
+            log.lock().roll_over()?;
+        }
+        let online = self.vdevs.online();
+        self.coalesce.lock().set_targets(online.clone());
+        self.dedup.lock().set_targets(online);
+
+        // 3.
+        drop(self.in_flight_writes.write());
+        let report = self.resilver(new_id)?;
+
+        // 4.
+        self.vdevs.finish_catch_up(new_id);
+        self.run_checkpoint()?;
+        tracing::info!(
+            "attached {} as vdev {new_id}: {} records copied, {} unrecoverable",
+            new_root.display(),
+            report.healed,
+            report.unrecoverable.len()
+        );
+        Ok((new_id, report))
     }
 
     /// Gets (creating if absent) the per-inode lock serializing this
@@ -3935,7 +4008,7 @@ impl PoolShared {
             format_version: lchfs_format::FORMAT_VERSION,
             pool_uuid: self.pool_uuid,
             vdev_id: self.vdev_id,
-            vdev_count: self.vdev_count,
+            vdev_count: self.vdevs.count(),
             generation,
             root_hash,
             root_location,
@@ -3953,9 +4026,18 @@ impl PoolShared {
         };
         // One superblock per vdev (§15.5). Each records its own vdev_id, so
         // a device can still say which member it is when read on its own.
-        for (vdev, backend) in self.vdevs.iter().zip(&self.superblock_backends) {
+        // A device still catching up from a live attach keeps its old
+        // (or absent) superblock until its fill completes, so a crash
+        // mid-attach leaves it looking stale -- which it is -- rather
+        // than current.
+        let set = self.vdevs.read();
+        for member in &set.members {
+            if set.catching_up.contains(&member.vdev.id) {
+                continue;
+            }
+            let Some(backend) = &member.superblock else { continue };
             let mut per_vdev = slot;
-            per_vdev.vdev_id = vdev.id;
+            per_vdev.vdev_id = member.vdev.id;
             finalize_superblock_slot_checksum(&mut per_vdev);
             write_superblock_slot(backend, &per_vdev)?;
         }
@@ -3964,13 +4046,6 @@ impl PoolShared {
     }
 }
 
-impl PoolShared {
-    /// Every vdev root in `vdev_id` order -- what `SegmentWriter` fans a
-    /// write out to (ARCHITECTURE.md §15.3).
-    fn vdev_roots(&self) -> Vec<&Path> {
-        self.vdevs.iter().map(|v| v.root.as_path()).collect()
-    }
-}
 
 pub(crate) fn get_reader<'a>(
     readers: &'a mut SegmentReaders,

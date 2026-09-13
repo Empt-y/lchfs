@@ -10,12 +10,13 @@
 //! considered and rejected.
 
 use crate::segment::SegmentWriter;
+use crate::vdevs::VdevSet;
 use crossbeam::deque::{Injector, Steal};
 use crossbeam::queue::ArrayQueue;
 use lchfs_format::{CodecId, ExtentKind, ExtentLocation, Hash32, StreamKind};
 use parking_lot::{Condvar, Mutex};
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -38,7 +39,7 @@ pub struct IngressOp {
     /// Signaled once this op lands (or fails). `Pool::write` (E.6) blocks
     /// on this per chunk before returning — see the plan's design decision
     /// on why `write()` stays synchronous despite the async handoff.
-    pub completion: crossbeam::channel::Sender<io::Result<ExtentLocation>>,
+    pub completion: crossbeam::channel::Sender<io::Result<Appended>>,
 }
 
 /// A logical shard's own currently-open Data-stream segment, plus the
@@ -47,16 +48,25 @@ pub struct IngressOp {
 /// single-threaded engine, but scoped to one shard's own writer instead of
 /// one global one).
 /// Borrow a `[PathBuf]` as the `[&Path]` slice `SegmentWriter` takes.
-fn roots(v: &[PathBuf]) -> Vec<&Path> {
-    v.iter().map(|p| p.as_path()).collect()
+/// What a committer hands back for one record: where it went, and on
+/// which devices. The index records the hash under exactly these slots,
+/// which after a live attach can be fewer than the pool has.
+#[derive(Debug, Clone)]
+pub struct Appended {
+    pub location: ExtentLocation,
+    pub vdevs: Arc<[u16]>,
 }
 
 struct ShardDataWriter {
     writer: SegmentWriter,
-    /// Every vdev this shard's Data segments are written to (§15.3). The
-    /// Data stream carries file content, so this is the fan-out that
-    /// actually replicates user data.
-    vdev_roots: Vec<PathBuf>,
+    /// The slots `writer`'s segment fans out to, shared with every
+    /// completion it produces.
+    vdev_ids: Arc<[u16]>,
+    /// The mount's online devices (§15.3). The Data stream carries file
+    /// content, so this is the fan-out that actually replicates user data.
+    /// Consulted at every rollover, so a device attached live is written
+    /// to from this shard's next segment on.
+    vdevs: Arc<VdevSet>,
     shard_id: u32,
     segment_cap_bytes: u64,
     next_segment_id: Arc<AtomicU64>,
@@ -70,18 +80,24 @@ impl ShardDataWriter {
         codec_id: CodecId,
         uncompressed_len: u32,
         payload: &[u8],
-    ) -> io::Result<ExtentLocation> {
+    ) -> io::Result<Appended> {
         if self.writer.current_size() + payload.len() as u64 > self.segment_cap_bytes {
             self.roll_over()?;
         }
-        self.writer
-            .append(kind, content_hash, codec_id, uncompressed_len, payload, Vec::new())
+        let location = self
+            .writer
+            .append(kind, content_hash, codec_id, uncompressed_len, payload, Vec::new())?;
+        Ok(Appended {
+            location,
+            vdevs: Arc::clone(&self.vdev_ids),
+        })
     }
 
     fn roll_over(&mut self) -> io::Result<()> {
         let new_id = self.next_segment_id.fetch_add(1, Ordering::Relaxed);
-        let new_writer =
-            SegmentWriter::create(&roots(&self.vdev_roots), new_id, StreamKind::Data, self.shard_id)?;
+        let online = self.vdevs.online();
+        let new_writer = SegmentWriter::create_on(&online, new_id, StreamKind::Data, self.shard_id)?;
+        self.vdev_ids = new_writer.vdev_ids().into();
         let old = std::mem::replace(&mut self.writer, new_writer);
         old.seal()
     }
@@ -113,20 +129,21 @@ impl LogicalShard {
     fn new(
         id: u32,
         ring_capacity: usize,
-        vdev_roots: &[PathBuf],
+        vdevs: Arc<VdevSet>,
         segment_cap_bytes: u64,
         next_segment_id: Arc<AtomicU64>,
     ) -> io::Result<Self> {
         let initial_id = next_segment_id.fetch_add(1, Ordering::Relaxed);
-        let writer = SegmentWriter::create(&roots(vdev_roots), initial_id, StreamKind::Data, id)?;
+        let writer = SegmentWriter::create_on(&vdevs.online(), initial_id, StreamKind::Data, id)?;
         Ok(Self {
             id,
             ring: ArrayQueue::new(ring_capacity),
             claimed: AtomicBool::new(false),
             pending: AtomicBool::new(false),
             data: Mutex::new(ShardDataWriter {
+                vdev_ids: writer.vdev_ids().into(),
                 writer,
-                vdev_roots: vdev_roots.to_vec(),
+                vdevs,
                 shard_id: id,
                 segment_cap_bytes,
                 next_segment_id,
@@ -184,8 +201,28 @@ pub struct CommitterPool {
 }
 
 impl CommitterPool {
+    /// `new_on` with a bare device set built from `vdev_roots`, slot by
+    /// position -- for tests and tooling that drive the pool directly.
     pub fn new(
         vdev_roots: &[PathBuf],
+        shard_count: u32,
+        worker_count: usize,
+        ring_capacity: usize,
+        data_segment_cap_bytes: u64,
+        next_segment_id: Arc<AtomicU64>,
+    ) -> io::Result<Self> {
+        Self::new_on(
+            Arc::new(VdevSet::from_roots(vdev_roots)),
+            shard_count,
+            worker_count,
+            ring_capacity,
+            data_segment_cap_bytes,
+            next_segment_id,
+        )
+    }
+
+    pub fn new_on(
+        vdevs: Arc<VdevSet>,
         shard_count: u32,
         worker_count: usize,
         ring_capacity: usize,
@@ -197,7 +234,7 @@ impl CommitterPool {
             shards.push(Arc::new(LogicalShard::new(
                 id,
                 ring_capacity,
-                vdev_roots,
+                Arc::clone(&vdevs),
                 data_segment_cap_bytes,
                 Arc::clone(&next_segment_id),
             )?));
@@ -237,6 +274,19 @@ impl CommitterPool {
     /// load spread across M>>K shards) — a real wake-on-drain condvar for
     /// this specific path is a documented future refinement, not required
     /// for correctness.
+    /// Rolls every shard's data writer to a fresh segment, each under its
+    /// own lock, so that once this returns every record any committer
+    /// appends fans out to the device set as it stands *now*. The barrier
+    /// a live attach needs: an append in flight when the set grew finishes
+    /// on the old segment and is recorded under the old slots (which is
+    /// true), and nothing appended after this can miss the new device.
+    pub fn roll_all_writers(&self) -> io::Result<()> {
+        for shard in &self.shards {
+            shard.data.lock().roll_over()?;
+        }
+        Ok(())
+    }
+
     pub fn push(&self, op: IngressOp) {
         let shard_id = shard_for_inode(op.inode_id, self.shards.len() as u32);
         let shard = &self.shards[shard_id as usize];

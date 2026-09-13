@@ -16,6 +16,8 @@
 //! (same bytes -> same hash -> no-op).
 
 use crate::segment::{SegmentReader, SegmentWriter, delta_segment_dir};
+use crate::vdevs::VdevSet;
+use std::sync::Arc;
 use lchfs_format::{
     DeltaLogEntry, ExtentKind, ExtentLocation, Hash32, SHARD_SUPERBLOCK_MAGIC, ShardSuperblockSlot,
     compute_shard_superblock_slot_checksum, finalize_shard_superblock_slot_checksum,
@@ -63,12 +65,15 @@ pub struct ReplayResult {
 /// (ARCHITECTURE.md §1, §3).
 pub struct ShardDeltaLog {
     pub shard_id: u32,
-    /// Every vdev this shard's delta segments and shard superblock are
-    /// written to. The delta log is the fsync fast path (§3), so without
-    /// fan-out here a write made durable by fsync -- rather than by a
-    /// checkpoint -- would exist on one device only.
+    /// The mount's online devices, which this shard's delta segments and
+    /// shard superblock fan out to. The delta log is the fsync fast path
+    /// (§3), so without fan-out here a write made durable by fsync --
+    /// rather than by a checkpoint -- would exist on one device only.
+    vdevs: Arc<VdevSet>,
+    /// Snapshot of `vdevs` as of the current segment.
     vdev_roots: Vec<PathBuf>,
     writer: SegmentWriter,
+    next_segment_id: u64,
     local_epoch: u64,
     delta_log_tail: ExtentLocation,
 }
@@ -82,7 +87,15 @@ impl ShardDeltaLog {
     /// "fresh state" (epoch 0) rather than a hard error -- non-fatal,
     /// since `replay_since(0)` against the still-intact, still-scannable
     /// delta segments just replays everything, which is idempotent.
+    /// `open_on` with a bare device set built from `vdev_roots`, slot by
+    /// position -- for tests that drive the log directly.
     pub fn open(vdev_roots: &[PathBuf], shard_id: u32) -> io::Result<Self> {
+        Self::open_on(Arc::new(VdevSet::from_roots(vdev_roots)), shard_id)
+    }
+
+    pub fn open_on(vdevs: Arc<VdevSet>, shard_id: u32) -> io::Result<Self> {
+        let online = vdevs.online();
+        let vdev_roots: Vec<PathBuf> = online.iter().map(|v| v.root.clone()).collect();
         if vdev_roots.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -96,24 +109,20 @@ impl ShardDeltaLog {
         // whatever was fsync'd but not yet checkpointed, before replay
         // ever looked at it.
         let mut max_id: Option<u64> = None;
-        for root in vdev_roots {
+        for root in &vdev_roots {
             for id in delta_segment_ids(root, shard_id)? {
                 max_id = Some(max_id.map_or(id, |m| m.max(id)));
             }
         }
         let next_id = max_id.map_or(0, |m| m + 1);
 
-        let writer = SegmentWriter::create_delta(
-            &vdev_roots.iter().map(|p| p.as_path()).collect::<Vec<_>>(),
-            shard_id,
-            next_id,
-        )?;
+        let writer = SegmentWriter::create_delta_on(&online, shard_id, next_id)?;
 
         // The shard superblock fans out too; whichever device's copy is
         // furthest along is the truth, since a crash can land between two
         // devices' writes of the same commit.
         let mut recovered: Option<(u64, ExtentLocation)> = None;
-        for root in vdev_roots {
+        for root in &vdev_roots {
             if let Ok(Some(slot)) = read_shard_superblock_file(root, shard_id)
                 && slot.shard_id == shard_id
                 && recovered.is_none_or(|(epoch, _)| slot.local_epoch > epoch)
@@ -125,11 +134,28 @@ impl ShardDeltaLog {
 
         Ok(Self {
             shard_id,
-            vdev_roots: vdev_roots.to_vec(),
+            vdevs,
+            vdev_roots,
             writer,
+            next_segment_id: next_id + 1,
             local_epoch,
             delta_log_tail,
         })
+    }
+
+    /// Starts a fresh delta segment on the device set as it stands now.
+    /// What a live attach calls, under this log's lock, so every commit
+    /// after it fans out to the new device too. The old segment stays
+    /// where it is: replay walks every segment on every device.
+    pub fn roll_over(&mut self) -> io::Result<()> {
+        let online = self.vdevs.online();
+        let id = self.next_segment_id;
+        self.next_segment_id += 1;
+        let new_writer = SegmentWriter::create_delta_on(&online, self.shard_id, id)?;
+        let old = std::mem::replace(&mut self.writer, new_writer);
+        old.seal()?;
+        self.vdev_roots = online.into_iter().map(|v| v.root).collect();
+        Ok(())
     }
 
     /// The `fsync(fd)` fast path (ARCHITECTURE.md §3): append `records`

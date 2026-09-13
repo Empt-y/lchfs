@@ -60,6 +60,11 @@ impl GcEngine {
         &self.pins
     }
 
+    /// The slot mark reads from.
+    pub fn primary_id(&self) -> u16 {
+        self.primary.id
+    }
+
     pub fn new(pool_root: PathBuf, locations: Arc<ChunkLocationCache>, pins: Arc<PendingDedupPins>) -> Self {
         Self::new_on(Vdev::new(crate::PRIMARY_VDEV_ID, pool_root), locations, pins)
     }
