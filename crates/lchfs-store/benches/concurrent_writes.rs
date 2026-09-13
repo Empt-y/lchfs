@@ -102,5 +102,75 @@ fn bench_concurrent_writers(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_concurrent_writers);
+/// Same shape, but every write carries bytes no other write has, so each
+/// one goes through the committer and the index put rather than resolving
+/// as a dedup hit after the first chunk. This is the group that measures
+/// the write path's one shared lock -- the persisted index -- under
+/// contention; the group above measures the prep pool and dedup.
+fn bench_concurrent_unique_writers(c: &mut Criterion) {
+    let mut group = c.benchmark_group("concurrent_unique_writers");
+    group.measurement_time(Duration::from_secs(3));
+    group.sample_size(10); // real file I/O per iteration -- keep this affordable
+
+    for &threads in &[1usize, 2, 4, 8] {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = Arc::new(Pool::create(dir.path(), bench_params()).unwrap());
+
+        // One file per thread, created up front -- the measured region
+        // below is pure write() contention, not create_file()'s own
+        // namespace-lock work.
+        let inos: Vec<u64> = (0..threads)
+            .map(|i| pool.create_file(1, &format!("f{i}"), 0o644).unwrap())
+            .collect();
+        let payloads: Vec<Vec<u8>> = (0..threads)
+            .map(|t| pseudo_random_bytes(t as u64 + 1, WRITE_SIZE))
+            .collect();
+        // A counter folded into the first bytes of every write, so no two
+        // writes in the whole run hash alike.
+        let unique = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        let total_bytes = (threads * WRITES_PER_THREAD * WRITE_SIZE) as u64;
+        group.throughput(Throughput::Bytes(total_bytes));
+        group.bench_with_input(BenchmarkId::from_parameter(threads), &threads, |b, &threads| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    let barrier = Arc::new(Barrier::new(threads));
+                    let handles: Vec<_> = (0..threads)
+                        .map(|t| {
+                            let pool = Arc::clone(&pool);
+                            let ino = inos[t];
+                            let mut data = payloads[t].clone();
+                            let barrier = Arc::clone(&barrier);
+                            let unique = Arc::clone(&unique);
+                            std::thread::spawn(move || {
+                                barrier.wait();
+                                let start = Instant::now();
+                                for w in 0..WRITES_PER_THREAD {
+                                    let n = unique.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    data[..8].copy_from_slice(&n.to_le_bytes());
+                                    pool.write(ino, (w * WRITE_SIZE) as u64, &data).unwrap();
+                                }
+                                start.elapsed()
+                            })
+                        })
+                        .collect();
+                    // Wall-clock for the whole batch is the slowest
+                    // thread, since they ran concurrently -- that's what
+                    // actually gates end-to-end throughput, not the sum.
+                    let slowest = handles
+                        .into_iter()
+                        .map(|h| h.join().unwrap())
+                        .max()
+                        .unwrap();
+                    total += slowest;
+                }
+                total
+            });
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_concurrent_writers, bench_concurrent_unique_writers);
 criterion_main!(benches);
