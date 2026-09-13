@@ -25,6 +25,7 @@
 //! special-casing.
 
 use crate::segment::SegmentReader;
+use crate::vdevs::VdevSet;
 use crate::{StreamKind, Vdev};
 use lchfs_format::{ExtentLocation, Hash32, SegmentState};
 use lchfs_index::{ChunkLocationCache, IndexStore, RedbIndex};
@@ -38,10 +39,11 @@ fn to_io_err(e: impl std::fmt::Display) -> io::Error {
 }
 
 pub struct DedupScanner {
-    /// The devices scanned, each on its own: duplicate physical copies are
-    /// a per-device fact, and the canonical chosen for a hash belongs to
-    /// that device's replica set (ARCHITECTURE.md §15.7).
-    targets: Vec<Vdev>,
+    /// The pool's device set; each pass scans every device online when it
+    /// starts, each on its own: duplicate physical copies are a per-device
+    /// fact, and the canonical chosen for a hash belongs to that device's
+    /// replica set (ARCHITECTURE.md §15.7).
+    vdevs: Arc<VdevSet>,
     /// Fixed at construction: the slot whose locations the cache holds.
     primary_id: u16,
     locations: Arc<ChunkLocationCache>,
@@ -61,10 +63,17 @@ pub struct DedupScanner {
 impl DedupScanner {
     /// `targets` is the online set, ascending by id; its first entry is the
     /// primary, whose locations the cache holds.
+    /// A fixed online set, first entry the primary -- for tests and
+    /// tooling. A mounted pool uses `new_on` with its live set.
     pub fn new(targets: Vec<Vdev>, locations: Arc<ChunkLocationCache>) -> Self {
+        let primary_id = targets[0].id;
+        Self::new_on(Arc::new(VdevSet::from_vdevs(targets)), primary_id, locations)
+    }
+
+    pub fn new_on(vdevs: Arc<VdevSet>, primary_id: u16, locations: Arc<ChunkLocationCache>) -> Self {
         Self {
-            primary_id: targets[0].id,
-            targets,
+            vdevs,
+            primary_id,
             locations,
             scanned_up_to: HashMap::new(),
         }
@@ -72,11 +81,6 @@ impl DedupScanner {
 
     fn primary_id(&self) -> u16 {
         self.primary_id
-    }
-
-    /// The online set changed (a live attach).
-    pub fn set_targets(&mut self, targets: Vec<Vdev>) {
-        self.targets = targets;
     }
 
     /// Scan newly-sealed Data-stream segments for `content_hash`
@@ -87,7 +91,7 @@ impl DedupScanner {
     /// never collides in practice, unlike bulk chunk data.
     pub fn run_pass(&mut self, persisted_index: &RwLock<RedbIndex>) -> io::Result<Vec<DedupMerge>> {
         let mut merges = Vec::new();
-        for vdev in self.targets.clone() {
+        for vdev in self.vdevs.online() {
             merges.extend(self.run_pass_on(&vdev, persisted_index)?);
         }
         Ok(merges)

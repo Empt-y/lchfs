@@ -84,26 +84,48 @@ impl ShardDataWriter {
         if self.writer.current_size() + payload.len() as u64 > self.segment_cap_bytes {
             self.roll_over()?;
         }
-        let location = self
+        let result = self
             .writer
-            .append(kind, content_hash, codec_id, uncompressed_len, payload, Vec::new())?;
+            .append(kind, content_hash, codec_id, uncompressed_len, payload, Vec::new());
+        self.report_faults();
         Ok(Appended {
-            location,
+            location: result?,
             vdevs: Arc::clone(&self.vdev_ids),
         })
+    }
+
+    /// Tells the device set about replicas this segment has dropped, and
+    /// refreshes the slot list handed out with each completion so the
+    /// index is told only the devices that still take this segment.
+    fn report_faults(&mut self) {
+        for id in self.writer.take_faults() {
+            self.vdevs.fault(id);
+        }
+        if self.vdev_ids.as_ref() != self.writer.vdev_ids() {
+            self.vdev_ids = self.writer.vdev_ids().into();
+        }
     }
 
     fn roll_over(&mut self) -> io::Result<()> {
         let new_id = self.next_segment_id.fetch_add(1, Ordering::Relaxed);
         let online = self.vdevs.online();
         let new_writer = SegmentWriter::create_on(&online, new_id, StreamKind::Data, self.shard_id)?;
-        self.vdev_ids = new_writer.vdev_ids().into();
         let old = std::mem::replace(&mut self.writer, new_writer);
-        old.seal()
+        // A device that could not take the new segment is faulted here;
+        // and the old segment's seal is the last chance to learn a
+        // replica failed on it.
+        self.report_faults();
+        let faults = old.seal()?;
+        for id in faults {
+            self.vdevs.fault(id);
+        }
+        Ok(())
     }
 
-    fn fsync(&self) -> io::Result<()> {
-        self.writer.fsync()
+    fn fsync(&mut self) -> io::Result<()> {
+        let result = self.writer.fsync();
+        self.report_faults();
+        result
     }
 }
 
@@ -134,7 +156,10 @@ impl LogicalShard {
         next_segment_id: Arc<AtomicU64>,
     ) -> io::Result<Self> {
         let initial_id = next_segment_id.fetch_add(1, Ordering::Relaxed);
-        let writer = SegmentWriter::create_on(&vdevs.online(), initial_id, StreamKind::Data, id)?;
+        let mut writer = SegmentWriter::create_on(&vdevs.online(), initial_id, StreamKind::Data, id)?;
+        for faulted in writer.take_faults() {
+            vdevs.fault(faulted);
+        }
         Ok(Self {
             id,
             ring: ArrayQueue::new(ring_capacity),

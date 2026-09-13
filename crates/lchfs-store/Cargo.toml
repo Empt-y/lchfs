@@ -22,7 +22,13 @@ blake3 = { workspace = true }
 serde = { workspace = true }
 nix = { workspace = true, features = ["fs", "user"] }
 
+[features]
+# Test-only: lets a test declare a device root dead so every replica
+# operation under it fails. See `segment::fault_injection`.
+fault-injection = []
+
 [dev-dependencies]
+lchfs-store = { path = ".", features = ["fault-injection"] }
 tempfile = { workspace = true }
 criterion = { workspace = true }
 lchfs-fsck = { workspace = true }

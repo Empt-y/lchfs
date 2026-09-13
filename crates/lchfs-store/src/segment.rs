@@ -149,9 +149,19 @@ pub struct SegmentWriter {
     files: Vec<File>,
     /// The slot each of `files` belongs to, in the same order. What the
     /// index records a new record under: the devices this segment actually
-    /// fans out to, which after a live attach is not necessarily every
-    /// device the pool has.
+    /// fans out to -- which after a live attach is not every device the
+    /// pool has, and after a fault is not every device it started with.
     vdev_ids: Vec<u16>,
+    /// The device root each of `files` lives under, same order. Only read
+    /// by fault injection in tests, but cheap and kept unconditionally so
+    /// the layout does not depend on a feature flag.
+    roots: Vec<PathBuf>,
+    /// Slots whose file failed an operation and was dropped from the
+    /// fan-out, not yet collected by the owner (`take_faults`). A device
+    /// that fails is left behind by this segment from that record on; the
+    /// owner tells the pool's device set, and the next rollover consults
+    /// that set, so every other writer drops it at its own next segment.
+    faulted: Vec<u16>,
     segment_id: u64,
     stream_kind: StreamKind,
     owner_shard: u32,
@@ -186,13 +196,16 @@ impl SegmentWriter {
         kind: StreamKind,
         owner_shard: u32,
     ) -> io::Result<Self> {
-        let mut paths = Vec::with_capacity(vdevs.len());
-        for vdev in vdevs {
-            std::fs::create_dir_all(segment_dir(&vdev.root, kind))?;
-            paths.push(segment_path(&vdev.root, segment_id, kind));
-        }
-        let ids: Vec<u16> = vdevs.iter().map(|v| v.id).collect();
-        Self::create_at(&paths, &ids, segment_id, kind, owner_shard)
+        Self::create_at(
+            vdevs,
+            |vdev| {
+                std::fs::create_dir_all(segment_dir(&vdev.root, kind))?;
+                Ok(segment_path(&vdev.root, segment_id, kind))
+            },
+            segment_id,
+            kind,
+            owner_shard,
+        )
     }
 
     /// Open a fresh segment in shard `shard_id`'s own Delta stream
@@ -217,13 +230,67 @@ impl SegmentWriter {
 
     /// `create_delta` for an explicit device set.
     pub fn create_delta_on(vdevs: &[Vdev], shard_id: u32, segment_id: u64) -> io::Result<Self> {
-        let mut paths = Vec::with_capacity(vdevs.len());
-        for vdev in vdevs {
-            std::fs::create_dir_all(delta_segment_dir(&vdev.root, shard_id))?;
-            paths.push(delta_segment_path(&vdev.root, shard_id, segment_id));
+        Self::create_at(
+            vdevs,
+            |vdev| {
+                std::fs::create_dir_all(delta_segment_dir(&vdev.root, shard_id))?;
+                Ok(delta_segment_path(&vdev.root, shard_id, segment_id))
+            },
+            segment_id,
+            StreamKind::Delta,
+            shard_id,
+        )
+    }
+
+    /// Slots dropped from this segment's fan-out since the last call,
+    /// because an operation on their file failed. The owner reports them
+    /// to the pool's device set.
+    pub fn take_faults(&mut self) -> Vec<u16> {
+        std::mem::take(&mut self.faulted)
+    }
+
+    /// Runs `op` against every replica file. A file that fails is dropped
+    /// from the fan-out and its slot recorded in `faulted`; the operation
+    /// as a whole fails only when no replica succeeded. That is the
+    /// fault model of §15.3 completed: synchronous to every *online*
+    /// device, where a device that has just failed is no longer online.
+    fn each_replica(&mut self, mut op: impl FnMut(&File) -> io::Result<()>) -> io::Result<()> {
+        let mut last_err: Option<io::Error> = None;
+        let mut i = 0;
+        while i < self.files.len() {
+            #[cfg(feature = "fault-injection")]
+            let injected = fault_injection::is_dead(&self.roots[i]);
+            #[cfg(not(feature = "fault-injection"))]
+            let injected = false;
+            let result = if injected {
+                Err(io::Error::other("fault injected"))
+            } else {
+                op(&self.files[i])
+            };
+            match result {
+                Ok(()) => i += 1,
+                Err(e) => {
+                    let id = self.vdev_ids.remove(i);
+                    self.files.remove(i);
+                    self.roots.remove(i);
+                    tracing::error!(
+                        "vdev {id}: {} segment {} failed ({e}); dropping it from this segment's fan-out",
+                        match self.stream_kind {
+                            StreamKind::Data => "data",
+                            StreamKind::Meta => "meta",
+                            StreamKind::Delta => "delta",
+                        },
+                        self.segment_id
+                    );
+                    self.faulted.push(id);
+                    last_err = Some(e);
+                }
+            }
         }
-        let ids: Vec<u16> = vdevs.iter().map(|v| v.id).collect();
-        Self::create_at(&paths, &ids, segment_id, StreamKind::Delta, shard_id)
+        match last_err {
+            Some(e) if self.files.is_empty() => Err(e),
+            _ => Ok(()),
+        }
     }
 
     /// The slots this segment fans out to.
@@ -231,30 +298,64 @@ impl SegmentWriter {
         &self.vdev_ids
     }
 
+    /// Opens the segment on every device `path_for` can place it on. A
+    /// device where the directory or the file cannot be created -- gone
+    /// from the filesystem, read-only, full -- is left out and recorded in
+    /// `faulted` for the owner to report, exactly as a failed append is.
+    /// Creation fails only if no device could take the segment.
     fn create_at(
-        paths: &[PathBuf],
-        vdev_ids: &[u16],
+        vdevs: &[Vdev],
+        path_for: impl Fn(&Vdev) -> io::Result<PathBuf>,
         segment_id: u64,
         kind: StreamKind,
         owner_shard: u32,
     ) -> io::Result<Self> {
-        if paths.is_empty() {
+        if vdevs.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "a segment needs at least one vdev to be written to",
             ));
         }
-        let mut files = Vec::with_capacity(paths.len());
-        for path in paths {
-            files.push(
-                OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .open(path)?,
-            );
+        let mut files = Vec::with_capacity(vdevs.len());
+        let mut placed: Vec<&Vdev> = Vec::with_capacity(vdevs.len());
+        let mut faulted = Vec::new();
+        let mut last_err = None;
+        for vdev in vdevs {
+            #[cfg(feature = "fault-injection")]
+            let injected = fault_injection::is_dead(&vdev.root);
+            #[cfg(not(feature = "fault-injection"))]
+            let injected = false;
+            let opened = if injected {
+                Err(io::Error::other("fault injected"))
+            } else {
+                path_for(vdev).and_then(|path| {
+                    OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .open(path)
+                })
+            };
+            match opened {
+                Ok(file) => {
+                    files.push(file);
+                    placed.push(vdev);
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "vdev {}: cannot create segment {segment_id} ({e}); leaving it out",
+                        vdev.id
+                    );
+                    faulted.push(vdev.id);
+                    last_err = Some(e);
+                }
+            }
         }
+        if files.is_empty() {
+            return Err(last_err.expect("no files means at least one error"));
+        }
+        let vdevs = placed;
 
         let mut header = SegmentHeader {
             magic: SEGMENT_HEADER_MAGIC,
@@ -265,20 +366,22 @@ impl SegmentWriter {
             header_checksum: 0,
         };
         finalize_segment_header_checksum(&mut header);
-        for file in &files {
-            write_header_page(file, &header)?;
-        }
-
-        Ok(Self {
+        // The header page goes through the same per-replica tolerance as
+        // everything after it, once the writer exists.
+        let mut writer = Self {
             files,
-            vdev_ids: vdev_ids.to_vec(),
+            vdev_ids: vdevs.iter().map(|v| v.id).collect(),
+            roots: vdevs.iter().map(|v| v.root.clone()).collect(),
+            faulted,
             segment_id,
             stream_kind: kind,
             owner_shard,
             cursor: SEGMENT_HEADER_PAGE_SIZE,
             record_count: 0,
             fingerprint: blake3::Hasher::new(),
-        })
+        };
+        writer.each_replica(|file| write_header_page(file, &header))?;
+        Ok(writer)
     }
 
     pub fn segment_id(&self) -> u64 {
@@ -338,15 +441,17 @@ impl SegmentWriter {
 
         let record_offset = self.cursor;
         // Every replica gets the identical record at the identical offset.
-        // Any failure fails the whole append: §15.3 chose synchronous
-        // all-vdev durability over quorum, because acking a write present on
-        // only some replicas would need a catch-up log -- a second
-        // durability mechanism to get wrong.
-        for file in &self.files {
+        // §15.3 chose synchronous all-vdev durability over quorum, because
+        // acking a write present on only some replicas would need a
+        // catch-up log. A replica that *fails* here is a different matter:
+        // it leaves the fan-out, the record is acked on the devices that
+        // took it, and the index says exactly those (`vdev_ids`), so the
+        // catch-up is the ordinary resilver when the device returns.
+        self.each_replica(|file| {
             file.write_all_at(&header_len.to_le_bytes(), record_offset)?;
             file.write_all_at(&encoded, record_offset + 4)?;
-            file.write_all_at(payload, record_offset + 4 + header_len as u64)?;
-        }
+            file.write_all_at(payload, record_offset + 4 + header_len as u64)
+        })?;
 
         let loc = ExtentLocation {
             segment_id: self.segment_id,
@@ -362,17 +467,18 @@ impl SegmentWriter {
     /// fsync this segment's file without sealing it — used for the
     /// checkpoint durability barriers (ARCHITECTURE.md §3), which fsync
     /// still-open segments long before they fill up and get sealed.
-    pub fn fsync(&self) -> io::Result<()> {
-        for file in &self.files {
-            file.sync_all()?;
-        }
-        Ok(())
+    pub fn fsync(&mut self) -> io::Result<()> {
+        self.each_replica(|file| file.sync_all())
     }
 
     /// Seal the segment: write record count, aggregate fingerprint hash,
     /// footer checksum (ARCHITECTURE.md §1 "Seal footer"), and flip the
     /// header page's state to `Sealed`.
-    pub fn seal(self) -> io::Result<()> {
+    ///
+    /// Returns the slots that failed during the seal and were dropped, for
+    /// the owner to report -- a sealed writer is consumed, so this is the
+    /// last chance to collect them.
+    pub fn seal(mut self) -> io::Result<Vec<u16>> {
         let mut footer = SegmentFooter {
             record_count: self.record_count,
             aggregate_fingerprint: Hash32(*self.fingerprint.finalize().as_bytes()),
@@ -381,10 +487,11 @@ impl SegmentWriter {
         finalize_segment_footer_checksum(&mut footer);
         let encoded =
             lchfs_format::encode(&footer).expect("SegmentFooter encoding is infallible");
-        for file in &self.files {
-            file.write_all_at(&(encoded.len() as u32).to_le_bytes(), self.cursor)?;
-            file.write_all_at(&encoded, self.cursor + 4)?;
-        }
+        let cursor = self.cursor;
+        self.each_replica(|file| {
+            file.write_all_at(&(encoded.len() as u32).to_le_bytes(), cursor)?;
+            file.write_all_at(&encoded, cursor + 4)
+        })?;
 
         let mut header = SegmentHeader {
             magic: SEGMENT_HEADER_MAGIC,
@@ -395,15 +502,43 @@ impl SegmentWriter {
             header_checksum: 0,
         };
         finalize_segment_header_checksum(&mut header);
-        for file in &self.files {
-            write_header_page(file, &header)?;
-        }
+        self.each_replica(|file| write_header_page(file, &header))?;
 
-        // Seal is only durable once every replica has it.
-        for file in &self.files {
-            file.sync_all()?;
-        }
-        Ok(())
+        // Seal is only durable once every replica that still holds the
+        // segment has it.
+        self.each_replica(|file| file.sync_all())?;
+        Ok(std::mem::take(&mut self.faulted))
+    }
+}
+
+/// Test-only fault injection: device roots declared dead fail every
+/// replica operation, so a disk that dies under an open descriptor -- the
+/// case nothing short of hardware produces on its own -- can be
+/// exercised. Compiled out without the `fault-injection` feature; with it,
+/// each replica operation costs one lock and one path comparison.
+#[cfg(feature = "fault-injection")]
+pub mod fault_injection {
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
+
+    fn dead() -> &'static Mutex<HashSet<PathBuf>> {
+        static DEAD: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+        DEAD.get_or_init(|| Mutex::new(HashSet::new()))
+    }
+
+    /// Every replica operation under `root` fails from now on.
+    pub fn kill(root: &Path) {
+        dead().lock().unwrap().insert(root.to_path_buf());
+    }
+
+    /// The device works again.
+    pub fn revive(root: &Path) {
+        dead().lock().unwrap().remove(root);
+    }
+
+    pub(crate) fn is_dead(root: &Path) -> bool {
+        dead().lock().unwrap().contains(root)
     }
 }
 

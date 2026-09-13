@@ -14,6 +14,7 @@
 
 use crate::gc::GcEngine;
 use crate::segment::{self, SegmentReader, SegmentWriter};
+use crate::vdevs::VdevSet;
 use crate::{StreamKind, Vdev};
 use lchfs_format::{ExtentLocation, Hash32};
 use lchfs_index::{ChunkLocationCache, IndexStore, PendingDedupPins, RedbIndex};
@@ -29,35 +30,41 @@ fn to_io_err(e: impl std::fmt::Display) -> io::Error {
 }
 
 pub struct CoalesceDaemon {
-    /// The devices this daemon repacks, each on its own: coalescing
-    /// rewrites extents into new segments *on one device*, so the
-    /// relocations it records belong to that vdev's replica set and no
-    /// other (ARCHITECTURE.md §15.7: mark is pool-global, sweep is
-    /// per-vdev). Forcing the devices into lockstep would need distributed
+    /// The pool's device set. Each pass repacks every device that is
+    /// online *when the pass starts*, each on its own: coalescing rewrites
+    /// extents into new segments *on one device*, so the relocations it
+    /// records belong to that vdev's replica set and no other
+    /// (ARCHITECTURE.md §15.7: mark is pool-global, sweep is per-vdev).
+    /// Forcing the devices into lockstep would need distributed
     /// coordination for no correctness gain -- per-vdev locations already
     /// make divergence the represented normal case.
-    targets: Vec<Vdev>,
+    vdevs: Arc<VdevSet>,
     /// Marks on the primary. One walk serves every target, because the DAG
     /// is content-addressed and identical on every device.
     gc: GcEngine,
 }
 
 impl CoalesceDaemon {
-    /// `targets` is the online set, ascending by id; its first entry is the
-    /// primary, which is where mark reads from.
+    /// `targets` is a fixed online set, ascending by id, whose first entry
+    /// is the primary -- for tests and tooling that drive the daemon
+    /// directly. A mounted pool uses `new_on` with its live set.
     pub fn new(targets: Vec<Vdev>, locations: Arc<ChunkLocationCache>, pins: Arc<PendingDedupPins>) -> Self {
-        let gc = GcEngine::new_on(targets[0].clone(), locations, pins);
-        Self { targets, gc }
+        let primary = targets[0].clone();
+        Self::new_on(Arc::new(VdevSet::from_vdevs(targets)), primary, locations, pins)
+    }
+
+    pub fn new_on(
+        vdevs: Arc<VdevSet>,
+        primary: Vdev,
+        locations: Arc<ChunkLocationCache>,
+        pins: Arc<PendingDedupPins>,
+    ) -> Self {
+        let gc = GcEngine::new_on(primary, locations, pins);
+        Self { vdevs, gc }
     }
 
     fn primary_id(&self) -> u16 {
         self.gc.primary_id()
-    }
-
-    /// The online set changed (a live attach). Mark keeps reading from
-    /// the primary it was built on; only the sweep targets change.
-    pub fn set_targets(&mut self, targets: Vec<Vdev>) {
-        self.targets = targets;
     }
 
     /// One idle-cycle pass: mark, find segments below the liveness
@@ -95,7 +102,7 @@ impl CoalesceDaemon {
             return Ok(());
         }
 
-        let targets = self.targets.clone();
+        let targets = self.vdevs.online();
         for vdev in &targets {
             // The primary's bitmaps come straight out of mark; any other
             // device's are the same hashes at that device's own offsets.
@@ -205,7 +212,11 @@ impl CoalesceDaemon {
             )?;
             relocations.push((header.content_hash, new_loc));
         }
-        writer.seal()?;
+        // A repack writes to one device; a failure here is the daemon's
+        // to report like any writer's.
+        for id in writer.seal()? {
+            self.vdevs.fault(id);
+        }
 
         // Durably repoint the index *before* touching the old segment --
         // if we crash after this but before the old segment is deleted,

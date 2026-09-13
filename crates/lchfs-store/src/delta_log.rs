@@ -116,7 +116,10 @@ impl ShardDeltaLog {
         }
         let next_id = max_id.map_or(0, |m| m + 1);
 
-        let writer = SegmentWriter::create_delta_on(&online, shard_id, next_id)?;
+        let mut writer = SegmentWriter::create_delta_on(&online, shard_id, next_id)?;
+        for id in writer.take_faults() {
+            vdevs.fault(id);
+        }
 
         // The shard superblock fans out too; whichever device's copy is
         // furthest along is the truth, since a crash can land between two
@@ -153,9 +156,31 @@ impl ShardDeltaLog {
         self.next_segment_id += 1;
         let new_writer = SegmentWriter::create_delta_on(&online, self.shard_id, id)?;
         let old = std::mem::replace(&mut self.writer, new_writer);
-        old.seal()?;
         self.vdev_roots = online.into_iter().map(|v| v.root).collect();
+        self.report_faults();
+        for id in old.seal()? {
+            self.vdevs.fault(id);
+        }
         Ok(())
+    }
+
+    /// Reports replicas the current segment has dropped, and stops
+    /// writing the shard superblock to them.
+    fn report_faults(&mut self) {
+        let faults = self.writer.take_faults();
+        if faults.is_empty() {
+            return;
+        }
+        for id in &faults {
+            self.vdevs.fault(*id);
+        }
+        let still: Vec<u16> = self.writer.vdev_ids().to_vec();
+        let online = self.vdevs.online();
+        self.vdev_roots = online
+            .into_iter()
+            .filter(|v| still.contains(&v.id))
+            .map(|v| v.root)
+            .collect();
     }
 
     /// The `fsync(fd)` fast path (ARCHITECTURE.md §3): append `records`
@@ -175,14 +200,16 @@ impl ShardDeltaLog {
         records: &[ShardCommitRecord],
     ) -> io::Result<()> {
         for record in records {
-            self.writer.append(
+            let appended = self.writer.append(
                 record.kind,
                 record.content_hash,
                 lchfs_format::CodecId::None,
                 record.encoded.len() as u32,
                 &record.encoded,
                 Vec::new(),
-            )?;
+            );
+            self.report_faults();
+            appended?;
         }
 
         let epoch = self.local_epoch + 1;
@@ -193,16 +220,20 @@ impl ShardDeltaLog {
         };
         let encoded = lchfs_format::encode(&entry).map_err(decode_error)?;
         let entry_hash = Hash32::of(&encoded);
-        let loc = self.writer.append(
+        let appended = self.writer.append(
             ExtentKind::DeltaLogEntry,
             entry_hash,
             lchfs_format::CodecId::None,
             encoded.len() as u32,
             &encoded,
             Vec::new(),
-        )?;
+        );
+        self.report_faults();
+        let loc = appended?;
 
-        self.writer.fsync()?;
+        let synced = self.writer.fsync();
+        self.report_faults();
+        synced?;
 
         self.local_epoch = epoch;
         self.delta_log_tail = loc;
@@ -227,17 +258,39 @@ impl ShardDeltaLog {
         let mut buf = vec![0u8; SHARD_SUPERBLOCK_FILE_SIZE as usize];
         buf[0..4].copy_from_slice(&(encoded.len() as u32).to_le_bytes());
         buf[4..4 + encoded.len()].copy_from_slice(&encoded);
+        // Per device, like the segment writes: a device that cannot take
+        // its shard superblock is faulted, and the commit stands on the
+        // devices that could.
+        let mut wrote_one = false;
+        let mut last_err = None;
+        let online = self.vdevs.online();
         for root in &self.vdev_roots {
-            let path = shard_superblock_path(root, self.shard_id);
-            std::fs::create_dir_all(path.parent().unwrap())?;
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&path)?;
-            file.write_all_at(&buf, 0)?;
-            file.sync_all()?;
+            let write = (|| -> io::Result<()> {
+                let path = shard_superblock_path(root, self.shard_id);
+                std::fs::create_dir_all(path.parent().unwrap())?;
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(&path)?;
+                file.write_all_at(&buf, 0)?;
+                file.sync_all()
+            })();
+            match write {
+                Ok(()) => wrote_one = true,
+                Err(e) => {
+                    if let Some(v) = online.iter().find(|v| &v.root == root) {
+                        self.vdevs.fault(v.id);
+                    }
+                    last_err = Some(e);
+                }
+            }
+        }
+        if !wrote_one
+            && let Some(e) = last_err
+        {
+            return Err(e);
         }
         Ok(())
     }

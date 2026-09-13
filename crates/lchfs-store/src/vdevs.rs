@@ -28,6 +28,11 @@ pub(crate) struct Member {
 pub(crate) struct VdevSetState {
     /// Ascending by `Vdev::id`.
     pub members: Vec<Member>,
+    /// Devices that failed an operation while online. Still owned -- their
+    /// locks and rings are held -- but no writer fans out to them, no
+    /// checkpoint advances their superblock, and reads do not try them.
+    /// `rejoin` moves one back once it has been repaired and caught up.
+    pub faulted: Vec<Member>,
     /// How many slots the pool has, whether or not each has a device here.
     pub count: u16,
     /// Devices that are online for *writes* but whose superblock must not
@@ -47,6 +52,7 @@ impl VdevSet {
         Self {
             state: RwLock::new(VdevSetState {
                 members,
+                faulted: Vec::new(),
                 count,
                 catching_up: HashSet::new(),
             }),
@@ -64,16 +70,27 @@ impl VdevSet {
     /// A set for tests and tooling that drive writers directly: the roots
     /// given, slot by position, no superblocks and no locks.
     pub fn from_roots(roots: &[PathBuf]) -> Self {
-        let members = roots
-            .iter()
-            .enumerate()
-            .map(|(i, r)| Member {
-                vdev: Vdev::new(i as u16, r.clone()),
+        Self::from_vdevs(
+            roots
+                .iter()
+                .enumerate()
+                .map(|(i, r)| Vdev::new(i as u16, r.clone()))
+                .collect(),
+        )
+    }
+
+    /// `from_roots` with explicit slots.
+    pub fn from_vdevs(vdevs: Vec<Vdev>) -> Self {
+        let count = vdevs.iter().map(|v| v.id + 1).max().unwrap_or(0);
+        let mut members: Vec<Member> = vdevs
+            .into_iter()
+            .map(|vdev| Member {
+                vdev,
                 superblock: None,
                 _lock: None,
             })
-            .collect::<Vec<_>>();
-        let count = members.len() as u16;
+            .collect();
+        members.sort_by_key(|m| m.vdev.id);
         Self::new(members, count)
     }
 
@@ -116,6 +133,57 @@ impl VdevSet {
             .map(|m| m.vdev.root.clone())
     }
 
+    /// Slots whose device failed while online (a subset of `missing`).
+    pub fn faulted(&self) -> Vec<u16> {
+        self.state.read().faulted.iter().map(|m| m.vdev.id).collect()
+    }
+
+    /// One line per slot, for status output.
+    pub fn status(&self) -> Vec<VdevStatus> {
+        let state = self.state.read();
+        (0..state.count)
+            .map(|id| {
+                let health = if state.members.iter().any(|m| m.vdev.id == id) {
+                    if state.catching_up.contains(&id) {
+                        VdevHealth::CatchingUp
+                    } else {
+                        VdevHealth::Online
+                    }
+                } else if state.faulted.iter().any(|m| m.vdev.id == id) {
+                    VdevHealth::Faulted
+                } else {
+                    VdevHealth::Absent
+                };
+                let root = state
+                    .members
+                    .iter()
+                    .chain(state.faulted.iter())
+                    .find(|m| m.vdev.id == id)
+                    .map(|m| m.vdev.root.clone());
+                VdevStatus { id, health, root }
+            })
+            .collect()
+    }
+
+    /// A device failed an operation: it leaves the online set from now
+    /// on. Idempotent -- every writer that trips over the same dead device
+    /// reports it, and only the first report does anything. Returns
+    /// whether this call was the one that changed state.
+    pub fn fault(&self, id: u16) -> bool {
+        let mut state = self.state.write();
+        let Some(pos) = state.members.iter().position(|m| m.vdev.id == id) else {
+            return false;
+        };
+        let member = state.members.remove(pos);
+        state.catching_up.remove(&id);
+        tracing::error!(
+            "vdev {id} at {} FAULTED; the pool continues without it",
+            member.vdev.root.display()
+        );
+        state.faulted.push(member);
+        true
+    }
+
     /// Slots with no device online.
     pub fn missing(&self) -> Vec<u16> {
         let state = self.state.read();
@@ -138,4 +206,23 @@ impl VdevSet {
     pub(crate) fn finish_catch_up(&self, id: u16) {
         self.state.write().catching_up.remove(&id);
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VdevHealth {
+    Online,
+    /// Online for writes, being filled by a resilver; superblock not yet
+    /// advanced.
+    CatchingUp,
+    /// Failed while online; owned but not used.
+    Faulted,
+    /// No device for this slot in this mount.
+    Absent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VdevStatus {
+    pub id: u16,
+    pub health: VdevHealth,
+    pub root: Option<PathBuf>,
 }

@@ -702,6 +702,7 @@ dependencies = [
  "lchfs-format",
  "lchfs-fsck",
  "lchfs-index",
+ "lchfs-store",
  "nix",
  "parking_lot",
  "rayon",

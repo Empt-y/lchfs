@@ -70,6 +70,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 pub use backend::{FileBackend, StorageBackend, Vdev};
+pub use vdevs::{VdevHealth, VdevStatus};
 
 #[derive(Debug, Error)]
 pub enum PoolError {
@@ -571,7 +572,10 @@ impl Pool {
             Arc::clone(&next_segment_id),
         )?;
         let meta_id = next_segment_id.fetch_add(1, Ordering::Relaxed);
-        let meta_writer = SegmentWriter::create_on(&vdevs, meta_id, StreamKind::Meta, 0)?;
+        let mut meta_writer = SegmentWriter::create_on(&vdevs, meta_id, StreamKind::Meta, 0)?;
+        for id in meta_writer.take_faults() {
+            vdev_set.fault(id);
+        }
 
         let shard_delta_logs = (0..shard_count)
             .map(|id| ShardDeltaLog::open_on(Arc::clone(&vdev_set), id).map(Mutex::new))
@@ -614,8 +618,8 @@ impl Pool {
         };
 
         // Every online device gets swept and scanned (§15.7); the daemons
-        // hold their own copy of the list.
-        let daemon_targets: Vec<Vdev> = vdevs.clone();
+        // read the live set at the start of each pass.
+        let primary_vdev = vdevs[0].clone();
         let shared = Arc::new(PoolShared {
             pool_root: pool_root.to_path_buf(),
             pool_params: params,
@@ -625,7 +629,7 @@ impl Pool {
             pool_uuid: lchfs_format::generate_pool_uuid()?,
             vdev_id: 0,
             primary_id: PRIMARY_VDEV_ID,
-            vdevs: vdev_set,
+            vdevs: Arc::clone(&vdev_set),
             mount_resilver: Vec::new(),
             attach_lock: Mutex::new(()),
             namespace: Mutex::new(namespace),
@@ -645,13 +649,15 @@ impl Pool {
             prep_pool,
             shard_delta_logs,
             checkpoint_lock: Mutex::new(()),
-            coalesce: Mutex::new(coalesce::CoalesceDaemon::new(
-                daemon_targets.clone(),
+            coalesce: Mutex::new(coalesce::CoalesceDaemon::new_on(
+                Arc::clone(&vdev_set),
+                primary_vdev.clone(),
                 Arc::clone(&dedup_index),
                 Arc::clone(&dedup_pins),
             )),
-            dedup: Mutex::new(dedup::DedupScanner::new(
-                daemon_targets,
+            dedup: Mutex::new(dedup::DedupScanner::new_on(
+                Arc::clone(&vdev_set),
+                primary_vdev.id,
                 Arc::clone(&dedup_index),
             )),
             checkpoint_task: Mutex::new(None),
@@ -1050,7 +1056,10 @@ impl Pool {
             Arc::clone(&next_segment_id),
         )?;
         let meta_id = next_segment_id.fetch_add(1, Ordering::Relaxed);
-        let meta_writer = SegmentWriter::create_on(&vdevs, meta_id, StreamKind::Meta, 0)?;
+        let mut meta_writer = SegmentWriter::create_on(&vdevs, meta_id, StreamKind::Meta, 0)?;
+        for id in meta_writer.take_faults() {
+            vdev_set.fault(id);
+        }
 
         // Two-tier crash recovery (ARCHITECTURE.md §7): the InoMap walk
         // above is tier one (the last full checkpoint's base state). Tier
@@ -1223,8 +1232,8 @@ impl Pool {
             }));
         }
         // Every online device gets swept and scanned (§15.7); the daemons
-        // hold their own copy of the list.
-        let daemon_targets: Vec<Vdev> = vdevs.clone();
+        // read the live set at the start of each pass.
+        let primary_vdev = vdevs[0].clone();
         let shared = Arc::new(PoolShared {
             pool_root: pool_root.to_path_buf(),
             pool_params: root.pool_params,
@@ -1233,7 +1242,7 @@ impl Pool {
             pool_uuid: slot.pool_uuid,
             vdev_id: slot.vdev_id,
             primary_id,
-            vdevs: vdev_set,
+            vdevs: Arc::clone(&vdev_set),
             mount_resilver: Vec::new(),
             attach_lock: Mutex::new(()),
             namespace: Mutex::new(namespace),
@@ -1253,13 +1262,15 @@ impl Pool {
             prep_pool,
             shard_delta_logs,
             checkpoint_lock: Mutex::new(()),
-            coalesce: Mutex::new(coalesce::CoalesceDaemon::new(
-                daemon_targets.clone(),
+            coalesce: Mutex::new(coalesce::CoalesceDaemon::new_on(
+                Arc::clone(&vdev_set),
+                primary_vdev.clone(),
                 Arc::clone(&dedup_index),
                 Arc::clone(&dedup_pins),
             )),
-            dedup: Mutex::new(dedup::DedupScanner::new(
-                daemon_targets,
+            dedup: Mutex::new(dedup::DedupScanner::new_on(
+                Arc::clone(&vdev_set),
+                primary_vdev.id,
                 Arc::clone(&dedup_index),
             )),
             checkpoint_task: Mutex::new(None),
@@ -1321,9 +1332,29 @@ impl Pool {
         !self.0.vdevs.missing().is_empty()
     }
 
-    /// The vdev slots with no device present in this mount.
+    /// The vdev slots with no device present in this mount, whether they
+    /// were absent at mount or have faulted since.
     pub fn missing_vdevs(&self) -> Vec<u16> {
         self.0.vdevs.missing()
+    }
+
+    /// Slots whose device failed while this pool was mounted.
+    pub fn faulted_vdevs(&self) -> Vec<u16> {
+        self.0.vdevs.faulted()
+    }
+
+    /// One entry per slot: online, catching up, faulted or absent.
+    pub fn vdev_status(&self) -> Vec<vdevs::VdevStatus> {
+        self.0.vdevs.status()
+    }
+
+    /// The slot serving as this mount's primary (ARCHITECTURE.md §15.10).
+    /// If it faults, the index it holds is unreachable and the pool must
+    /// be remounted with another device as primary; `vdev_status` shows
+    /// it as faulted like any other, and this is how a caller knows the
+    /// difference.
+    pub fn primary_vdev(&self) -> u16 {
+        self.0.primary_id
     }
 
     /// Adds a blank device while mounted (ARCHITECTURE.md §15.10), into a
@@ -2199,7 +2230,7 @@ impl PoolShared {
             .is_some_and(|w| w.current_size() + raw_payload.len() as u64 > u64::from(cap));
         if needs_rollover {
             let full = writers.remove(&key).expect("checked present");
-            full.seal()?;
+            self.report_faults(full.seal()?);
         }
         let writer = match writers.entry(key) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
@@ -2234,13 +2265,15 @@ impl PoolShared {
             return Ok(());
         }
         {
-            let writers = self.heal_writers.lock();
+            let mut writers = self.heal_writers.lock();
             let mut synced = HashSet::new();
             for &(vdev_id, kind, _, _) in healed {
                 if synced.insert((vdev_id, kind))
-                    && let Some(w) = writers.get(&(vdev_id, kind))
+                    && let Some(w) = writers.get_mut(&(vdev_id, kind))
                 {
-                    w.fsync()?;
+                    let result = w.fsync();
+                    self.report_faults(w.take_faults());
+                    result?;
                 }
             }
         }
@@ -2268,9 +2301,18 @@ impl PoolShared {
     fn seal_heal_writers(&self) -> Result<(), PoolError> {
         let drained: Vec<_> = self.heal_writers.lock().drain().collect();
         for (_, w) in drained {
-            w.seal()?;
+            self.report_faults(w.seal()?);
         }
         Ok(())
+    }
+
+    /// Tells the device set about slots a writer has dropped. Every writer
+    /// that trips over the same dead device reports it; the set makes the
+    /// first report count and the rest no-ops.
+    fn report_faults(&self, faults: Vec<u16>) {
+        for id in faults {
+            self.vdevs.fault(id);
+        }
     }
 
     /// Brings `vdev_id` up to date with the rest of the pool
@@ -2562,14 +2604,16 @@ impl PoolShared {
         }
         let mut meta_writer = self.meta_writer.lock();
         self.ensure_meta_room(&mut meta_writer, encoded.len() as u64)?;
-        let loc = meta_writer.append(
+        let appended = meta_writer.append(
             kind,
             hash,
             CodecId::None,
             encoded.len() as u32,
             &encoded,
             Vec::new(),
-        )?;
+        );
+        self.report_faults(meta_writer.take_faults());
+        let loc = appended?;
         // Recorded before the meta lock is released, for the same reason
         // the committer records under its shard lock: rolling this writer
         // under its lock then guarantees everything on the old segment is
@@ -2596,9 +2640,10 @@ impl PoolShared {
     /// Starts a fresh meta segment on the device set as it stands now.
     fn roll_meta_writer(&self, meta_writer: &mut SegmentWriter) -> Result<(), PoolError> {
         let id = self.next_segment_id.fetch_add(1, Ordering::Relaxed);
-        let new_writer = SegmentWriter::create_on(&self.vdevs.online(), id, StreamKind::Meta, 0)?;
+        let mut new_writer = SegmentWriter::create_on(&self.vdevs.online(), id, StreamKind::Meta, 0)?;
+        self.report_faults(new_writer.take_faults());
         let old = std::mem::replace(meta_writer, new_writer);
-        old.seal()?;
+        self.report_faults(old.seal()?);
         Ok(())
     }
 
@@ -2661,9 +2706,8 @@ impl PoolShared {
         for log in &self.shard_delta_logs {
             log.lock().roll_over()?;
         }
-        let online = self.vdevs.online();
-        self.coalesce.lock().set_targets(online.clone());
-        self.dedup.lock().set_targets(online);
+        // The daemons read the live set at the start of each pass, so
+        // there is nothing to tell them.
 
         // 3.
         let report = self.resilver(new_id)?;
@@ -4119,7 +4163,12 @@ impl PoolShared {
         // Barrier #2: everything the new superblock slot will point to
         // (InodeObjects, DirectoryObjects, IndirectHashLists, InoMap,
         // SnapshotTable, RootObject) went to meta_writer above.
-        self.meta_writer.lock().fsync()?;
+        {
+            let mut meta_writer = self.meta_writer.lock();
+            let synced = meta_writer.fsync();
+            self.report_faults(meta_writer.take_faults());
+            synced?;
+        }
         // Heal segments were fsync'd as they were committed; sealing here
         // just closes them out on the same cadence as everything else.
         self.seal_heal_writers()?;
@@ -4184,17 +4233,31 @@ impl PoolShared {
         // (or absent) superblock until its fill completes, so a crash
         // mid-attach leaves it looking stale -- which it is -- rather
         // than current.
-        let set = self.vdevs.read();
-        for member in &set.members {
-            if set.catching_up.contains(&member.vdev.id) {
-                continue;
+        let mut failed: Vec<u16> = Vec::new();
+        {
+            let set = self.vdevs.read();
+            for member in &set.members {
+                if set.catching_up.contains(&member.vdev.id) {
+                    continue;
+                }
+                let Some(backend) = &member.superblock else { continue };
+                let mut per_vdev = slot;
+                per_vdev.vdev_id = member.vdev.id;
+                finalize_superblock_slot_checksum(&mut per_vdev);
+                if let Err(e) = write_superblock_slot(backend, &per_vdev) {
+                    // The primary's ring is where the mount recovers from;
+                    // losing it is not something the pool can write its
+                    // way around. Any other member is faulted like a
+                    // failed segment write.
+                    if member.vdev.id == self.primary_id {
+                        return Err(e);
+                    }
+                    tracing::error!("vdev {}: superblock write failed ({e})", member.vdev.id);
+                    failed.push(member.vdev.id);
+                }
             }
-            let Some(backend) = &member.superblock else { continue };
-            let mut per_vdev = slot;
-            per_vdev.vdev_id = member.vdev.id;
-            finalize_superblock_slot_checksum(&mut per_vdev);
-            write_superblock_slot(backend, &per_vdev)?;
         }
+        self.report_faults(failed);
 
         Ok(())
     }
