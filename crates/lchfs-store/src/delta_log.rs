@@ -63,8 +63,6 @@ pub struct ReplayResult {
 /// (ARCHITECTURE.md §1, §3).
 pub struct ShardDeltaLog {
     pub shard_id: u32,
-    /// Reads use vdev 0 (§15.10); writes fan out across all of these.
-    pool_root: PathBuf,
     /// Every vdev this shard's delta segments and shard superblock are
     /// written to. The delta log is the fsync fast path (§3), so without
     /// fan-out here a write made durable by fsync -- rather than by a
@@ -91,25 +89,19 @@ impl ShardDeltaLog {
                 "a delta log needs at least one vdev",
             ));
         }
-        let pool_root: &Path = &vdev_roots[0];
-        let dir = delta_segment_dir(pool_root, shard_id);
-        let next_id = if dir.is_dir() {
-            let mut max_id: Option<u64> = None;
-            for entry in std::fs::read_dir(&dir)? {
-                let entry = entry?;
-                let file_name = entry.file_name();
-                let stem = Path::new(&file_name)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("");
-                if let Ok(id) = stem.parse::<u64>() {
-                    max_id = Some(max_id.map_or(id, |m| m.max(id)));
-                }
+        // The next id must clear every segment on *every* device. Seeding
+        // it from vdev 0 alone would, with vdev 0's delta directory lost,
+        // start again at 0 -- and `create_delta` fans out with truncate,
+        // so it would wipe vdev 1's `0.dseg`, the one surviving copy of
+        // whatever was fsync'd but not yet checkpointed, before replay
+        // ever looked at it.
+        let mut max_id: Option<u64> = None;
+        for root in vdev_roots {
+            for id in delta_segment_ids(root, shard_id)? {
+                max_id = Some(max_id.map_or(id, |m| m.max(id)));
             }
-            max_id.map_or(0, |m| m + 1)
-        } else {
-            0
-        };
+        }
+        let next_id = max_id.map_or(0, |m| m + 1);
 
         let writer = SegmentWriter::create_delta(
             &vdev_roots.iter().map(|p| p.as_path()).collect::<Vec<_>>(),
@@ -117,14 +109,22 @@ impl ShardDeltaLog {
             next_id,
         )?;
 
-        let (local_epoch, delta_log_tail) = match read_shard_superblock_file(pool_root, shard_id) {
-            Ok(Some(slot)) if slot.shard_id == shard_id => (slot.local_epoch, slot.delta_log_tail),
-            _ => (0, ExtentLocation::default()),
-        };
+        // The shard superblock fans out too; whichever device's copy is
+        // furthest along is the truth, since a crash can land between two
+        // devices' writes of the same commit.
+        let mut recovered: Option<(u64, ExtentLocation)> = None;
+        for root in vdev_roots {
+            if let Ok(Some(slot)) = read_shard_superblock_file(root, shard_id)
+                && slot.shard_id == shard_id
+                && recovered.is_none_or(|(epoch, _)| slot.local_epoch > epoch)
+            {
+                recovered = Some((slot.local_epoch, slot.delta_log_tail));
+            }
+        }
+        let (local_epoch, delta_log_tail) = recovered.unwrap_or((0, ExtentLocation::default()));
 
         Ok(Self {
             shard_id,
-            pool_root: pool_root.to_path_buf(),
             vdev_roots: vdev_roots.to_vec(),
             writer,
             local_epoch,
@@ -242,50 +242,56 @@ impl ShardDeltaLog {
     /// persist-counter serialization, not from trusting it), tolerating a
     /// torn trailing record from a crash mid-append the same way mount-
     /// time segment scanning already does.
+    ///
+    /// Every device is scanned, not just the primary (§15.2). Delta
+    /// segments fan out like everything else, so a segment or a record the
+    /// primary has lost is still on the others at the same offset. Each
+    /// segment id seen on any device is walked on every device, and a
+    /// record counts once -- from the first device where it reads back and
+    /// verifies -- so a torn or rotted copy on one device neither ends the
+    /// scan early nor replays twice.
     pub fn replay_since(&self, watermark: u64) -> io::Result<ReplayResult> {
-        let dir = delta_segment_dir(&self.pool_root, self.shard_id);
-        let mut segment_ids: Vec<u64> = if dir.is_dir() {
-            std::fs::read_dir(&dir)?
-                .filter_map(|e| e.ok())
-                .filter_map(|e| {
-                    let file_name = e.file_name();
-                    Path::new(&file_name)
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .and_then(|s| s.parse::<u64>().ok())
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let mut segment_ids: Vec<u64> = Vec::new();
+        for root in &self.vdev_roots {
+            segment_ids.extend(delta_segment_ids(root, self.shard_id)?);
+        }
         segment_ids.sort_unstable();
+        segment_ids.dedup();
 
         let mut entries = Vec::new();
         let mut locations = Vec::new();
 
         for segment_id in segment_ids {
-            let reader =
-                match SegmentReader::open_delta(&self.pool_root, self.shard_id, segment_id) {
-                    Ok(r) => r,
-                    Err(_) => continue,
+            let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            for root in &self.vdev_roots {
+                let Ok(reader) = SegmentReader::open_delta(root, self.shard_id, segment_id) else {
+                    continue;
                 };
-            let mut offset = crate::segment::SEGMENT_HEADER_PAGE_SIZE as u32;
-            while let Some((header, next_offset)) = reader.scan_next(offset) {
-                let loc = ExtentLocation {
-                    segment_id,
-                    offset,
-                    len: header.record_len,
-                };
-                if header.kind == ExtentKind::DeltaLogEntry {
-                    if let Ok((_h, bytes)) = reader.read_record(loc)
-                        && let Ok(entry) = lchfs_format::decode::<DeltaLogEntry>(&bytes)
-                    {
-                        entries.push(entry);
+                let mut offset = crate::segment::SEGMENT_HEADER_PAGE_SIZE as u32;
+                while let Some((header, next_offset)) = reader.scan_next(offset) {
+                    let loc = ExtentLocation {
+                        segment_id,
+                        offset,
+                        len: header.record_len,
+                    };
+                    if !seen.contains(&offset) {
+                        if header.kind == ExtentKind::DeltaLogEntry {
+                            if let Ok((_h, bytes)) = reader.read_record(loc)
+                                && let Ok(entry) = lchfs_format::decode::<DeltaLogEntry>(&bytes)
+                            {
+                                entries.push(entry);
+                                seen.insert(offset);
+                            }
+                        } else {
+                            // Content is verified when it is actually read,
+                            // through a path that fails over; here only the
+                            // framing matters.
+                            locations.push((header.content_hash, loc));
+                            seen.insert(offset);
+                        }
                     }
-                } else {
-                    locations.push((header.content_hash, loc));
+                    offset = next_offset;
                 }
-                offset = next_offset;
             }
         }
 
@@ -294,6 +300,27 @@ impl ShardDeltaLog {
 
         Ok(ReplayResult { entries, locations })
     }
+}
+
+/// Every delta segment id present for `shard_id` under `vdev_root`;
+/// empty if the shard has no directory there.
+fn delta_segment_ids(vdev_root: &Path, shard_id: u32) -> io::Result<Vec<u64>> {
+    let dir = delta_segment_dir(vdev_root, shard_id);
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut ids = Vec::new();
+    for entry in std::fs::read_dir(&dir)? {
+        let file_name = entry?.file_name();
+        if let Some(id) = Path::new(&file_name)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            ids.push(id);
+        }
+    }
+    Ok(ids)
 }
 
 fn read_shard_superblock_file(

@@ -837,34 +837,28 @@ impl Pool {
                 (readers, locations, max_segment_id, index, false)
             };
 
-        let root_bytes = {
-            let reader = get_reader(
-                &mut readers,
-                pool_root,
-                PRIMARY_VDEV_ID,
-                slot.root_location.segment_id,
-                StreamKind::Meta,
-            )?;
-            let (_header, bytes) = reader.read_record(slot.root_location)?;
-            bytes
-        };
+        let root_bytes = mount_read(
+            &mut readers,
+            &vdevs,
+            &persisted_index,
+            StreamKind::Meta,
+            slot.root_hash,
+            slot.root_location,
+        )?;
         let root: RootObject =
             lchfs_format::decode(&root_bytes).map_err(|e| PoolError::Format(e.to_string()))?;
 
         let inomap_loc = *locations
             .get(&root.inomap_hash)
             .ok_or_else(|| PoolError::Format("InoMap location missing from segment scan".into()))?;
-        let inomap_bytes = {
-            let reader = get_reader(
-                &mut readers,
-                pool_root,
-                PRIMARY_VDEV_ID,
-                inomap_loc.segment_id,
-                StreamKind::Meta,
-            )?;
-            let (_h, bytes) = reader.read_record(inomap_loc)?;
-            bytes
-        };
+        let inomap_bytes = mount_read(
+            &mut readers,
+            &vdevs,
+            &persisted_index,
+            StreamKind::Meta,
+            root.inomap_hash,
+            inomap_loc,
+        )?;
         let ino_map: InoMap =
             lchfs_format::decode(&inomap_bytes).map_err(|e| PoolError::Format(e.to_string()))?;
 
@@ -875,11 +869,14 @@ impl Pool {
             let loc = *locations.get(&entry.current_object_hash).ok_or_else(|| {
                 PoolError::Format(format!("InodeObject for ino {} missing from scan", entry.ino))
             })?;
-            let bytes = {
-                let reader = get_reader(&mut readers, pool_root, PRIMARY_VDEV_ID, loc.segment_id, StreamKind::Meta)?;
-                let (_h, bytes) = reader.read_record(loc)?;
-                bytes
-            };
+            let bytes = mount_read(
+                &mut readers,
+                &vdevs,
+                &persisted_index,
+                StreamKind::Meta,
+                entry.current_object_hash,
+                loc,
+            )?;
             let inode: InodeObject =
                 lchfs_format::decode(&bytes).map_err(|e| PoolError::Format(e.to_string()))?;
             if inode.kind == InodeKind::Directory
@@ -888,12 +885,14 @@ impl Pool {
                 let dir_loc = *locations
                     .get(dir_hash)
                     .ok_or_else(|| PoolError::Format("DirectoryObject missing from scan".into()))?;
-                let dir_bytes = {
-                    let reader =
-                        get_reader(&mut readers, pool_root, PRIMARY_VDEV_ID, dir_loc.segment_id, StreamKind::Meta)?;
-                    let (_h, bytes) = reader.read_record(dir_loc)?;
-                    bytes
-                };
+                let dir_bytes = mount_read(
+                    &mut readers,
+                    &vdevs,
+                    &persisted_index,
+                    StreamKind::Meta,
+                    *dir_hash,
+                    dir_loc,
+                )?;
                 let dir: DirectoryObject = lchfs_format::decode(&dir_bytes)
                     .map_err(|e| PoolError::Format(e.to_string()))?;
                 for child in &dir.entries {
@@ -990,9 +989,7 @@ impl Pool {
                             entry.ino
                         ))
                     })?;
-                    let delta_reader =
-                        SegmentReader::open_delta(pool_root, shard_id, loc.segment_id)?;
-                    let (_h, bytes) = delta_reader.read_record(*loc)?;
+                    let bytes = mount_read_delta(&vdevs, shard_id, *loc)?;
                     let inode: InodeObject = lchfs_format::decode(&bytes)
                         .map_err(|e| PoolError::Format(e.to_string()))?;
 
@@ -1011,9 +1008,7 @@ impl Pool {
                                 entry.ino
                             ))
                         })?;
-                        let ihl_reader =
-                            SegmentReader::open_delta(pool_root, shard_id, ihl_loc.segment_id)?;
-                        let (_h, ihl_bytes) = ihl_reader.read_record(*ihl_loc)?;
+                        let ihl_bytes = mount_read_delta(&vdevs, shard_id, *ihl_loc)?;
                         let ihl: IndirectHashList = lchfs_format::decode(&ihl_bytes)
                             .map_err(|e| PoolError::Format(e.to_string()))?;
                         // Place each chunk at its own `logical_offset`, for
@@ -1036,14 +1031,14 @@ impl Pool {
                                     chunk.content_hash, entry.ino
                                 ))
                             })?;
-                            let reader = get_reader(
+                            let bytes = mount_read(
                                 &mut readers,
-                                pool_root,
-                                PRIMARY_VDEV_ID,
-                                chunk_loc.segment_id,
+                                &vdevs,
+                                &persisted_index,
                                 StreamKind::Data,
+                                chunk.content_hash,
+                                *chunk_loc,
                             )?;
-                            let (_h, bytes) = reader.read_record(*chunk_loc)?;
                             let start = chunk.logical_offset as usize;
                             let end = (start + bytes.len()).min(contents.len());
                             if start < end {
@@ -3950,6 +3945,84 @@ pub(crate) fn get_reader<'a>(
         e.insert(SegmentReader::open(vdev_root, segment_id, kind)?);
     }
     Ok(readers.get(&key).unwrap())
+}
+
+/// A mount-time record read that survives a bad primary copy. The mount
+/// path resolves locations from the primary (its index or a scan of it),
+/// so it tries that first; when the primary's copy fails, every other
+/// online vdev is tried -- at the same location, since fan-out writes put
+/// the identical record at the identical offset (§15.3), and then at
+/// whatever the index says that device holds for the hash, which covers a
+/// replica that a heal or a repack has since moved. No heal happens here:
+/// the pool is not up yet, and scrub will find the bad copy on its own
+/// schedule. What matters is that a mirror with one rotten meta segment
+/// on vdev 0 still mounts.
+fn mount_read(
+    readers: &mut SegmentReaders,
+    vdevs: &[Vdev],
+    index: &RedbIndex,
+    kind: StreamKind,
+    hash: Hash32,
+    loc: ExtentLocation,
+) -> Result<Vec<u8>, PoolError> {
+    let primary = &vdevs[0];
+    let primary_err = match get_reader(readers, &primary.root, primary.id, loc.segment_id, kind)
+        .and_then(|r| r.read_record(loc).map_err(PoolError::from))
+    {
+        Ok((_, bytes)) => return Ok(bytes),
+        Err(e) => e,
+    };
+    for vdev in &vdevs[1..] {
+        let mut candidates = vec![loc];
+        if let Ok(replicas) = index.chunk_locations(hash) {
+            candidates.extend(
+                replicas
+                    .into_iter()
+                    .filter(|(v, l)| *v == vdev.id && *l != loc)
+                    .map(|(_, l)| l),
+            );
+        }
+        for candidate in candidates {
+            let read = get_reader(readers, &vdev.root, vdev.id, candidate.segment_id, kind)
+                .and_then(|r| r.read_record(candidate).map_err(PoolError::from));
+            if let Ok((_, bytes)) = read {
+                tracing::warn!(
+                    "mount: {kind:?} record {hash:?} unreadable on vdev {} ({primary_err}); served from vdev {}",
+                    primary.id,
+                    vdev.id
+                );
+                return Ok(bytes);
+            }
+        }
+    }
+    Err(primary_err)
+}
+
+/// `mount_read` for a shard's delta stream during replay. Delta segments
+/// fan out like every other stream and are never healed or repacked, so
+/// the same location on any other device is the only alternative there is.
+fn mount_read_delta(vdevs: &[Vdev], shard_id: u32, loc: ExtentLocation) -> Result<Vec<u8>, PoolError> {
+    let mut first_err = None;
+    for vdev in vdevs {
+        match SegmentReader::open_delta(&vdev.root, shard_id, loc.segment_id)
+            .map_err(PoolError::from)
+            .and_then(|r| r.read_record(loc).map_err(PoolError::from))
+        {
+            Ok((_, bytes)) => {
+                if first_err.is_some() {
+                    tracing::warn!(
+                        "mount: delta record for shard {shard_id} unreadable on vdev 0; served from vdev {}",
+                        vdev.id
+                    );
+                }
+                return Ok(bytes);
+            }
+            Err(e) => {
+                first_err.get_or_insert(e);
+            }
+        }
+    }
+    Err(first_err.expect("at least one vdev"))
 }
 
 /// The highest Data/Meta segment id present under `vdev_root`, without

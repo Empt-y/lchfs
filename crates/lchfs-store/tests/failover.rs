@@ -343,3 +343,65 @@ fn a_heal_segment_that_exists_on_one_vdev_survives_a_remount_and_new_writes() {
         .collect();
     assert_eq!(sizes_after, sizes_before, "a heal segment on vdev b was clobbered by a new writer");
 }
+
+/// Mounting reads the root, the InoMap, every InodeObject and directory
+/// from the primary. None of that used to fail over, so a mirror with one
+/// rotten meta segment on vdev 0 was unmountable while a perfect copy sat
+/// on vdev 1. Every meta segment on vdev 0 is destroyed here, not just
+/// corrupted, so nothing on the primary can be serving these reads.
+#[test]
+fn a_mirror_still_mounts_when_the_primary_has_lost_its_metadata() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let ino = write_and_checkpoint(a.path(), b.path());
+    {
+        // Some directory structure, so the walk touches DirectoryObjects.
+        let pool = Pool::open_replicated(&[a.path(), b.path()]).unwrap();
+        let d = pool.mkdir(1, "dir", 0o755).unwrap();
+        let f = pool.create_file(d, "inner", 0o644).unwrap();
+        pool.write(f, 0, b"inner content").unwrap();
+        pool.checkpoint().unwrap();
+    }
+    for f in segment_files(a.path(), "meta") {
+        std::fs::remove_file(f).unwrap();
+    }
+
+    let pool = Pool::open_replicated(&[a.path(), b.path()]).unwrap();
+    assert_eq!(read_all(&pool, ino), payload());
+    let d = pool.lookup(1, "dir").unwrap().expect("dir survives");
+    let f = pool.lookup(d, "inner").unwrap().expect("inner survives");
+    assert_eq!(pool.read(f, 0, 13).unwrap().as_ref(), b"inner content");
+
+    // And scrub puts the primary right again.
+    let reports = pool.scrub().unwrap();
+    assert!(reports[0].healed > 0, "{reports:?}");
+    assert!(reports[0].unrecoverable.is_empty(), "{reports:?}");
+}
+
+/// The same for content that only exists in a shard's delta log at mount
+/// time -- fsync'd but not yet checkpointed -- which replay reads from the
+/// delta stream rather than the index.
+#[test]
+fn delta_replay_at_mount_fails_over_too() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let data = payload();
+    let ino = {
+        let pool = Pool::create_replicated(&[a.path(), b.path()], small_params()).unwrap();
+        pool.checkpoint().unwrap();
+        let ino = pool.create_file(1, "fsynced", 0o644).unwrap();
+        pool.write(ino, 0, &data).unwrap();
+        pool.fsync(ino).unwrap();
+        // No checkpoint: the file lives in the delta log only. Dropping
+        // the pool without one is the crash this replay path exists for
+        // (Drop stops the timers; it does not checkpoint).
+        drop(pool);
+        ino
+    };
+    let delta_dir = a.path().join("segments/delta");
+    assert!(delta_dir.is_dir(), "test setup: expected a delta log on vdev a");
+    std::fs::remove_dir_all(&delta_dir).unwrap();
+
+    let pool = Pool::open_replicated(&[a.path(), b.path()]).unwrap();
+    assert_eq!(pool.read(ino, 0, data.len() as u32).unwrap(), data);
+}
