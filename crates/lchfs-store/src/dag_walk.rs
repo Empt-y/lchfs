@@ -18,7 +18,8 @@
 use crate::segment::SegmentReader;
 use crate::{PoolError, SegmentReaders, StreamKind, Vdev, get_reader};
 use lchfs_format::{ContentRef, ExtentKind, ExtentLocation, Hash32, InoMap, InodeObject, IndirectHashList, RootObject};
-use lchfs_index::{ChunkLocationCache, IndexStore, RedbIndex};
+use lchfs_index::{ChunkLocationCache, RedbIndex};
+use parking_lot::RwLock;
 use roaring::RoaringBitmap;
 use std::collections::{HashMap, HashSet};
 
@@ -47,29 +48,29 @@ impl LiveSet {
     }
 
     /// The live byte ranges on `vdev_id`, resolved through that device's
-    /// own index entries. A hash with no entry there is simply not on that
-    /// device (it missed the write, or has since been reclaimed) and
-    /// contributes nothing -- there are no bytes to keep. Costs one index
-    /// range read per live hash, which idle-cycle work can afford.
-    pub fn resolve_on(&self, vdev_id: u16, index: &RedbIndex) -> Result<HashMap<u64, RoaringBitmap>, PoolError> {
+    /// own index entries: one sequential pass over the index, a page at a
+    /// time, keeping the entries for `vdev_id` whose hash is live. A hash
+    /// with no entry there is simply not on that device (it missed the
+    /// write, or has since been reclaimed) and contributes nothing --
+    /// there are no bytes to keep.
+    pub fn resolve_on(&self, vdev_id: u16, index: &RwLock<RedbIndex>) -> Result<HashMap<u64, RoaringBitmap>, PoolError> {
         let mut out = HashMap::new();
-        for &hash in &self.hashes {
-            for (v, loc) in index.chunk_locations(hash)? {
-                if v == vdev_id {
-                    mark_location(loc, &mut out);
+        let mut after: Option<(Hash32, u16)> = None;
+        loop {
+            let page = index.read().chunk_locations_page(after, crate::INDEX_PAGE)?;
+            let Some(&(last_hash, last_vdev, _)) = page.last() else {
+                return Ok(out);
+            };
+            for (hash, v, loc) in &page {
+                if *v == vdev_id && self.hashes.contains(hash) {
+                    mark_location(*loc, &mut out);
                 }
             }
+            if page.len() < crate::INDEX_PAGE {
+                return Ok(out);
+            }
+            after = Some((last_hash, last_vdev));
         }
-        Ok(out)
-    }
-}
-
-/// The primary's per-segment view, which is what sweeping the primary
-/// consumes and what every pre-replication caller already expected.
-impl std::ops::Deref for LiveSet {
-    type Target = HashMap<u64, RoaringBitmap>;
-    fn deref(&self) -> &Self::Target {
-        &self.by_segment
     }
 }
 

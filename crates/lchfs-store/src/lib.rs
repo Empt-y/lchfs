@@ -253,6 +253,9 @@ type Replicas = Vec<(u16, ExtentLocation)>;
 /// `(vdev_id, stream, hash, new location)` -- what `heal_commit` takes.
 type PendingHeal = (u16, StreamKind, Hash32, ExtentLocation);
 
+/// Index entries read per page by a pass over the whole index.
+pub(crate) const INDEX_PAGE: usize = 8192;
+
 /// Heal appends per fsync during a resilver. One fsync per record would make
 /// resilvering a large device take as long as writing it record by record.
 const HEAL_BATCH: usize = 256;
@@ -801,24 +804,35 @@ impl Pool {
     /// Only the last slot can leave, because slots are `0..count` and a
     /// hole in the middle is a degraded pool, not a smaller one.
     pub fn detach_vdev(vdev_roots: &[&Path]) -> Result<u16, PoolError> {
-        let membership = check_membership(vdev_roots, false)?;
+        let membership = check_membership(vdev_roots, true)?;
         if membership.vdev_count < 2 {
             return Err(PoolError::InvalidArgument(
                 "a single-vdev pool has nothing to detach".into(),
             ));
         }
         let leaving = membership.vdev_count - 1;
+        // The leaving device may already be gone: dead, or erased by a
+        // detach that was interrupted before the survivors were rewritten.
+        // Either way the survivors are proven among themselves.
+        match membership.missing_vdevs.as_slice() {
+            [] => {}
+            [one] if *one == leaving => {}
+            missing => {
+                return Err(PoolError::InvalidArgument(format!(
+                    "pool is missing vdevs {missing:?}; only the last slot can be detached"
+                )));
+            }
+        }
         let leaving_root = membership
             .members
             .iter()
             .find(|(s, _)| s.vdev_id == leaving)
-            .map(|(_, r)| r.to_path_buf())
-            .expect("complete set contains its last slot");
+            .map(|(_, r)| r.to_path_buf());
 
         // Prove the survivors can stand alone, with the leaving device
-        // still a member and so still a source to heal from.
+        // still a member (if present) and so still a source to heal from.
         {
-            let pool = Self::open_replicated(vdev_roots)?;
+            let pool = Self::open_degraded(vdev_roots)?;
             for id in 0..leaving {
                 let report = pool.resilver(id)?;
                 if !report.unrecoverable.is_empty() {
@@ -840,12 +854,19 @@ impl Pool {
             pool.checkpoint()?;
         }
 
-        // Every survivor at once, under every lock, so no mount can slip
-        // in between one device saying N and the next saying N-1.
-        let membership = check_membership(vdev_roots, false)?;
+        // Under every lock, so no mount can slip in part-way. The order is
+        // for a crash at any point: the leaving device's ring goes first,
+        // after which the set reads as "last slot empty" whatever the
+        // survivors say -- the highest count wins, and the slot has no
+        // device -- and a rerun of this picks up here. Then each survivor
+        // is rewritten with the smaller count.
+        let membership = check_membership(vdev_roots, true)?;
         let mut locks = Vec::with_capacity(vdev_roots.len());
         for root in vdev_roots {
             locks.push(acquire_pool_lock(root)?);
+        }
+        if let Some(root) = &leaving_root {
+            std::fs::remove_file(backend::superblock_path(root))?;
         }
         for (slot, root) in &membership.members {
             if slot.vdev_id == leaving {
@@ -857,15 +878,12 @@ impl Pool {
             finalize_superblock_slot_checksum(&mut updated);
             write_superblock_slot(&backend, &updated)?;
         }
-        let index_file = index_path(vdev_roots[0]);
+        let index_file = index_path(membership.members[0].1);
         if index_file.exists()
             && let Ok(mut index) = RedbIndex::open(&index_file)
         {
             index.delete_vdev_locations(leaving)?;
         }
-        // The leaving device's ring is erased last: until here it still
-        // agreed with the survivors and a crash left a coherent set.
-        std::fs::remove_file(backend::superblock_path(&leaving_root))?;
         Ok(leaving)
     }
 
@@ -932,7 +950,7 @@ impl Pool {
                         locations.entry(hash).or_insert(loc);
                     }
                 }
-                let index = rebuild_index(&index_file, &locations, &vdevs, slot.generation)?;
+                let index = rebuild_index(&index_file, &vdevs, slot.generation)?;
                 // The slow path's full scan already covers every segment
                 // unconditionally, so it has no analog of the fast path's
                 // "index might be missing recent, un-checkpointed
@@ -2271,13 +2289,13 @@ impl PoolShared {
         self.vdev_root(vdev_id)?;
         let mut report = ResilverReport::default();
         let mut pending: Vec<PendingHeal> = Vec::new();
-        for (hash, replicas) in self.replica_groups()? {
+        self.for_each_replica_group(|hash, replicas| {
             report.examined += 1;
             if replicas.iter().any(|(v, _)| *v == vdev_id) {
-                continue;
+                return Ok(());
             }
             report.missing += 1;
-            if !self.heal_from_any_replica(hash, vdev_id, &replicas, &mut pending)? {
+            if !self.heal_from_any_replica(hash, vdev_id, replicas, &mut pending)? {
                 report.unrecoverable.push(hash);
             }
             if pending.len() >= HEAL_BATCH {
@@ -2285,7 +2303,8 @@ impl PoolShared {
                 report.healed += pending.len() as u64;
                 pending.clear();
             }
-        }
+            Ok(())
+        })?;
         self.heal_commit(&pending)?;
         report.healed += pending.len() as u64;
         self.seal_heal_writers()?;
@@ -2302,7 +2321,6 @@ impl PoolShared {
     /// On a single-vdev pool it still verifies and reports; it just has
     /// nowhere to heal from.
     fn scrub(&self) -> Result<Vec<ScrubReport>, PoolError> {
-        let groups = self.replica_groups()?;
         let online = self.vdevs.online();
         let mut reports = Vec::with_capacity(online.len());
         for vdev in &online {
@@ -2311,27 +2329,28 @@ impl PoolShared {
                 ..Default::default()
             };
             let mut pending: Vec<PendingHeal> = Vec::new();
-            for (hash, replicas) in &groups {
+            self.for_each_replica_group(|hash, replicas| {
                 let Some(&(_, own)) = replicas.iter().find(|(v, _)| *v == vdev.id) else {
-                    continue;
+                    return Ok(());
                 };
                 report.verified += 1;
                 let ok = self
                     .stream_kind_of(vdev.id, own.segment_id)
                     .is_some_and(|kind| self.read_raw_from_vdev(vdev.id, own, kind).is_ok());
                 if ok {
-                    continue;
+                    return Ok(());
                 }
                 report.corrupt += 1;
-                if !self.heal_from_any_replica(*hash, vdev.id, replicas, &mut pending)? {
-                    report.unrecoverable.push(*hash);
+                if !self.heal_from_any_replica(hash, vdev.id, replicas, &mut pending)? {
+                    report.unrecoverable.push(hash);
                 }
                 if pending.len() >= HEAL_BATCH {
                     self.heal_commit(&pending)?;
                     report.healed += pending.len() as u64;
                     pending.clear();
                 }
-            }
+                Ok(())
+            })?;
             self.heal_commit(&pending)?;
             report.healed += pending.len() as u64;
             reports.push(report);
@@ -2340,20 +2359,49 @@ impl PoolShared {
         Ok(reports)
     }
 
-    /// Every hash in the index with its replicas, hash-major. One snapshot
-    /// for a whole repair pass; `heal_from_any_replica` re-queries a hash
-    /// live before giving up on it, so a coalesce that moved a replica
-    /// mid-pass does not get it reported as lost.
-    fn replica_groups(&self) -> Result<Vec<(Hash32, Replicas)>, PoolError> {
-        let all = self.persisted_index.read().iter_all_chunk_locations()?;
-        let mut groups: Vec<(Hash32, Replicas)> = Vec::new();
-        for (hash, vdev_id, loc) in all {
-            match groups.last_mut() {
-                Some((h, replicas)) if *h == hash => replicas.push((vdev_id, loc)),
-                _ => groups.push((hash, vec![(vdev_id, loc)])),
+    /// Calls `f` once per hash in the index with that hash's replicas,
+    /// hash-major, reading the index a page at a time so the lock is held
+    /// per page and the pass costs a page of memory rather than the pool.
+    /// A hash's replicas are contiguous in key order, so a page is cut at
+    /// the last *complete* group and the next page resumes after it.
+    /// `heal_from_any_replica` re-queries a hash live before giving up on
+    /// it, so a coalesce that moved a replica between pages is not
+    /// reported as loss.
+    fn for_each_replica_group(
+        &self,
+        mut f: impl FnMut(Hash32, &Replicas) -> Result<(), PoolError>,
+    ) -> Result<(), PoolError> {
+        let mut after: Option<(Hash32, u16)> = None;
+        loop {
+            let page = self.persisted_index.read().chunk_locations_page(after, INDEX_PAGE)?;
+            let last_page = page.len() < INDEX_PAGE;
+            let mut groups: Vec<(Hash32, Replicas)> = Vec::new();
+            for (hash, vdev_id, loc) in page {
+                match groups.last_mut() {
+                    Some((h, replicas)) if *h == hash => replicas.push((vdev_id, loc)),
+                    _ => groups.push((hash, vec![(vdev_id, loc)])),
+                }
             }
+            if groups.is_empty() {
+                return Ok(());
+            }
+            // The last group may continue on the next page; unless this is
+            // the final page, hold it back and resume from just before it.
+            let carry = if last_page { None } else { groups.pop() };
+            for (hash, replicas) in &groups {
+                f(*hash, replicas)?;
+            }
+            after = match (&carry, groups.last()) {
+                (Some((h, _)), _) => {
+                    // Resume from the end of the last complete group: every
+                    // key of `h`'s group sorts after it.
+                    let (prev_hash, prev) = groups.last().expect("carry implies a complete group before it");
+                    let _ = h;
+                    Some((*prev_hash, prev.last().expect("non-empty group").0))
+                }
+                (None, _) => return Ok(()),
+            };
         }
-        Ok(groups)
     }
 
     /// Appends `hash` onto `target` from the first replica elsewhere that
@@ -2575,9 +2623,11 @@ impl PoolShared {
     /// 4. The device stops catching up and a checkpoint publishes every
     ///    member's superblock with the new slot count.
     ///
-    /// A crash before step 4 leaves the device with no superblock and the
-    /// pool with its old count: the attach did not happen, and the
-    /// segments on the device are orphans a rerun overwrites.
+    /// A crash before step 4 leaves the device with no superblock. The
+    /// members may already say the new count -- it is published by any
+    /// checkpoint from step 1 on -- so the pool reads as one slot short,
+    /// exactly like an interrupted offline attach, and mounts degraded or
+    /// finishes with a rerun of either attach, which fills the slot.
     fn attach_vdev_live(&self, new_root: &Path) -> Result<(u16, ResilverReport), PoolError> {
         let _one_at_a_time = self.attach_lock.lock();
         let new_id = match self.vdevs.missing().as_slice() {
@@ -4326,12 +4376,7 @@ fn scan_segments(
 /// generation is stale -- old entries are harmless leftovers, since
 /// content-addressed extents are immutable), starts fresh only if it's
 /// missing or corrupt.
-fn rebuild_index(
-    index_file: &Path,
-    primary_locations: &HashMap<Hash32, ExtentLocation>,
-    vdevs: &[Vdev],
-    generation: u64,
-) -> Result<RedbIndex, PoolError> {
+fn rebuild_index(index_file: &Path, vdevs: &[Vdev], generation: u64) -> Result<RedbIndex, PoolError> {
     let mut index = match RedbIndex::open(index_file) {
         Ok(idx) => idx,
         Err(_) => {
@@ -4341,10 +4386,9 @@ fn rebuild_index(
     };
     // Every device gets its own scan, because its copies sit at its own
     // offsets and an index that knew only the primary's would leave read
-    // failover with nothing to fail over to (§15.1). `primary_locations`
-    // is a merged map the mount path also uses, so it is not trusted as
-    // any one device's view here.
-    let _ = primary_locations;
+    // failover with nothing to fail over to (§15.1). The primary is
+    // scanned again here rather than reusing the mount's merged map, which
+    // by then holds other devices' locations too.
     for vdev in vdevs {
         let (readers, _) = open_all_segment_readers(&vdev.root, vdev.id)?;
         let mut locations = HashMap::new();
@@ -4468,7 +4512,6 @@ fn check_membership<'a>(given_roots: &[&'a Path], allow_missing: bool) -> Result
     }
 
     let expected_uuid = members[0].0.pool_uuid;
-    let vdev_count = members[0].0.vdev_count;
     for (s, root) in &members {
         if s.pool_uuid != expected_uuid {
             return Err(PoolError::Format(format!(
@@ -4476,14 +4519,23 @@ fn check_membership<'a>(given_roots: &[&'a Path], allow_missing: bool) -> Result
                 root.display()
             )));
         }
+    }
+    // Members can disagree on the count: a device that missed an attach
+    // still says the old one, and an attach or detach interrupted between
+    // rewriting one ring and the next leaves both numbers on disk. The
+    // highest wins. A device that was away for a grow is merely stale; an
+    // interrupted grow reads as its new slot being empty; an interrupted
+    // shrink reads as the old last slot being empty. All three are
+    // degraded-mountable and finished by rerunning the operation, and the
+    // next checkpoint writes every ring with the same number again.
+    let vdev_count = members.iter().map(|(s, _)| s.vdev_count).max().unwrap_or(0);
+    for (s, root) in &members {
         if s.vdev_count != vdev_count {
-            return Err(PoolError::Format(format!(
-                "{} says the pool has {} vdevs but {} says {}",
+            tracing::warn!(
+                "{} says the pool has {} vdevs, others say {vdev_count}; taking the higher",
                 root.display(),
-                s.vdev_count,
-                members[0].1.display(),
-                vdev_count
-            )));
+                s.vdev_count
+            );
         }
     }
     if !allow_missing {

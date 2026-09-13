@@ -83,7 +83,7 @@ fn live_bytes(pool_root: &std::path::Path, root: lchfs_format::Hash32) -> u64 {
         Arc::new(cache),
         Arc::new(PendingDedupPins::new()),
     );
-    gc.mark(&[root]).values().map(|bitmap| bitmap.len()).sum()
+    gc.mark(&[root]).by_segment.values().map(|bitmap| bitmap.len()).sum()
 }
 
 #[test]

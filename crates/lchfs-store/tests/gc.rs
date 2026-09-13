@@ -65,7 +65,7 @@ fn mark_covers_root_inomap_and_chunks() {
     // DirectoryObject/IndirectHashList/SnapshotTable) and the data
     // segment (the chunk itself) must both have live bytes.
     assert!(!live.is_empty());
-    let total_live: u64 = live.values().map(|b| b.len()).sum();
+    let total_live: u64 = live.by_segment.values().map(|b| b.len()).sum();
     assert!(total_live > 0);
 }
 
@@ -115,10 +115,10 @@ fn shared_chunk_survives_when_only_one_referencing_root_is_live() {
     // root keeps its content live without disturbing the current one"
     // means in practice.
     let live_gen2_only = gc.mark(&[root_gen2]);
-    let bytes_gen2_only: u64 = live_gen2_only.values().map(|b| b.len()).sum();
+    let bytes_gen2_only: u64 = live_gen2_only.by_segment.values().map(|b| b.len()).sum();
 
     let live_both = gc.mark(&[root_gen1, root_gen2]);
-    let bytes_both: u64 = live_both.values().map(|b| b.len()).sum();
+    let bytes_both: u64 = live_both.by_segment.values().map(|b| b.len()).sum();
 
     assert!(
         bytes_both > bytes_gen2_only,
@@ -129,7 +129,7 @@ fn shared_chunk_survives_when_only_one_referencing_root_is_live() {
     // The shared chunk itself must be live in *both* cases -- it's still
     // referenced by B regardless of which generation's root is considered.
     for (seg, live_set) in &live_gen2_only.by_segment {
-        assert!(live_both.get(seg).unwrap().len() >= live_set.len());
+        assert!(live_both.by_segment.get(seg).unwrap().len() >= live_set.len());
     }
 }
 
@@ -143,7 +143,7 @@ fn snapshot_table_record_is_always_live() {
 
     let mut gc = GcEngine::new(dir.path().to_path_buf(), load_locations(dir.path()), no_pins());
     let live_from_root = gc.mark(&[root]);
-    let total: u64 = live_from_root.values().map(|b| b.len()).sum();
+    let total: u64 = live_from_root.by_segment.values().map(|b| b.len()).sum();
     // Even an empty pool's checkpoint writes RootObject + InoMap +
     // root InodeObject + root DirectoryObject + SnapshotTable -- all
     // meta-stream records, all must be marked live from the root alone.
@@ -198,7 +198,7 @@ fn sweep_candidates_flags_low_liveness_segment_but_not_a_fresh_pool() {
     let locations = load_locations(dir.path());
     let mut gc = GcEngine::new(dir.path().to_path_buf(), Arc::clone(&locations), no_pins());
     let live = gc.mark(&[root]);
-    let candidates = gc.sweep_candidates(&live);
+    let candidates = gc.sweep_candidates(&live.by_segment);
     assert!(
         !candidates.is_empty(),
         "overwriting 9/10 files' worth of content into now-sealed segments must produce at least one low-liveness candidate"
@@ -213,7 +213,7 @@ fn sweep_candidates_flags_low_liveness_segment_but_not_a_fresh_pool() {
     drop(pool2);
     let mut gc2 = GcEngine::new(dir2.path().to_path_buf(), load_locations(dir2.path()), no_pins());
     let live2 = gc2.mark(&[root2]);
-    let candidates2 = gc2.sweep_candidates(&live2);
+    let candidates2 = gc2.sweep_candidates(&live2.by_segment);
     assert!(candidates2.is_empty(), "a fresh pool with no overwrites should have no sweep candidates");
 }
 
@@ -252,7 +252,7 @@ fn grace_window_protects_most_recently_sealed_segments() {
     let locations = load_locations(dir.path());
     let mut gc = GcEngine::new(dir.path().to_path_buf(), locations, no_pins());
     let live = gc.mark(&[root]);
-    let candidates = gc.sweep_candidates(&live);
+    let candidates = gc.sweep_candidates(&live.by_segment);
 
     // Enumerate every *sealed* data segment directly (bypassing
     // sweep_candidates) to know what the full universe of low-liveness

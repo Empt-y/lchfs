@@ -207,6 +207,35 @@ impl RedbIndex {
         Ok(out)
     }
 
+    /// A page of `(hash, vdev_id, location)` entries in key order, starting
+    /// strictly after `after` (or from the beginning), at most `limit` long.
+    /// What a pass over the whole index uses instead of
+    /// `iter_all_chunk_locations`: a page at a time, so the index lock is
+    /// held for a page and the pass costs a page of memory, not the pool.
+    pub fn chunk_locations_page(
+        &self,
+        after: Option<(Hash32, u16)>,
+        limit: usize,
+    ) -> Result<Vec<(Hash32, u16, ExtentLocation)>, IndexError> {
+        let txn = self.db.begin_read().map_err(err)?;
+        let table = txn.open_table(CHUNK_LOCATIONS).map_err(err)?;
+        let mut out = Vec::with_capacity(limit);
+        let start = after.map(|(hash, vdev_id)| encode_chunk_key(hash, vdev_id));
+        let lower = match &start {
+            Some(key) => std::ops::Bound::Excluded(key.as_slice()),
+            None => std::ops::Bound::Unbounded,
+        };
+        let range = table
+            .range::<&[u8]>((lower, std::ops::Bound::Unbounded))
+            .map_err(err)?;
+        for entry in range.take(limit) {
+            let (k, v) = entry.map_err(err)?;
+            let (hash, vdev_id) = decode_chunk_key(k.value())?;
+            out.push((hash, vdev_id, decode_location(v.value())?));
+        }
+        Ok(out)
+    }
+
     /// Forgets every entry for one vdev, returning how many there were.
     /// What replacing a device needs: the slot's old entries describe
     /// copies on hardware that is gone, and a resilver that trusted them

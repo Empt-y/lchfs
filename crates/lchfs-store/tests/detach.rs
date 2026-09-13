@@ -163,3 +163,38 @@ fn a_pool_can_grow_and_shrink_repeatedly() {
     assert_eq!(read_file(&pool, "one", one.len()), one);
     assert_eq!(read_file(&pool, "two", two.len()), two);
 }
+
+/// A detach interrupted after the leaving device's ring was erased but
+/// before every survivor was rewritten leaves survivors disagreeing on
+/// the count. That must still mount degraded, and a rerun must finish.
+#[test]
+fn a_detach_interrupted_between_survivors_is_recoverable() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let c = tempfile::tempdir().unwrap();
+    let data = payload(41);
+    {
+        let pool = Pool::create_replicated(&[a.path(), b.path(), c.path()], small_params()).unwrap();
+        let ino = pool.create_file(1, "f", 0o644).unwrap();
+        pool.write(ino, 0, &data).unwrap();
+        pool.checkpoint().unwrap();
+    }
+    // Simulate the crash: c's ring gone, a rewritten to 2, b still says 3.
+    let b_ring = std::fs::read(b.path().join("SUPERBLOCK")).unwrap();
+    Pool::detach_vdev(&[a.path(), b.path(), c.path()]).unwrap();
+    std::fs::write(b.path().join("SUPERBLOCK"), &b_ring).unwrap();
+
+    // Highest count wins: the pool is 3 wide with slot 2 empty.
+    let err = Pool::open_replicated(&[a.path(), b.path()]).unwrap_err().to_string();
+    assert!(err.contains("3 vdevs but 2 were given"), "{err}");
+    {
+        let pool = Pool::open_degraded(&[a.path(), b.path()]).unwrap();
+        assert_eq!(pool.missing_vdevs(), vec![2]);
+        assert_eq!(read_file(&pool, "f", data.len()), data);
+    }
+    // And the rerun, with the leaver already gone, finishes the shrink.
+    assert_eq!(Pool::detach_vdev(&[a.path(), b.path()]).unwrap(), 2);
+    let pool = Pool::open_replicated(&[a.path(), b.path()]).unwrap();
+    assert!(!pool.is_degraded());
+    assert_eq!(read_file(&pool, "f", data.len()), data);
+}

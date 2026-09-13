@@ -98,7 +98,7 @@ fn unlinked_content_becomes_gc_reclaimable() {
             std::sync::Arc::new(cache),
             std::sync::Arc::new(lchfs_index::PendingDedupPins::new()),
         );
-        gc.mark(&[empty_root]).values().map(|b| b.len()).sum()
+        gc.mark(&[empty_root]).by_segment.values().map(|b| b.len()).sum()
     };
 
     let dir = tempfile::tempdir().unwrap();
@@ -122,7 +122,7 @@ fn unlinked_content_becomes_gc_reclaimable() {
         std::sync::Arc::new(lchfs_index::PendingDedupPins::new()),
     );
     let live = gc.mark(&[root]);
-    let total_live: u64 = live.values().map(|b| b.len()).sum();
+    let total_live: u64 = live.by_segment.values().map(|b| b.len()).sum();
 
     // Some growth over the empty-pool baseline is expected (this pool did
     // have a file created, even though it's now unlinked -- e.g. its

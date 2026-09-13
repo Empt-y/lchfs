@@ -371,3 +371,36 @@ fn opening_a_wrong_path_leaves_nothing_behind() {
     assert!(Pool::open(&empty).is_err());
     assert!(!empty.join("SUPERBLOCK").exists(), "open created a superblock ring in an empty dir");
 }
+
+/// An attach interrupted after some members were rewritten with the new
+/// count and others not: highest wins, the new slot reads as empty, and
+/// the pool is degraded-mountable until a rerun fills it.
+#[test]
+fn an_attach_interrupted_between_members_is_recoverable() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let c = tempfile::tempdir().unwrap();
+    let data = payload(42);
+    {
+        let pool = Pool::create_replicated(&[a.path(), b.path()], small_params()).unwrap();
+        let ino = pool.create_file(1, "f", 0o644).unwrap();
+        pool.write(ino, 0, &data).unwrap();
+        pool.checkpoint().unwrap();
+    }
+    let b_ring = std::fs::read(b.path().join("SUPERBLOCK")).unwrap();
+    Pool::attach_vdev(&[a.path(), b.path()], c.path()).unwrap();
+    // "Crash": b never got the new count, and c never got its ring.
+    std::fs::write(b.path().join("SUPERBLOCK"), &b_ring).unwrap();
+    std::fs::remove_dir_all(c.path()).unwrap();
+
+    {
+        let pool = Pool::open_degraded(&[a.path(), b.path()]).unwrap();
+        assert_eq!(pool.missing_vdevs(), vec![2]);
+        assert_eq!(read_file(&pool, "f", data.len()), data);
+        pool.checkpoint().unwrap();
+    }
+    assert_eq!(Pool::attach_vdev(&[a.path(), b.path()], c.path()).unwrap(), 2);
+    let pool = Pool::open_replicated(&[a.path(), b.path(), c.path()]).unwrap();
+    assert_eq!(pool.mount_resilver().len(), 1);
+    assert_eq!(read_file(&pool, "f", data.len()), data);
+}

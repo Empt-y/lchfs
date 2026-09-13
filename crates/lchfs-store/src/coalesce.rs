@@ -102,7 +102,7 @@ impl CoalesceDaemon {
             let bitmaps = if vdev.id == self.primary_id() {
                 live.by_segment.clone()
             } else {
-                live.resolve_on(vdev.id, &persisted_index.read()).map_err(to_io_err)?
+                live.resolve_on(vdev.id, persisted_index).map_err(to_io_err)?
             };
             for segment_id in self.gc.sweep_candidates_on(&vdev.root, &bitmaps) {
                 self.repack_segment(

@@ -46,7 +46,7 @@ fn mark_bytes(pool_root: &std::path::Path, roots: &[Hash32]) -> u64 {
         load_locations(pool_root),
         Arc::new(PendingDedupPins::new()),
     );
-    gc.mark(roots).values().map(|b| b.len()).sum()
+    gc.mark(roots).by_segment.values().map(|b| b.len()).sum()
 }
 
 /// Writes 10 distinct-content files, checkpoints, snapshots that state,

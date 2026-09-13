@@ -122,6 +122,7 @@ fn loser_becomes_reclaimable_by_gc_after_convergence() {
     let live = gc.mark(&[root]);
 
     let loser_marked_live = live
+        .by_segment
         .get(&loser_loc.segment_id)
         .map(|bitmap| bitmap.contains(loser_loc.offset))
         .unwrap_or(false);

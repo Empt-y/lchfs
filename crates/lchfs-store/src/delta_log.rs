@@ -289,6 +289,10 @@ impl ShardDeltaLog {
 
         for segment_id in segment_ids {
             let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            // Offsets whose framing parsed somewhere but whose entry never
+            // read back on any device: a silent drop here is an fsync'd
+            // update quietly lost, so at least say so.
+            let mut unreadable: std::collections::HashSet<u32> = std::collections::HashSet::new();
             for root in &self.vdev_roots {
                 let Ok(reader) = SegmentReader::open_delta(root, self.shard_id, segment_id) else {
                     continue;
@@ -306,6 +310,9 @@ impl ShardDeltaLog {
                             {
                                 entries.push(entry);
                                 seen.insert(offset);
+                                unreadable.remove(&offset);
+                            } else {
+                                unreadable.insert(offset);
                             }
                         } else {
                             // Content is verified when it is actually read,
@@ -316,6 +323,12 @@ impl ShardDeltaLog {
                         }
                     }
                 }
+            }
+            for offset in unreadable {
+                tracing::error!(
+                    "shard {} delta segment {segment_id} offset {offset}: entry unreadable on every device; an fsync'd update may be lost",
+                    self.shard_id
+                );
             }
         }
 
