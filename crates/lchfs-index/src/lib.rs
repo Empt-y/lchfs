@@ -432,6 +432,15 @@ impl ChunkLocationCache {
         }
     }
 
+    /// Drops every entry -- what a promotion does before warming the cache
+    /// from the new primary's index, since the old entries were the old
+    /// primary's offsets.
+    pub fn clear(&self) {
+        for bucket in &self.buckets {
+            bucket.write().expect("ChunkLocationCache lock poisoned").clear();
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.buckets
             .iter()

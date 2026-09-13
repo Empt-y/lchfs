@@ -232,16 +232,15 @@ const DEDUP_INTERVAL: Duration = Duration::from_secs(30);
 /// background pass by far; once a day is the conventional cadence and
 /// tests call `Pool::scrub` directly rather than waiting on it.
 const SCRUB_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+/// How often the failover task looks for a faulted primary. A fault is
+/// reported from inside a writer, under that writer's lock, where a
+/// rebuild cannot run; this task is where it runs instead. Writes fail
+/// for at most this long after the primary dies before the index moves.
+const FAILOVER_INTERVAL: Duration = Duration::from_secs(1);
 
 fn index_path(pool_root: &Path) -> PathBuf {
     pool_root.join("INDEX.redb")
 }
-
-/// The slot a brand-new pool's first device gets, and the primary of any
-/// mount that has it. See `PoolShared::primary_id` for what "primary"
-/// means at runtime -- it is the lowest *online* vdev, which is this one
-/// whenever vdev 0 is present.
-pub(crate) const PRIMARY_VDEV_ID: u16 = 0;
 
 /// Open readers keyed by `(vdev_id, segment_id, stream)`. A segment_id is
 /// pool-global (§15.4), but after a heal the same id can exist on one vdev
@@ -328,6 +327,7 @@ struct RepairStats {
     failovers: AtomicU64,
     heals: AtomicU64,
     heal_failures: AtomicU64,
+    promotions: AtomicU64,
 }
 
 impl RepairStats {
@@ -336,6 +336,7 @@ impl RepairStats {
             failovers: self.failovers.load(Ordering::Relaxed),
             heals: self.heals.load(Ordering::Relaxed),
             heal_failures: self.heal_failures.load(Ordering::Relaxed),
+            promotions: self.promotions.load(Ordering::Relaxed),
         }
     }
 }
@@ -349,6 +350,8 @@ pub struct RepairStatsSnapshot {
     pub heals: u64,
     /// Heals that themselves failed (the read still succeeded).
     pub heal_failures: u64,
+    /// Times a faulted primary was replaced by promoting another device.
+    pub promotions: u64,
 }
 
 fn committer_thread_count() -> usize {
@@ -450,16 +453,6 @@ struct PoolShared {
     /// the pool would stop matching its own vdevs.
     pool_uuid: [u8; 16],
     vdev_id: u16,
-    /// The vdev whose copy of everything is read by default: the lowest
-    /// online slot at mount, `vdevs.online()[0].id`. It holds the pool's
-    /// `INDEX.redb` (ARCHITECTURE.md §15.10), `ChunkLocationCache`'s
-    /// entries are *its* locations, and GC mark and the coalesce/dedup
-    /// daemons read from it. Read failover (§15.2) consults the others
-    /// only when it fails. Vdev 0 whenever vdev 0 is present; when a mount
-    /// runs without it (§15.8), the next device up takes the role,
-    /// rebuilding an index of its own. Fixed for the mount's lifetime,
-    /// even if a lower slot is attached live.
-    primary_id: u16,
     /// The online device set (ARCHITECTURE.md §15.10), shared with every
     /// fan-out writer so a device attached live reaches them. Also holds
     /// each member's superblock ring and root lock, and knows the pool's
@@ -535,6 +528,7 @@ struct PoolShared {
     coalesce_task: Mutex<Option<background::PeriodicTask>>,
     dedup_task: Mutex<Option<background::PeriodicTask>>,
     scrub_task: Mutex<Option<background::PeriodicTask>>,
+    failover_task: Mutex<Option<background::PeriodicTask>>,
 }
 
 impl Pool {
@@ -657,9 +651,6 @@ impl Pool {
             root_hash: Hash32([0; 32]),
         };
 
-        // Every online device gets swept and scanned (§15.7); the daemons
-        // read the live set at the start of each pass.
-        let primary_vdev = vdevs[0].clone();
         let shared = Arc::new(PoolShared {
             pool_root: pool_root.to_path_buf(),
             pool_params: params,
@@ -668,7 +659,6 @@ impl Pool {
             // created across several devices (ARCHITECTURE.md §15.6).
             pool_uuid: lchfs_format::generate_pool_uuid()?,
             vdev_id: 0,
-            primary_id: PRIMARY_VDEV_ID,
             vdevs: Arc::clone(&vdev_set),
             mount_resilver: Vec::new(),
             attach_lock: Mutex::new(()),
@@ -692,19 +682,18 @@ impl Pool {
             checkpoint_lock: Mutex::new(()),
             coalesce: Mutex::new(coalesce::CoalesceDaemon::new_on(
                 Arc::clone(&vdev_set),
-                primary_vdev.clone(),
                 Arc::clone(&dedup_index),
                 Arc::clone(&dedup_pins),
             )),
             dedup: Mutex::new(dedup::DedupScanner::new_on(
                 Arc::clone(&vdev_set),
-                primary_vdev.id,
                 Arc::clone(&dedup_index),
             )),
             checkpoint_task: Mutex::new(None),
             coalesce_task: Mutex::new(None),
             dedup_task: Mutex::new(None),
             scrub_task: Mutex::new(None),
+            failover_task: Mutex::new(None),
         });
 
         shared.run_checkpoint()?;
@@ -1383,9 +1372,6 @@ impl Pool {
                 Ok(())
             }));
         }
-        // Every online device gets swept and scanned (§15.7); the daemons
-        // read the live set at the start of each pass.
-        let primary_vdev = vdevs[0].clone();
         let shared = Arc::new(PoolShared {
             pool_root: pool_root.to_path_buf(),
             pool_params: root.pool_params,
@@ -1393,7 +1379,6 @@ impl Pool {
             // would make the pool stop matching its own vdevs.
             pool_uuid: slot.pool_uuid,
             vdev_id: slot.vdev_id,
-            primary_id,
             vdevs: Arc::clone(&vdev_set),
             mount_resilver: Vec::new(),
             attach_lock: Mutex::new(()),
@@ -1417,19 +1402,18 @@ impl Pool {
             checkpoint_lock: Mutex::new(()),
             coalesce: Mutex::new(coalesce::CoalesceDaemon::new_on(
                 Arc::clone(&vdev_set),
-                primary_vdev.clone(),
                 Arc::clone(&dedup_index),
                 Arc::clone(&dedup_pins),
             )),
             dedup: Mutex::new(dedup::DedupScanner::new_on(
                 Arc::clone(&vdev_set),
-                primary_vdev.id,
                 Arc::clone(&dedup_index),
             )),
             checkpoint_task: Mutex::new(None),
             coalesce_task: Mutex::new(None),
             dedup_task: Mutex::new(None),
             scrub_task: Mutex::new(None),
+            failover_task: Mutex::new(None),
         });
 
         // A device that trailed the primary's generation missed writes
@@ -1517,7 +1501,7 @@ impl Pool {
     /// it back. The primary cannot be taken offline: its index is the
     /// mount's.
     pub fn offline_vdev(&self, id: u16) -> Result<(), PoolError> {
-        if id == self.0.primary_id {
+        if id == self.0.primary() {
             return Err(PoolError::InvalidArgument(format!(
                 "vdev {id} is this mount's primary and holds its index; remount with another primary instead"
             )));
@@ -1536,12 +1520,26 @@ impl Pool {
     }
 
     /// The slot serving as this mount's primary (ARCHITECTURE.md §15.10).
-    /// If it faults, the index it holds is unreachable and the pool must
-    /// be remounted with another device as primary; `vdev_status` shows
-    /// it as faulted like any other, and this is how a caller knows the
-    /// difference.
+    /// If it faults, the index it holds is unusable; the failover task
+    /// promotes the lowest online device within a second, rebuilding the
+    /// index onto it, and this changes to say so. `promote_primary` is
+    /// the same thing on demand.
     pub fn primary_vdev(&self) -> u16 {
-        self.0.primary_id
+        self.0.primary()
+    }
+
+    /// Whether the primary has faulted and no promotion has happened yet
+    /// -- the window in which writes fail because the index is on a dead
+    /// device.
+    pub fn primary_faulted(&self) -> bool {
+        self.0.vdevs.primary_faulted()
+    }
+
+    /// Makes the lowest online device the primary, rebuilding the index
+    /// onto it from every online device. Refused unless the current
+    /// primary has faulted: promotion is failover, not a preference.
+    pub fn promote_primary(&self) -> Result<u16, PoolError> {
+        self.0.promote_primary()
     }
 
     /// Adds a blank device while mounted (ARCHITECTURE.md §15.10), into a
@@ -1849,6 +1847,7 @@ impl Drop for Pool {
         self.0.coalesce_task.lock().take();
         self.0.dedup_task.lock().take();
         self.0.scrub_task.lock().take();
+        self.0.failover_task.lock().take();
     }
 }
 
@@ -1899,6 +1898,17 @@ impl PoolShared {
             }
         });
         *self.scrub_task.lock() = Some(scrub_task);
+
+        let failover_shared = Arc::clone(self);
+        let failover_task =
+            background::PeriodicTask::spawn("lchfs-failover", FAILOVER_INTERVAL, move || {
+                if failover_shared.vdevs.primary_faulted()
+                    && let Err(e) = failover_shared.promote_primary()
+                {
+                    tracing::error!("failover: could not promote a new primary: {e}");
+                }
+            });
+        *self.failover_task.lock() = Some(failover_task);
     }
 
     /// One idle-cycle GC-mark-and-coalesce pass (ARCHITECTURE.md §6):
@@ -2307,12 +2317,13 @@ impl PoolShared {
             .get(hash)
             .ok_or_else(|| PoolError::Format(format!("{what} {hash:?} not found")))?;
 
+        let primary = self.primary();
         let primary_err = {
             let mut readers = self.readers.lock();
-            let reader = get_reader(
+            let reader = get_reader_lazy(
                 &mut readers,
-                &self.pool_root,
-                self.primary_id,
+                || self.vdev_root(primary),
+                primary,
                 preferred.segment_id,
                 kind,
             );
@@ -2336,19 +2347,19 @@ impl PoolShared {
             healed,
         };
         if self.vdevs.len() == 1 {
-            self.record_corruption(event(self.primary_id, Some(preferred), primary_err.to_string(), false));
+            self.record_corruption(event(self.primary(), Some(preferred), primary_err.to_string(), false));
             return Err(primary_err);
         }
         tracing::warn!(
             "{what} {hash:?} unreadable on vdev {} ({primary_err}); trying other replicas",
-            self.primary_id
+            self.primary()
         );
 
         let replicas = self.persisted_index.read().chunk_locations(hash)?;
         let mut failed: Vec<(u16, Option<ExtentLocation>, String)> =
-            vec![(self.primary_id, Some(preferred), primary_err.to_string())];
+            vec![(self.primary(), Some(preferred), primary_err.to_string())];
         for (vdev_id, loc) in replicas {
-            if vdev_id == self.primary_id || !self.is_online(vdev_id) {
+            if vdev_id == self.primary() || !self.is_online(vdev_id) {
                 continue;
             }
             match self.read_raw_from_vdev(vdev_id, loc, kind) {
@@ -2400,6 +2411,11 @@ impl PoolShared {
 
     fn is_online(&self, vdev_id: u16) -> bool {
         self.vdevs.is_online(vdev_id)
+    }
+
+    /// The current primary's slot; see `VdevSet::primary`.
+    fn primary(&self) -> u16 {
+        self.vdevs.primary()
     }
 
     fn vdev_root(&self, vdev_id: u16) -> Result<PathBuf, PoolError> {
@@ -2505,7 +2521,7 @@ impl PoolShared {
             index.flush()?;
         }
         for &(vdev_id, _, hash, loc) in healed {
-            if vdev_id == self.primary_id {
+            if vdev_id == self.primary() {
                 self.dedup_index.put(hash, loc);
             }
         }
@@ -2532,6 +2548,55 @@ impl PoolShared {
             log.pop_front();
         }
         log.push_back(event);
+    }
+
+    /// Failover for the one single point of failure §16.1 left: the
+    /// primary's index. The index is a rebuildable cache (§4), so losing
+    /// the device it is on costs a rebuild, not the pool. The lowest online
+    /// device becomes primary; an index is rebuilt onto it from every
+    /// online device's segments -- the slow mount path's scan, run live;
+    /// the mount's index handle is pointed at it; the location cache,
+    /// whose entries were the old primary's offsets, is emptied and warmed
+    /// from the new index.
+    ///
+    /// The index write lock is held for the whole rebuild. Writes wait
+    /// rather than race the scan: a record that landed after the scan but
+    /// before the swap would otherwise be indexed only in the old, dead
+    /// index. They were failing anyway -- their index puts were going to
+    /// a device that had faulted -- so waiting is strictly better.
+    ///
+    /// Reads during the rebuild that miss the cache fall through to the
+    /// old primary and fail over; after it they hit the new one directly.
+    fn promote_primary(&self) -> Result<u16, PoolError> {
+        let _one_at_a_time = self.attach_lock.lock();
+        let old = self.primary();
+        if !self.vdevs.primary_faulted() {
+            return Err(PoolError::InvalidArgument(format!(
+                "vdev {old} is the primary and has not faulted; promotion is failover, not a preference"
+            )));
+        }
+        let online = self.vdevs.online();
+        let Some(new_primary) = online.first().cloned() else {
+            return Err(PoolError::Format("no online device to promote".into()));
+        };
+        tracing::warn!(
+            "primary vdev {old} has faulted; promoting vdev {} and rebuilding the index on it",
+            new_primary.id
+        );
+        let generation = self.namespace.lock().generation;
+        {
+            let mut index = self.persisted_index.write();
+            let rebuilt = rebuild_index(&index_path(&new_primary.root), &online, generation)?;
+            self.dedup_index.clear();
+            self.dedup_index.extend(rebuilt.iter_chunk_locations()?);
+            *index = rebuilt;
+        }
+        self.vdevs.promote(new_primary.id);
+        self.repair_stats.promotions.fetch_add(1, Ordering::Relaxed);
+        // Publish: every online superblock now carries this generation and
+        // the new primary's index is checkpointed against it.
+        self.run_checkpoint()?;
+        Ok(new_primary.id)
     }
 
     /// Tells the device set about slots a writer has dropped. Every writer
@@ -4109,7 +4174,8 @@ impl PoolShared {
     /// generous constant since `next_ino` is a monotonic in-memory counter
     /// with no real ceiling, not a fixed-size table.
     fn statfs(&self) -> Result<PoolStats, PoolError> {
-        let vfs = nix::sys::statvfs::statvfs(self.pool_root.as_path())
+        let root = self.vdevs.primary_root().unwrap_or_else(|| self.pool_root.clone());
+        let vfs = nix::sys::statvfs::statvfs(root.as_path())
             .map_err(|e| PoolError::Io(std::io::Error::from(e)))?;
         let files_total = self.namespace.lock().inodes.len() as u64;
         Ok(PoolStats {
@@ -4593,7 +4659,7 @@ impl PoolShared {
                     // losing it is not something the pool can write its
                     // way around. Any other member is faulted like a
                     // failed segment write.
-                    if member.vdev.id == self.primary_id {
+                    if member.vdev.id == self.primary() {
                         return Err(e);
                     }
                     tracing::error!("vdev {}: superblock write failed ({e})", member.vdev.id);
@@ -4615,9 +4681,21 @@ pub(crate) fn get_reader<'a>(
     segment_id: u64,
     kind: StreamKind,
 ) -> Result<&'a SegmentReader, PoolError> {
+    get_reader_lazy(readers, || Ok(vdev_root.to_path_buf()), vdev_id, segment_id, kind)
+}
+
+/// `get_reader` that only learns the device's root on a cache miss, so
+/// the hit path -- every ordinary read -- costs no lookup and no clone.
+pub(crate) fn get_reader_lazy(
+    readers: &mut SegmentReaders,
+    vdev_root: impl FnOnce() -> Result<PathBuf, PoolError>,
+    vdev_id: u16,
+    segment_id: u64,
+    kind: StreamKind,
+) -> Result<&SegmentReader, PoolError> {
     let key = (vdev_id, segment_id, kind);
     if let std::collections::hash_map::Entry::Vacant(e) = readers.entry(key) {
-        e.insert(SegmentReader::open(vdev_root, segment_id, kind)?);
+        e.insert(SegmentReader::open(&vdev_root()?, segment_id, kind)?);
     }
     Ok(readers.get(&key).unwrap())
 }

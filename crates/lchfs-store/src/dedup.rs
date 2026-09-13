@@ -44,8 +44,6 @@ pub struct DedupScanner {
     /// fact, and the canonical chosen for a hash belongs to that device's
     /// replica set (ARCHITECTURE.md §15.7).
     vdevs: Arc<VdevSet>,
-    /// Fixed at construction: the slot whose locations the cache holds.
-    primary_id: u16,
     locations: Arc<ChunkLocationCache>,
     /// In-memory only, per (vdev, stream) (today only ever `StreamKind::Data` is
     /// scanned -- see `run_pass`). Losing this on restart is fine: the
@@ -66,21 +64,19 @@ impl DedupScanner {
     /// A fixed online set, first entry the primary -- for tests and
     /// tooling. A mounted pool uses `new_on` with its live set.
     pub fn new(targets: Vec<Vdev>, locations: Arc<ChunkLocationCache>) -> Self {
-        let primary_id = targets[0].id;
-        Self::new_on(Arc::new(VdevSet::from_vdevs(targets)), primary_id, locations)
+        Self::new_on(Arc::new(VdevSet::from_vdevs(targets)), locations)
     }
 
-    pub fn new_on(vdevs: Arc<VdevSet>, primary_id: u16, locations: Arc<ChunkLocationCache>) -> Self {
+    pub fn new_on(vdevs: Arc<VdevSet>, locations: Arc<ChunkLocationCache>) -> Self {
         Self {
             vdevs,
-            primary_id,
             locations,
             scanned_up_to: HashMap::new(),
         }
     }
 
     fn primary_id(&self) -> u16 {
-        self.primary_id
+        self.vdevs.primary()
     }
 
     /// Scan newly-sealed Data-stream segments for `content_hash`

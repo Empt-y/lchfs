@@ -49,17 +49,11 @@ impl CoalesceDaemon {
     /// is the primary -- for tests and tooling that drive the daemon
     /// directly. A mounted pool uses `new_on` with its live set.
     pub fn new(targets: Vec<Vdev>, locations: Arc<ChunkLocationCache>, pins: Arc<PendingDedupPins>) -> Self {
-        let primary = targets[0].clone();
-        Self::new_on(Arc::new(VdevSet::from_vdevs(targets)), primary, locations, pins)
+        Self::new_on(Arc::new(VdevSet::from_vdevs(targets)), locations, pins)
     }
 
-    pub fn new_on(
-        vdevs: Arc<VdevSet>,
-        primary: Vdev,
-        locations: Arc<ChunkLocationCache>,
-        pins: Arc<PendingDedupPins>,
-    ) -> Self {
-        let gc = GcEngine::new_on(primary, locations, pins);
+    pub fn new_on(vdevs: Arc<VdevSet>, locations: Arc<ChunkLocationCache>, pins: Arc<PendingDedupPins>) -> Self {
+        let gc = GcEngine::new_on(Arc::clone(&vdevs), locations, pins);
         Self { vdevs, gc }
     }
 

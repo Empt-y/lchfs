@@ -13,6 +13,7 @@ use parking_lot::RwLock;
 use std::collections::HashSet;
 use std::fs::File;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU16, Ordering};
 
 /// One online device, with what the mount holds on it.
 pub(crate) struct Member {
@@ -45,10 +46,17 @@ pub(crate) struct VdevSetState {
 
 pub struct VdevSet {
     state: RwLock<VdevSetState>,
+    /// The slot whose copy of everything is read by default and which
+    /// holds the mount's `INDEX.redb` (ARCHITECTURE.md §15.10): the lowest
+    /// online slot at mount, and thereafter whatever `promote` last chose.
+    /// An atomic because the read path asks for it per read and must not
+    /// take a lock to learn it.
+    primary: AtomicU16,
 }
 
 impl VdevSet {
     pub(crate) fn new(members: Vec<Member>, count: u16) -> Self {
+        let primary = members.first().map(|m| m.vdev.id).unwrap_or(0);
         Self {
             state: RwLock::new(VdevSetState {
                 members,
@@ -56,7 +64,31 @@ impl VdevSet {
                 count,
                 catching_up: HashSet::new(),
             }),
+            primary: AtomicU16::new(primary),
         }
+    }
+
+    /// The current primary's slot.
+    pub fn primary(&self) -> u16 {
+        self.primary.load(Ordering::Acquire)
+    }
+
+    /// The current primary's root, if it is still online.
+    pub fn primary_root(&self) -> Option<PathBuf> {
+        self.root_of(self.primary())
+    }
+
+    /// True when the primary has faulted: the mount's index is on a device
+    /// it can no longer use, and a promotion is due.
+    pub fn primary_faulted(&self) -> bool {
+        let primary = self.primary();
+        self.state.read().faulted.iter().any(|m| m.vdev.id == primary)
+    }
+
+    /// Makes `id` the primary. The caller has already rebuilt the index
+    /// on it; this only moves the role.
+    pub(crate) fn promote(&self, id: u16) {
+        self.primary.store(id, Ordering::Release);
     }
 
     pub(crate) fn member(vdev: Vdev, superblock: FileBackend, lock: Flock<File>) -> Member {

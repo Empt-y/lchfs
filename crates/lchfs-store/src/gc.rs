@@ -14,6 +14,7 @@
 //! it isn't a parallel concern.
 
 use crate::segment::SegmentReader;
+use crate::vdevs::VdevSet;
 use crate::{SegmentReaders, StreamKind, Vdev, dag_walk};
 use crate::dag_walk::LiveSet;
 use std::path::Path;
@@ -36,8 +37,9 @@ const DEFAULT_LIVENESS_THRESHOLD: f64 = 0.5;
 const GRACE_WINDOW_SEGMENTS: usize = 2;
 
 pub struct GcEngine {
-    /// The device mark reads from (root and id): the mount's primary.
-    primary: Vdev,
+    /// The pool's device set; mark reads from whichever device is the
+    /// primary when the pass starts.
+    vdevs: Arc<VdevSet>,
     locations: Arc<ChunkLocationCache>,
     pins: Arc<PendingDedupPins>,
     readers: SegmentReaders,
@@ -62,17 +64,22 @@ impl GcEngine {
 
     /// The slot mark reads from.
     pub fn primary_id(&self) -> u16 {
-        self.primary.id
+        self.vdevs.primary()
+    }
+
+    fn primary(&self) -> Vdev {
+        let id = self.vdevs.primary();
+        Vdev::new(id, self.vdevs.root_of(id).unwrap_or_default())
     }
 
     pub fn new(pool_root: PathBuf, locations: Arc<ChunkLocationCache>, pins: Arc<PendingDedupPins>) -> Self {
-        Self::new_on(Vdev::new(crate::PRIMARY_VDEV_ID, pool_root), locations, pins)
+        Self::new_on(Arc::new(VdevSet::from_roots(&[pool_root])), locations, pins)
     }
 
-    /// `new`, for a mount whose primary is not vdev 0 (§15.8).
-    pub fn new_on(primary: Vdev, locations: Arc<ChunkLocationCache>, pins: Arc<PendingDedupPins>) -> Self {
+    /// `new` on a live device set.
+    pub fn new_on(vdevs: Arc<VdevSet>, locations: Arc<ChunkLocationCache>, pins: Arc<PendingDedupPins>) -> Self {
         Self {
-            primary,
+            vdevs,
             locations,
             pins,
             readers: HashMap::new(),
@@ -98,10 +105,11 @@ impl GcEngine {
     /// guessing.
     pub fn mark(&mut self, live_roots: &[Hash32]) -> LiveSet {
         let mut live = LiveSet::default();
+        let primary = self.primary();
         for &root in live_roots {
             if let Err(e) = dag_walk::walk_reachable(
                 root,
-                &self.primary,
+                &primary,
                 &self.locations,
                 &mut self.readers,
                 &mut live,
@@ -149,7 +157,7 @@ impl GcEngine {
     /// actual space to reclaim) lives; Meta-stream segments are far
     /// smaller and churn differently, not addressed by this pass.
     pub fn sweep_candidates(&self, live_sets: &HashMap<u64, RoaringBitmap>) -> Vec<u64> {
-        self.sweep_candidates_on(&self.primary.root, live_sets)
+        self.sweep_candidates_on(&self.primary().root, live_sets)
     }
 
     /// `sweep_candidates` for an arbitrary vdev root, given that device's

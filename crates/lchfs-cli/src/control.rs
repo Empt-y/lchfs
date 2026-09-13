@@ -152,12 +152,15 @@ pub fn handle(pool: &Pool, request: &Value) -> anyhow::Result<Value> {
                     })
                 })
                 .collect();
-            let primary_faulted = pool.faulted_vdevs().contains(&primary);
+            // A faulted primary is promoted away within a second; a remount
+            // is only required if there is nothing left to promote.
+            let remount_required = pool.primary_faulted() && pool.vdev_status().iter().all(|s| s.health != VdevHealth::Online);
             Ok(json!({
                 "pool_uuid": lchfs_format::pool_uuid_hex(&pool.pool_uuid()),
                 "primary": primary,
                 "degraded": pool.is_degraded(),
-                "remount_required": primary_faulted,
+                "primary_faulted": pool.primary_faulted(),
+                "remount_required": remount_required,
                 "vdevs": vdevs,
                 "missing": pool.missing_vdevs(),
                 "faulted": pool.faulted_vdevs(),
@@ -165,6 +168,7 @@ pub fn handle(pool: &Pool, request: &Value) -> anyhow::Result<Value> {
                     "failovers": stats.failovers,
                     "heals": stats.heals,
                     "heal_failures": stats.heal_failures,
+                    "promotions": stats.promotions,
                     "corruption_events": pool.corruption_events().len(),
                 },
                 "mount_resilver": pool
@@ -231,6 +235,7 @@ pub fn handle(pool: &Pool, request: &Value) -> anyhow::Result<Value> {
                 }))
                 .collect::<Vec<_>>()))
         }
+        "promote" => Ok(json!({ "primary": pool.promote_primary()? })),
         other => anyhow::bail!("unknown command {other:?}"),
     }
 }
