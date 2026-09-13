@@ -17,8 +17,24 @@ pub enum CodecId {
 pub trait Codec {
     fn id(&self) -> CodecId;
     fn compress(&self, data: &[u8], level: i32) -> Vec<u8>;
-    fn decompress(&self, data: &[u8], uncompressed_len: usize) -> Vec<u8>;
+    /// Fallible, because the bytes come off disk: a corrupted record is an
+    /// error for the reader to report against that record, never a panic
+    /// that takes the whole mount down with it.
+    fn decompress(&self, data: &[u8], uncompressed_len: usize) -> Result<Vec<u8>, DecompressError>;
 }
+
+/// The stored payload is not something this codec produced -- corrupted on
+/// disk, or the header's `codec_id`/`uncompressed_len` no longer describe it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecompressError(pub String);
+
+impl std::fmt::Display for DecompressError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for DecompressError {}
 
 pub struct ZstdCodec;
 
@@ -32,9 +48,8 @@ impl Codec for ZstdCodec {
             .expect("zstd compression of an in-memory buffer should not fail")
     }
 
-    fn decompress(&self, data: &[u8], uncompressed_len: usize) -> Vec<u8> {
-        zstd::bulk::decompress(data, uncompressed_len)
-            .expect("zstd decompression of a record written by this codec should not fail")
+    fn decompress(&self, data: &[u8], uncompressed_len: usize) -> Result<Vec<u8>, DecompressError> {
+        zstd::bulk::decompress(data, uncompressed_len).map_err(|e| DecompressError(e.to_string()))
     }
 }
 

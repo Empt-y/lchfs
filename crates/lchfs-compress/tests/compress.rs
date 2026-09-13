@@ -13,7 +13,7 @@ proptest! {
     ) {
         let codec = ZstdCodec;
         let compressed = codec.compress(&data, level);
-        let decompressed = codec.decompress(&compressed, data.len());
+        let decompressed = codec.decompress(&compressed, data.len()).unwrap();
         prop_assert_eq!(data, decompressed);
     }
 
@@ -30,7 +30,7 @@ proptest! {
         if let CompressionDecision::Compress { codec, level } = sample_and_decide(&data) {
             prop_assert_eq!(codec, CodecId::Zstd);
             let compressed = ZstdCodec.compress(&data, level);
-            let decompressed = ZstdCodec.decompress(&compressed, data.len());
+            let decompressed = ZstdCodec.decompress(&compressed, data.len()).unwrap();
             prop_assert_eq!(data, decompressed);
         }
     }
@@ -54,4 +54,12 @@ fn small_chunk_samples_whole_chunk_and_still_decides() {
     let data = vec![b'x'; 100];
     let decision = sample_and_decide(&data);
     assert!(matches!(decision, CompressionDecision::Compress { .. }));
+}
+
+/// Bytes that are not a zstd frame must come back as an error, not a panic:
+/// this is the path a corrupted on-disk record takes.
+#[test]
+fn garbage_input_is_an_error_not_a_panic() {
+    let err = ZstdCodec.decompress(&[0xFFu8; 64], 4096).unwrap_err();
+    assert!(!err.to_string().is_empty());
 }

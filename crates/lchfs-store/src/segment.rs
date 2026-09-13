@@ -394,6 +394,34 @@ fn write_header_page(file: &File, header: &SegmentHeader) -> io::Result<()> {
     file.write_all_at(&page, 0)
 }
 
+/// Turns a record's on-disk payload back into its logical bytes, applying
+/// whatever codec the header says was used. No content-hash check -- the
+/// callers that need one keep doing it themselves; this exists so
+/// `read_record`, `read_record_raw` and read failover's heal path (lib.rs)
+/// share one decode rather than three.
+///
+/// A payload that will not decompress is reported as a corrupted record,
+/// the same shape as a bad length prefix. It cannot be a content-hash
+/// mismatch, because there are no bytes to hash yet -- and it must not be
+/// a panic, because these bytes came off a disk that may have rotted them.
+pub fn decode_payload(
+    header: &ExtentRecordHeader,
+    payload: Vec<u8>,
+) -> Result<Vec<u8>, SegmentError> {
+    if header.codec_id == CodecId::None {
+        return Ok(payload);
+    }
+    use lchfs_compress::{Codec, ZstdCodec};
+    ZstdCodec
+        .decompress(&payload, header.uncompressed_len as usize)
+        .map_err(|e| {
+            SegmentError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("corrupted record: payload does not decompress ({e})"),
+            ))
+        })
+}
+
 /// Random-access reader for a sealed or open segment.
 pub struct SegmentReader {
     file: File,
@@ -493,13 +521,7 @@ impl SegmentReader {
         loc: ExtentLocation,
     ) -> Result<(ExtentRecordHeader, Vec<u8>), SegmentError> {
         let (header, payload) = self.read_raw(loc)?;
-
-        let decompressed = if header.codec_id == CodecId::None {
-            payload
-        } else {
-            use lchfs_compress::{Codec, ZstdCodec};
-            ZstdCodec.decompress(&payload, header.uncompressed_len as usize)
-        };
+        let decompressed = decode_payload(&header, payload)?;
 
         if let Err(_verify_err) = lchfs_crypto::verify(&decompressed, header.content_hash) {
             let actual = Hash32::of(&decompressed);
@@ -530,13 +552,7 @@ impl SegmentReader {
         loc: ExtentLocation,
     ) -> Result<(ExtentRecordHeader, Vec<u8>), SegmentError> {
         let (header, payload) = self.read_raw(loc)?;
-
-        let decompressed = if header.codec_id == CodecId::None {
-            payload.clone()
-        } else {
-            use lchfs_compress::{Codec, ZstdCodec};
-            ZstdCodec.decompress(&payload, header.uncompressed_len as usize)
-        };
+        let decompressed = decode_payload(&header, payload.clone())?;
 
         if let Err(_verify_err) = lchfs_crypto::verify(&decompressed, header.content_hash) {
             let actual = Hash32::of(&decompressed);
