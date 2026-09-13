@@ -653,14 +653,18 @@ impl Pool {
             // `ingress::Indexer` for why that placement matters.
             let cache = Arc::clone(&dedup_index);
             let persisted = Arc::clone(&persisted_index);
-            committer_pool.set_indexer(Arc::new(move |hash, loc, on: &[u16]| {
-                cache.put(hash, loc);
-                let mut index = persisted.write();
-                for &vdev_id in on {
-                    index.put_chunk_location(hash, vdev_id, loc).map_err(std::io::Error::other)?;
-                }
-                Ok(())
-            }));
+            committer_pool.set_indexer(ingress::Indexer {
+                cache,
+                persist: Arc::new(move |batch: &[ingress::IndexEntry]| {
+                    let entries = batch
+                        .iter()
+                        .flat_map(|(hash, loc, on)| on.iter().map(move |&v| (*hash, v, *loc)));
+                    persisted
+                        .write()
+                        .put_chunk_locations(entries)
+                        .map_err(std::io::Error::other)
+                }),
+            });
         }
         let prep_pool = IngestPreparationPool::new(
             committer_thread_count(),
@@ -1392,14 +1396,18 @@ impl Pool {
             // `ingress::Indexer` for why that placement matters.
             let cache = Arc::clone(&dedup_index);
             let persisted = Arc::clone(&persisted_index);
-            committer_pool.set_indexer(Arc::new(move |hash, loc, on: &[u16]| {
-                cache.put(hash, loc);
-                let mut index = persisted.write();
-                for &vdev_id in on {
-                    index.put_chunk_location(hash, vdev_id, loc).map_err(std::io::Error::other)?;
-                }
-                Ok(())
-            }));
+            committer_pool.set_indexer(ingress::Indexer {
+                cache,
+                persist: Arc::new(move |batch: &[ingress::IndexEntry]| {
+                    let entries = batch
+                        .iter()
+                        .flat_map(|(hash, loc, on)| on.iter().map(move |&v| (*hash, v, *loc)));
+                    persisted
+                        .write()
+                        .put_chunk_locations(entries)
+                        .map_err(std::io::Error::other)
+                }),
+            });
         }
         let shared = Arc::new(PoolShared {
             pool_root: pool_root.to_path_buf(),
@@ -2418,6 +2426,9 @@ impl PoolShared {
             self.primary()
         );
 
+        // A record younger than its shard's index batch has no replica
+        // entries yet; drain the batches before asking. Failure path only.
+        self.committer_pool.flush_index()?;
         let replicas = self.persisted_index.read().chunk_locations(hash)?;
         let mut failed: Vec<(u16, Option<ExtentLocation>, String)> =
             vec![(self.primary(), Some(preferred), primary_err.to_string())];
@@ -2754,6 +2765,7 @@ impl PoolShared {
             ));
         }
         self.vdev_root(vdev_id)?;
+        self.committer_pool.flush_index()?;
         let mut report = ResilverReport::default();
         let mut pending: Vec<PendingHeal> = Vec::new();
         self.for_each_replica_group(|hash, replicas| {
@@ -2788,6 +2800,7 @@ impl PoolShared {
     /// On a single-vdev pool it still verifies and reports; it just has
     /// nowhere to heal from.
     fn scrub(&self) -> Result<Vec<ScrubReport>, PoolError> {
+        self.committer_pool.flush_index()?;
         let online = self.vdevs.online();
         let mut reports = Vec::with_capacity(online.len());
         for vdev in &online {
@@ -4340,15 +4353,21 @@ impl PoolShared {
 
         let shard_id = ingress::shard_for_inode(ino, self.shard_delta_logs.len() as u32);
 
-        // Barrier: this shard's data segment must be durable before the
-        // IndirectHashList we're about to write can reference its chunk
-        // hashes.
-        self.committer_pool.shard(shard_id).fsync_data()?;
-
         let ino_lock = self.lock_for_ino(ino);
         let _guard = ino_lock.lock();
 
         let session_chunks = self.finalize_incremental_session(ino)?;
+
+        // Barrier: this shard's data segment must be durable before the
+        // IndirectHashList we're about to write can reference its chunk
+        // hashes -- *including* the trailing chunk finalize just
+        // committed. This used to run before the finalize, which left
+        // the last chunk of every fsync'd append unfsynced while the
+        // delta entry claimed it; an in-process crash never showed it
+        // because the page cache still had the bytes. Found when the
+        // index batch, flushed by this same fsync, came up one entry
+        // short.
+        self.committer_pool.shard(shard_id).fsync_data()?;
 
         // Deliberately not read before `ino_lock` was acquired: a
         // concurrent write() on another thread could otherwise grow the
@@ -4723,6 +4742,9 @@ impl PoolShared {
         // between, the old superblock slot (still pointing at the
         // previous generation) stays the recovery target and this index
         // checkpoint is simply orphaned, not referenced by anything yet.
+        // Every shard's index batch lands before the index claims this
+        // generation: the mount fast path trusts that claim.
+        self.committer_pool.flush_index()?;
         self.persisted_index.write().checkpoint(generation)?;
 
         let object_count = {

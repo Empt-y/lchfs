@@ -207,6 +207,31 @@ impl RedbIndex {
         Ok(out)
     }
 
+    /// Many `put_chunk_location`s in one transaction. What the committer
+    /// flushes its per-shard batch through: one `begin_write`/`commit`
+    /// per batch instead of per record, which is the difference between
+    /// the index being a lock every chunk takes and one a batch takes.
+    pub fn put_chunk_locations(
+        &mut self,
+        entries: impl IntoIterator<Item = (Hash32, u16, ExtentLocation)>,
+    ) -> Result<(), IndexError> {
+        let mut txn = self.db.begin_write().map_err(err)?;
+        txn.set_durability(Durability::None).map_err(err)?;
+        {
+            let mut table = txn.open_table(CHUNK_LOCATIONS).map_err(err)?;
+            for (hash, vdev_id, loc) in entries {
+                table
+                    .insert(
+                        encode_chunk_key(hash, vdev_id).as_slice(),
+                        encode_location(loc).as_slice(),
+                    )
+                    .map_err(err)?;
+            }
+        }
+        txn.commit().map_err(err)?;
+        Ok(())
+    }
+
     /// A page of `(hash, vdev_id, location)` entries in key order, starting
     /// strictly after `after` (or from the beginning), at most `limit` long.
     /// What a pass over the whole index uses instead of

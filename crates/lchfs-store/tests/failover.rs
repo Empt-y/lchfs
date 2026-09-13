@@ -475,3 +475,48 @@ fn unhealable_corruption_is_recorded_as_such() {
     assert!(!events[0].healed);
     assert_eq!(events[0].ino, Some(ino));
 }
+
+// ---- Index batching (Phase 5 M1) ----------------------------------------
+
+/// A record's persisted index entries live in its shard's batch until a
+/// flush. Anything that reads the persisted index and expects it complete
+/// -- a resilver, a scrub, a failover read -- drains the batches first, so
+/// a record written a moment ago, with no checkpoint or fsync since, is
+/// already accounted for on every device it reached.
+#[test]
+fn passes_that_read_the_index_see_records_still_in_the_batch() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let pool = Pool::create_replicated(&[a.path(), b.path()], small_params()).unwrap();
+    pool.checkpoint().unwrap();
+    let ino = pool.create_file(1, "fresh", 0o644).unwrap();
+    pool.write(ino, 0, &payload()).unwrap();
+    // No checkpoint, no fsync: every entry for "fresh" is in a batch.
+    let report = pool.resilver(1).unwrap();
+    assert!(report.examined > 0);
+    assert_eq!(report.missing, 0, "b took every record, and the index must say so: {report:?}");
+    let reports = pool.scrub().unwrap();
+    assert!(reports.iter().all(|r| r.corrupt == 0 && r.verified > 0), "{reports:?}");
+}
+
+/// Records written after the last checkpoint and never fsync'd are not in
+/// the persisted index at a crash -- batched or not -- and are recovered
+/// by the delta replay and owner-shard rescan exactly as before.
+#[test]
+fn a_crash_with_records_still_in_the_index_batch_recovers_through_fsync() {
+    let a = tempfile::tempdir().unwrap();
+    let pool = Pool::create(a.path(), small_params()).unwrap();
+    pool.checkpoint().unwrap();
+    let ino = pool.create_file(1, "f", 0o644).unwrap();
+    pool.write(ino, 0, &payload()).unwrap();
+    pool.fsync(ino).unwrap();
+    drop(pool);
+    let pool = Pool::open(a.path()).unwrap();
+    assert_eq!(pool.read(ino, 0, payload().len() as u32).unwrap(), payload());
+    // And the next checkpoint leaves an index fsck agrees with.
+    pool.checkpoint().unwrap();
+    drop(pool);
+    let roots = lchfs_fsck::collect_live_roots(a.path()).unwrap();
+    let report = lchfs_fsck::verify_index(a.path(), &roots);
+    assert!(report.is_clean(), "{:?}", report.errors);
+}

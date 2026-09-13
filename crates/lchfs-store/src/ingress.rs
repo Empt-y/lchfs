@@ -62,6 +62,10 @@ struct ShardDataWriter {
     /// The slots `writer`'s segment fans out to, shared with every
     /// completion it produces.
     vdev_ids: Arc<[u16]>,
+    /// Landed records not yet in the persisted index. Drained under this
+    /// shard's lock by `flush_index`; see `Indexer` for when.
+    pending_index: Vec<IndexEntry>,
+    indexer: Arc<OnceLock<Indexer>>,
     /// The mount's online devices (§15.3). The Data stream carries file
     /// content, so this is the fan-out that actually replicates user data.
     /// Consulted at every rollover, so a device attached live is written
@@ -106,7 +110,26 @@ impl ShardDataWriter {
         }
     }
 
+    /// Hands every pending record to the index in one transaction. Runs
+    /// under the shard lock, so nothing appended to this shard can be
+    /// unindexed once it returns.
+    fn flush_index(&mut self) -> io::Result<()> {
+        if self.pending_index.is_empty() {
+            return Ok(());
+        }
+        let Some(index) = self.indexer.get() else {
+            self.pending_index.clear();
+            return Ok(());
+        };
+        let result = (index.persist)(&self.pending_index);
+        self.pending_index.clear();
+        result
+    }
+
     fn roll_over(&mut self) -> io::Result<()> {
+        // Everything on the old segment is indexed before it is left
+        // behind: the invariant a live attach's barrier rests on.
+        self.flush_index()?;
         let new_id = self.next_segment_id.fetch_add(1, Ordering::Relaxed);
         let online = self.vdevs.online();
         let new_writer = SegmentWriter::create_on(&online, new_id, StreamKind::Data, self.shard_id)?;
@@ -125,7 +148,8 @@ impl ShardDataWriter {
     fn fsync(&mut self) -> io::Result<()> {
         let result = self.writer.fsync();
         self.report_faults();
-        result
+        result?;
+        self.flush_index()
     }
 }
 
@@ -154,6 +178,7 @@ impl LogicalShard {
         vdevs: Arc<VdevSet>,
         segment_cap_bytes: u64,
         next_segment_id: Arc<AtomicU64>,
+        indexer: Arc<OnceLock<Indexer>>,
     ) -> io::Result<Self> {
         let initial_id = next_segment_id.fetch_add(1, Ordering::Relaxed);
         let mut writer = SegmentWriter::create_on(&vdevs.online(), initial_id, StreamKind::Data, id)?;
@@ -168,6 +193,8 @@ impl LogicalShard {
             data: Mutex::new(ShardDataWriter {
                 vdev_ids: writer.vdev_ids().into(),
                 writer,
+                pending_index: Vec::with_capacity(INDEX_BATCH),
+                indexer,
                 vdevs,
                 shard_id: id,
                 segment_cap_bytes,
@@ -217,13 +244,36 @@ pub fn shard_for_inode(inode_id: u64, shard_count: u32) -> u32 {
 
 /// K physical committer threads (K ~= num_cpus) draining a work-stealing
 /// deque of "logical shards with pending work". ARCHITECTURE.md §5.
-/// Records a landed record in the pool's index: `(hash, location, the
-/// slots it landed on)`. Called by a committer *under its shard's lock*,
-/// before the write is acknowledged, so that "this shard's writer has been
-/// rolled" implies "every record on its previous segment is indexed" --
-/// which is what lets a live attach use the writers' own locks as its
-/// barrier instead of a lock every write would have to take (§5).
-pub type Indexer = Arc<dyn Fn(Hash32, ExtentLocation, &[u16]) -> io::Result<()> + Send + Sync>;
+/// One landed record for the index: the hash, where it went, the slots it
+/// went to.
+pub type IndexEntry = (Hash32, ExtentLocation, Arc<[u16]>);
+
+/// Records a batch of landed records in the pool's persisted index.
+/// Called by a committer *under its shard's lock* -- when the shard's
+/// batch fills, when its writer rolls, when it fsyncs, or when the pool
+/// asks every shard to flush -- so that "this shard's writer has been
+/// rolled" still implies "every record on its previous segment is
+/// indexed", which is what lets a live attach use the writers' own locks
+/// as its barrier (§5). The location *cache* is updated per record, at
+/// once, since that is what reads consult; only the redb transaction is
+/// batched.
+/// The persisting half of an `Indexer`: one call per batch.
+pub type PersistBatch = Arc<dyn Fn(&[IndexEntry]) -> io::Result<()> + Send + Sync>;
+
+pub struct Indexer {
+    /// Updated per record, at once: reads, dedup and file hydration
+    /// consult this, and a record must be findable the moment its write
+    /// is acknowledged.
+    pub cache: Arc<lchfs_index::ChunkLocationCache>,
+    /// The persisted index, fed a batch at a time.
+    pub persist: PersistBatch,
+}
+
+/// Records a shard buffers before one index transaction takes them all.
+/// Large enough that the transaction cost stops mattering, small enough
+/// that a failover read of a just-written record (which flushes first)
+/// does not wait on much.
+pub const INDEX_BATCH: usize = 1024;
 
 pub struct CommitterPool {
     shards: Vec<Arc<LogicalShard>>,
@@ -274,6 +324,7 @@ impl CommitterPool {
                 Arc::clone(&vdevs),
                 data_segment_cap_bytes,
                 Arc::clone(&next_segment_id),
+                Arc::clone(&indexer),
             )?));
         }
 
@@ -287,10 +338,9 @@ impl CommitterPool {
                 let injector = Arc::clone(&injector);
                 let wake = Arc::clone(&wake);
                 let shutdown = Arc::clone(&shutdown);
-                let indexer = Arc::clone(&indexer);
                 std::thread::Builder::new()
                     .name(format!("lchfs-committer-{worker_idx}"))
-                    .spawn(move || committer_loop(shards, injector, wake, shutdown, indexer))
+                    .spawn(move || committer_loop(shards, injector, wake, shutdown))
                     .expect("spawn committer thread")
             })
             .collect();
@@ -323,6 +373,16 @@ impl CommitterPool {
     /// lock. Once only; a second call is ignored.
     pub fn set_indexer(&self, indexer: Indexer) {
         let _ = self.indexer.set(indexer);
+    }
+
+    /// Drains every shard's index batch, each under its own lock. What
+    /// the pool calls before anything that reads the persisted index and
+    /// expects it complete: a checkpoint, a failover read, a scrub.
+    pub fn flush_index(&self) -> io::Result<()> {
+        for shard in &self.shards {
+            shard.data.lock().flush_index()?;
+        }
+        Ok(())
     }
 
     pub fn roll_all_writers(&self) -> io::Result<()> {
@@ -418,7 +478,6 @@ fn committer_loop(
     injector: Arc<Injector<u32>>,
     wake: Arc<(Mutex<()>, Condvar)>,
     shutdown: Arc<AtomicBool>,
-    indexer: Arc<OnceLock<Indexer>>,
 ) {
     while !shutdown.load(Ordering::Acquire) {
         match pop_pending(&injector) {
@@ -448,8 +507,16 @@ fn committer_loop(
                             &op.payload,
                         )
                         .and_then(|appended| {
-                            if let Some(index) = indexer.get() {
-                                index(op.content_hash, appended.location, &appended.vdevs)?;
+                            if let Some(index) = data.indexer.get() {
+                                index.cache.put(op.content_hash, appended.location);
+                            }
+                            data.pending_index.push((
+                                op.content_hash,
+                                appended.location,
+                                Arc::clone(&appended.vdevs),
+                            ));
+                            if data.pending_index.len() >= INDEX_BATCH {
+                                data.flush_index()?;
                             }
                             Ok(appended)
                         });
