@@ -15,7 +15,7 @@
 //! than any `pub(crate)`-only helper.
 
 use lchfs_format::{
-    ChunkRef, ContentRef, DirectoryObject, ExtentLocation, Hash32, InoMap, InodeKind,
+    ChunkRef, ContentRef, DirectoryObject, ExtentLocation, ExtentRecordHeader, Hash32, InoMap, InodeKind,
     InodeObject, IndirectHashList, RootObject, SnapshotTable, StreamKind, SUPERBLOCK_MAGIC,
     SUPERBLOCK_SLOT_COUNT, SUPERBLOCK_SLOT_SIZE, SuperblockSlot, compute_superblock_slot_checksum,
 };
@@ -23,7 +23,7 @@ use lchfs_index::{IndexStore, RedbIndex};
 use lchfs_store::backend::{FileBackend, StorageBackend};
 use lchfs_store::segment::{SegmentError, SegmentReader};
 use serde::de::DeserializeOwned;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -63,6 +63,22 @@ pub enum FsckError {
     LegacyFormatVersion { found: u32, supported: u32 },
     #[error("cannot rebuild the index while the pool is in use: {0}")]
     PoolLocked(String),
+    #[error("{root} belongs to a different pool (uuid mismatch) — not a member")]
+    ForeignVdev { root: String },
+    #[error("{root} says the pool has {declared} vdevs, but {expected_from} says {expected}")]
+    VdevCountMismatch { root: String, declared: u16, expected: u16, expected_from: String },
+    #[error("{a} and {b} both claim to be vdev {vdev_id}")]
+    DuplicateVdev { a: String, b: String, vdev_id: u16 },
+    #[error("vdev {vdev_id} was not given — the pool is being checked degraded")]
+    VdevAbsent { vdev_id: u16 },
+    #[error("vdev {vdev_id} is at generation {generation}, behind the newest ({newest}) — it needs a resilver")]
+    VdevBehind { vdev_id: u16, generation: u64, newest: u64 },
+    #[error("record {hash:?} is missing from vdev {vdev_id}")]
+    ReplicaMissing { hash: Hash32, vdev_id: u16 },
+    #[error("record {hash:?} on vdev {vdev_id} does not verify: {detail}")]
+    ReplicaCorrupt { hash: Hash32, vdev_id: u16, detail: String },
+    #[error("record {hash:?} on vdev {vdev_id} verifies but its header disagrees with vdev {reference}'s: {detail}")]
+    ReplicaDivergent { hash: Hash32, vdev_id: u16, reference: u16, detail: String },
     #[error("I/O error: {0}")]
     Io(String),
 }
@@ -510,4 +526,191 @@ pub fn rebuild_index(pool_root: &Path) -> Result<(), FsckError> {
         .checkpoint(generation)
         .map_err(|e| FsckError::Io(e.to_string()))?;
     Ok(())
+}
+
+/// Cross-checks the replicas of a pool against each other (ARCHITECTURE.md
+/// §15.8). Every root given is scanned on its own, exactly as `check` scans
+/// a single pool, and then the scans are compared: a record any device
+/// holds must be on every device, must read back and verify there, and
+/// must carry the same header it does on the lowest-numbered device that
+/// verifies it. Superblocks are compared first, since a device that is not
+/// a member, or one that has fallen behind, explains every record-level
+/// difference after it.
+///
+/// Reads every record on every device, so it costs what a scrub costs.
+/// Like the rest of this crate it shares nothing with the engine's own
+/// read failover or resilver -- those are the code being audited.
+///
+/// The scan's last-wins rule applies per device: where a hash appears more
+/// than once on one vdev (a heal segment re-creating a record whose
+/// original is still there), the copy in the highest-numbered segment is
+/// the one compared, because that is the copy the engine's index points at
+/// after a heal.
+pub fn check_replicas(vdev_roots: &[&Path]) -> FsckReport {
+    let mut report = FsckReport::default();
+    if vdev_roots.is_empty() {
+        return report;
+    }
+
+    // Superblocks: membership, then currency.
+    let mut members: Vec<(u16, &Path, SuperblockSlot)> = Vec::with_capacity(vdev_roots.len());
+    for root in vdev_roots {
+        match read_superblock(root) {
+            Ok(slot) => members.push((slot.vdev_id, root, slot)),
+            Err(e) => {
+                report.errors.push(e);
+                return report;
+            }
+        }
+    }
+    let (first_root, first) = (members[0].1, members[0].2);
+    for (_, root, slot) in &members[1..] {
+        if slot.pool_uuid != first.pool_uuid {
+            // Nothing else this device says is about our pool, so one
+            // finding, not a cascade.
+            report.errors.push(FsckError::ForeignVdev { root: root.display().to_string() });
+            continue;
+        }
+        if slot.vdev_count != first.vdev_count {
+            report.errors.push(FsckError::VdevCountMismatch {
+                root: root.display().to_string(),
+                declared: slot.vdev_count,
+                expected: first.vdev_count,
+                expected_from: first_root.display().to_string(),
+            });
+        }
+    }
+    if !report.errors.is_empty() {
+        // Not the same pool: comparing their records would be noise.
+        return report;
+    }
+    members.sort_by_key(|(id, _, _)| *id);
+    for pair in members.windows(2) {
+        if pair[0].0 == pair[1].0 {
+            report.errors.push(FsckError::DuplicateVdev {
+                a: pair[0].1.display().to_string(),
+                b: pair[1].1.display().to_string(),
+                vdev_id: pair[0].0,
+            });
+        }
+    }
+    let present: HashSet<u16> = members.iter().map(|(id, _, _)| *id).collect();
+    for id in 0..first.vdev_count {
+        if !present.contains(&id) {
+            report.errors.push(FsckError::VdevAbsent { vdev_id: id });
+        }
+    }
+    let newest = members.iter().map(|(_, _, s)| s.generation).max().unwrap_or(0);
+    for (id, _, slot) in &members {
+        if slot.generation < newest {
+            report.errors.push(FsckError::VdevBehind {
+                vdev_id: *id,
+                generation: slot.generation,
+                newest,
+            });
+        }
+    }
+
+    // Records: scan each device independently, then compare.
+    let mut scans: Vec<(u16, &Path, HashMap<Hash32, ExtentLocation>)> = Vec::with_capacity(members.len());
+    for (id, root, _) in &members {
+        match scan_all_segments(root) {
+            Ok(m) => scans.push((*id, root, m)),
+            Err(e) => {
+                report.errors.push(e);
+                return report;
+            }
+        }
+    }
+    let mut every_hash: Vec<Hash32> = scans
+        .iter()
+        .flat_map(|(_, _, m)| m.keys().copied())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    every_hash.sort_by_key(|h| h.0);
+
+    let mut readers: HashMap<(u16, u64, StreamKind), SegmentReader> = HashMap::new();
+    for hash in every_hash {
+        report.objects_visited += 1;
+        // The reference is the lowest-numbered vdev whose copy verifies;
+        // everything else is compared to it. Nothing is assumed about vdev
+        // 0 being right.
+        let mut reference: Option<(u16, ExtentRecordHeader)> = None;
+        for (id, root, locations) in &scans {
+            let Some(&loc) = locations.get(&hash) else {
+                report.errors.push(FsckError::ReplicaMissing { hash, vdev_id: *id });
+                continue;
+            };
+            let header = match read_verified_record(&mut readers, *id, root, loc) {
+                Ok(h) => h,
+                Err(detail) => {
+                    report.errors.push(FsckError::ReplicaCorrupt { hash, vdev_id: *id, detail });
+                    continue;
+                }
+            };
+            match &reference {
+                None => reference = Some((*id, header)),
+                Some((ref_id, ref_header)) => {
+                    if let Some(detail) = header_difference(ref_header, &header) {
+                        report.errors.push(FsckError::ReplicaDivergent {
+                            hash,
+                            vdev_id: *id,
+                            reference: *ref_id,
+                            detail,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    report
+}
+
+/// Reads one record from one vdev with the full verifying read, trying the
+/// data stream and then the meta stream: segment ids are pool-global and
+/// unique across streams, so exactly one of the two files can exist.
+fn read_verified_record(
+    readers: &mut HashMap<(u16, u64, StreamKind), SegmentReader>,
+    vdev_id: u16,
+    root: &Path,
+    loc: ExtentLocation,
+) -> Result<ExtentRecordHeader, String> {
+    let mut last_err = String::from("segment file not found in either stream");
+    for kind in [StreamKind::Data, StreamKind::Meta] {
+        let key = (vdev_id, loc.segment_id, kind);
+        let reader = match readers.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                match SegmentReader::open(root, loc.segment_id, kind) {
+                    Ok(r) => e.insert(r),
+                    Err(_) => continue,
+                }
+            }
+        };
+        match reader.read_record(loc) {
+            Ok((header, _bytes)) => return Ok(header),
+            Err(e) => last_err = e.to_string(),
+        }
+    }
+    Err(last_err)
+}
+
+/// The header fields that must agree between replicas of one record.
+/// Backpointers are excluded: they are provenance hints (§1), and a
+/// healed copy legitimately carries whatever the source replica had.
+fn header_difference(a: &ExtentRecordHeader, b: &ExtentRecordHeader) -> Option<String> {
+    if a.kind != b.kind {
+        return Some(format!("kind {:?} vs {:?}", a.kind, b.kind));
+    }
+    if a.codec_id != b.codec_id {
+        return Some(format!("codec {:?} vs {:?}", a.codec_id, b.codec_id));
+    }
+    if a.uncompressed_len != b.uncompressed_len {
+        return Some(format!(
+            "uncompressed_len {} vs {}",
+            a.uncompressed_len, b.uncompressed_len
+        ));
+    }
+    None
 }

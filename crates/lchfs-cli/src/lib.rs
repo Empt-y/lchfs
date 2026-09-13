@@ -19,7 +19,13 @@ enum Command {
     Mount { pool: PathBuf, mountpoint: PathBuf },
     /// Walk the DAG and verify integrity (ARCHITECTURE.md §10).
     Fsck {
+        /// vdev 0's root.
         pool: PathBuf,
+        /// The pool's other vdev roots, for a replica comparison
+        /// (ARCHITECTURE.md §15.8). Any order; each device's superblock
+        /// says which slot it is.
+        #[arg(long = "vdev")]
+        vdevs: Vec<PathBuf>,
         #[arg(long)]
         verify_index: bool,
         #[arg(long)]
@@ -48,8 +54,8 @@ pub fn run() -> anyhow::Result<()> {
     match cli.command {
         Command::CreatePool { path } => create_pool(&path),
         Command::Mount { pool, mountpoint } => mount(&pool, &mountpoint),
-        Command::Fsck { pool, verify_index, rebuild_index } => {
-            fsck(&pool, verify_index, rebuild_index)
+        Command::Fsck { pool, vdevs, verify_index, rebuild_index } => {
+            fsck(&pool, &vdevs, verify_index, rebuild_index)
         }
         Command::Snapshot { action } => snapshot(action),
         Command::Stats { pool } => stats(&pool),
@@ -80,7 +86,12 @@ fn mount(pool: &std::path::Path, mountpoint: &std::path::Path) -> anyhow::Result
     Ok(())
 }
 
-fn fsck(pool: &std::path::Path, verify_index: bool, rebuild_index: bool) -> anyhow::Result<()> {
+fn fsck(
+    pool: &std::path::Path,
+    other_vdevs: &[PathBuf],
+    verify_index: bool,
+    rebuild_index: bool,
+) -> anyhow::Result<()> {
     // No `Pool::open` here: fsck deliberately reads the pool directory
     // directly (see lchfs-fsck's module doc comment) rather than going
     // through the live engine -- opening a `Pool` would also run mount-
@@ -92,13 +103,35 @@ fn fsck(pool: &std::path::Path, verify_index: bool, rebuild_index: bool) -> anyh
     }
 
     let live_roots = lchfs_fsck::collect_live_roots(pool)?;
-    let report = if verify_index {
+    let mut report = if verify_index {
         lchfs_fsck::verify_index(pool, &live_roots)
     } else {
         lchfs_fsck::check(pool, &live_roots)
     };
-
     println!("Objects visited: {}", report.objects_visited);
+
+    // The DAG walk above audits vdev 0. With the other devices named, the
+    // replicas are compared against each other too; without them, say so
+    // when the pool is replicated rather than quietly checking one device
+    // of several.
+    let superblock = lchfs_fsck::read_superblock(pool)?;
+    if !other_vdevs.is_empty() {
+        let mut roots: Vec<&std::path::Path> = vec![pool];
+        roots.extend(other_vdevs.iter().map(|p| p.as_path()));
+        let replicas = lchfs_fsck::check_replicas(&roots);
+        println!(
+            "Records compared across {} vdevs: {}",
+            roots.len(),
+            replicas.objects_visited
+        );
+        report.errors.extend(replicas.errors);
+    } else if superblock.vdev_count > 1 {
+        println!(
+            "Pool has {} vdevs; only vdev 0 was checked. Pass --vdev for each other device to compare replicas.",
+            superblock.vdev_count
+        );
+    }
+
     if report.is_clean() {
         println!("No errors found.");
         Ok(())

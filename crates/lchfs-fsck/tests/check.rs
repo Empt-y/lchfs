@@ -148,3 +148,155 @@ fn collect_live_roots_includes_snapshot_table_entries() {
     let live_roots = lchfs_fsck::collect_live_roots(dir.path()).unwrap();
     assert_eq!(live_roots, vec![root]);
 }
+
+// ---- Replica comparison (ARCHITECTURE.md §15.8) ----------------------
+
+fn setup_replicated_pool(a: &std::path::Path, b: &std::path::Path) {
+    let pool = Pool::create_replicated(&[a, b], small_params()).unwrap();
+    let ino = pool.create_file(1, "chunked.bin", 0o644).unwrap();
+    pool.write(ino, 0, &deterministic_bytes(7, 40_000)).unwrap();
+    pool.checkpoint().unwrap();
+}
+
+fn data_segments(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut v: Vec<_> = std::fs::read_dir(root.join("segments/data"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn healthy_replicas_compare_clean() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    setup_replicated_pool(a.path(), b.path());
+    let report = lchfs_fsck::check_replicas(&[a.path(), b.path()]);
+    assert!(report.is_clean(), "{:?}", report.errors);
+    assert!(report.objects_visited > 0);
+}
+
+#[test]
+fn a_record_missing_from_one_vdev_is_reported_against_that_vdev() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    setup_replicated_pool(a.path(), b.path());
+    for f in data_segments(b.path()) {
+        std::fs::remove_file(f).unwrap();
+    }
+    let report = lchfs_fsck::check_replicas(&[a.path(), b.path()]);
+    let missing_on_b = report
+        .errors
+        .iter()
+        .filter(|e| matches!(e, lchfs_fsck::FsckError::ReplicaMissing { vdev_id: 1, .. }))
+        .count();
+    assert!(missing_on_b > 0, "{:?}", report.errors);
+    assert!(
+        !report.errors.iter().any(|e| matches!(e, lchfs_fsck::FsckError::ReplicaMissing { vdev_id: 0, .. })),
+        "vdev 0 has everything: {:?}",
+        report.errors
+    );
+}
+
+#[test]
+fn a_corrupt_replica_is_reported_and_the_good_one_is_not() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    setup_replicated_pool(a.path(), b.path());
+    for path in data_segments(b.path()) {
+        let mut bytes = std::fs::read(&path).unwrap();
+        if bytes.len() > 8192 {
+            let mid = bytes.len() / 2;
+            for x in &mut bytes[mid..mid + 64] {
+                *x ^= 0xff;
+            }
+            std::fs::write(&path, &bytes).unwrap();
+        }
+    }
+    let report = lchfs_fsck::check_replicas(&[a.path(), b.path()]);
+    assert!(
+        report.errors.iter().any(|e| matches!(e, lchfs_fsck::FsckError::ReplicaCorrupt { vdev_id: 1, .. })),
+        "{:?}",
+        report.errors
+    );
+    assert!(
+        report.errors.iter().all(|e| !matches!(e, lchfs_fsck::FsckError::ReplicaCorrupt { vdev_id: 0, .. })),
+        "{:?}",
+        report.errors
+    );
+}
+
+/// The engine's own repair leaves the pool clean by fsck's independent
+/// reckoning -- a heal segment on one device is a legitimate replica, not
+/// a divergence.
+#[test]
+fn a_healed_pool_compares_clean() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    setup_replicated_pool(a.path(), b.path());
+    for path in data_segments(b.path()) {
+        let mut bytes = std::fs::read(&path).unwrap();
+        if bytes.len() > 8192 {
+            let mid = bytes.len() / 2;
+            for x in &mut bytes[mid..mid + 64] {
+                *x ^= 0xff;
+            }
+            std::fs::write(&path, &bytes).unwrap();
+        }
+    }
+    {
+        let pool = Pool::open_replicated(&[a.path(), b.path()]).unwrap();
+        let reports = pool.scrub().unwrap();
+        assert!(reports[1].healed > 0, "{reports:?}");
+        pool.checkpoint().unwrap();
+    }
+    let report = lchfs_fsck::check_replicas(&[a.path(), b.path()]);
+    assert!(report.is_clean(), "{:?}", report.errors);
+}
+
+#[test]
+fn a_device_left_behind_by_a_degraded_mount_is_flagged() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    setup_replicated_pool(a.path(), b.path());
+    {
+        let pool = Pool::open_degraded(&[a.path()]).unwrap();
+        let ino = pool.create_file(1, "later", 0o644).unwrap();
+        pool.write(ino, 0, &deterministic_bytes(9, 20_000)).unwrap();
+        pool.checkpoint().unwrap();
+    }
+    let report = lchfs_fsck::check_replicas(&[a.path(), b.path()]);
+    assert!(
+        report.errors.iter().any(|e| matches!(e, lchfs_fsck::FsckError::VdevBehind { vdev_id: 1, .. })),
+        "{:?}",
+        report.errors
+    );
+    assert!(
+        report.errors.iter().any(|e| matches!(e, lchfs_fsck::FsckError::ReplicaMissing { vdev_id: 1, .. })),
+        "the records written while b was away should be missing from it: {:?}",
+        report.errors
+    );
+
+    // Checked with only vdev 0 present, the absence itself is the finding.
+    let alone = lchfs_fsck::check_replicas(&[a.path()]);
+    assert!(
+        alone.errors.iter().any(|e| matches!(e, lchfs_fsck::FsckError::VdevAbsent { vdev_id: 1 })),
+        "{:?}",
+        alone.errors
+    );
+}
+
+#[test]
+fn a_foreign_device_stops_the_comparison() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    setup_replicated_pool(a.path(), b.path());
+    drop(Pool::create(other.path(), small_params()).unwrap());
+    let report = lchfs_fsck::check_replicas(&[a.path(), other.path()]);
+    assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+    assert!(matches!(report.errors[0], lchfs_fsck::FsckError::ForeignVdev { .. }));
+    assert_eq!(report.objects_visited, 0, "no records should be compared with a foreign device");
+}
