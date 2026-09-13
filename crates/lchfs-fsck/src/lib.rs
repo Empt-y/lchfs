@@ -495,7 +495,7 @@ pub fn verify_index(pool_root: &Path, live_roots: &[Hash32]) -> FsckReport {
 /// authoritative -- this is the explicit full-rebuild path). Checkpoints
 /// at the current superblock's generation so the next `Pool::open` can
 /// take the fast (index-trusting) mount path.
-pub fn rebuild_index(pool_root: &Path) -> Result<(), FsckError> {
+pub fn rebuild_index(pool_root: &Path, other_vdevs: &[&Path]) -> Result<(), FsckError> {
     // Unlike the read-only checks, this rewrites INDEX.redb (and may delete
     // and recreate it), so it must not run against a live mount. Read-only
     // fsck deliberately takes no lock: the append-only, fsync-ordered format
@@ -503,24 +503,35 @@ pub fn rebuild_index(pool_root: &Path) -> Result<(), FsckError> {
     // mount is writing.
     let _lock = lchfs_store::lock_pool(pool_root)
         .map_err(|e| FsckError::PoolLocked(format!("{e}")))?;
-    let locations = scan_all_segments(pool_root)?;
-    // Same slot supplies the generation and this device's vdev_id -- the
-    // rebuilt entries describe *this* vdev's copies (ARCHITECTURE.md §15.1).
     let slot = read_superblock(pool_root)?;
     let generation = slot.generation;
 
-    let index_path = pool_root.join("INDEX.redb");
-    let mut index = match RedbIndex::open(&index_path) {
-        Ok(idx) => idx,
-        Err(_) => {
-            let _ = std::fs::remove_file(&index_path);
-            RedbIndex::create(&index_path).map_err(|e| FsckError::Io(e.to_string()))?
+    // The index lives on vdev 0 but describes every device's copies
+    // (ARCHITECTURE.md §15.1), so every device given is scanned and its
+    // entries written under its own vdev_id -- the id its superblock
+    // claims, not its position in the list. A rebuild from the primary
+    // alone would leave read failover with nothing to fail over to.
+    let mut scans: Vec<(u16, HashMap<Hash32, ExtentLocation>)> = vec![(slot.vdev_id, scan_all_segments(pool_root)?)];
+    for root in other_vdevs {
+        let other = read_superblock(root)?;
+        if other.pool_uuid != slot.pool_uuid {
+            return Err(FsckError::ForeignVdev { root: root.display().to_string() });
         }
-    };
-    for (&hash, &loc) in &locations {
-        index
-            .put_chunk_location(hash, slot.vdev_id, loc)
-            .map_err(|e| FsckError::Io(e.to_string()))?;
+        scans.push((other.vdev_id, scan_all_segments(root)?));
+    }
+
+    let index_path = pool_root.join("INDEX.redb");
+    // Always start from an empty file: a rebuild that kept old entries
+    // would keep an entry for a replica that no longer exists, which is
+    // exactly the kind of stale pointer a rebuild is asked to clear.
+    let _ = std::fs::remove_file(&index_path);
+    let mut index = RedbIndex::create(&index_path).map_err(|e| FsckError::Io(e.to_string()))?;
+    for (vdev_id, locations) in &scans {
+        for (&hash, &loc) in locations {
+            index
+                .put_chunk_location(hash, *vdev_id, loc)
+                .map_err(|e| FsckError::Io(e.to_string()))?;
+        }
     }
     index
         .checkpoint(generation)

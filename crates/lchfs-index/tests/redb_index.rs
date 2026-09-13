@@ -163,3 +163,24 @@ fn iter_all_lists_every_replica_and_delete_forgets_one() {
     index.delete_chunk_location(b, 5).unwrap();
     assert_eq!(index.chunk_locations(b).unwrap(), vec![(0, loc(20))]);
 }
+
+#[test]
+fn delete_vdev_locations_forgets_one_slot_and_leaves_the_rest() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut index = RedbIndex::create(&dir.path().join("INDEX.redb")).unwrap();
+    let loc = |segment_id| ExtentLocation {
+        segment_id,
+        offset: 4096,
+        len: 10,
+    };
+    for i in 0..5u8 {
+        let h = Hash32([i; 32]);
+        index.put_chunk_location(h, 0, loc(1)).unwrap();
+        index.put_chunk_location(h, 1, loc(2)).unwrap();
+    }
+    assert_eq!(index.delete_vdev_locations(1).unwrap(), 5);
+    assert_eq!(index.delete_vdev_locations(1).unwrap(), 0);
+    let all = index.iter_all_chunk_locations().unwrap();
+    assert_eq!(all.len(), 5);
+    assert!(all.iter().all(|(_, v, _)| *v == 0));
+}

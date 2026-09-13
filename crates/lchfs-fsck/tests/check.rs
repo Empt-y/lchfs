@@ -122,7 +122,7 @@ fn rebuild_index_produces_a_pool_that_reopens_correctly() {
     drop(pool);
 
     std::fs::remove_file(dir.path().join("INDEX.redb")).unwrap();
-    lchfs_fsck::rebuild_index(dir.path()).unwrap();
+    lchfs_fsck::rebuild_index(dir.path(), &[]).unwrap();
 
     let pool2 = Pool::open(dir.path()).unwrap();
     assert_eq!(pool2.lookup(1, "a").unwrap(), pool2.lookup(1, "b").unwrap());
@@ -299,4 +299,36 @@ fn a_foreign_device_stops_the_comparison() {
     assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
     assert!(matches!(report.errors[0], lchfs_fsck::FsckError::ForeignVdev { .. }));
     assert_eq!(report.objects_visited, 0, "no records should be compared with a foreign device");
+}
+
+/// A rebuilt index has to describe every device, or read failover has
+/// nothing to fail over to. Proven the direct way: rebuild, then lose vdev
+/// 0's data and read everything through the pool.
+#[test]
+fn rebuild_index_records_every_vdevs_replicas() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    setup_replicated_pool(a.path(), b.path());
+    std::fs::remove_file(a.path().join("INDEX.redb")).unwrap();
+
+    lchfs_fsck::rebuild_index(a.path(), &[b.path()]).unwrap();
+
+    for f in data_segments(a.path()) {
+        std::fs::remove_file(f).unwrap();
+    }
+    let pool = Pool::open_replicated(&[a.path(), b.path()]).unwrap();
+    let ino = pool.lookup(1, "chunked.bin").unwrap().unwrap();
+    assert_eq!(pool.read(ino, 0, 40_000).unwrap().as_ref(), deterministic_bytes(7, 40_000).as_slice());
+    assert!(pool.repair_stats().failovers >= 1, "reads should have come from vdev b");
+}
+
+#[test]
+fn rebuild_index_refuses_a_foreign_device() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    setup_replicated_pool(a.path(), b.path());
+    drop(Pool::create(other.path(), small_params()).unwrap());
+    let err = lchfs_fsck::rebuild_index(a.path(), &[other.path()]).unwrap_err();
+    assert!(matches!(err, lchfs_fsck::FsckError::ForeignVdev { .. }), "{err}");
 }

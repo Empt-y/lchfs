@@ -207,6 +207,33 @@ impl RedbIndex {
         Ok(out)
     }
 
+    /// Forgets every entry for one vdev, returning how many there were.
+    /// What replacing a device needs: the slot's old entries describe
+    /// copies on hardware that is gone, and a resilver that trusted them
+    /// would copy nothing onto the blank replacement.
+    pub fn delete_vdev_locations(&mut self, vdev_id: u16) -> Result<usize, IndexError> {
+        let mut txn = self.db.begin_write().map_err(err)?;
+        txn.set_durability(Durability::Immediate).map_err(err)?;
+        let removed = {
+            let mut table = txn.open_table(CHUNK_LOCATIONS).map_err(err)?;
+            let doomed: Vec<Vec<u8>> = table
+                .iter()
+                .map_err(err)?
+                .filter_map(|entry| {
+                    let (k, _) = entry.ok()?;
+                    let (_, v) = decode_chunk_key(k.value()).ok()?;
+                    (v == vdev_id).then(|| k.value().to_vec())
+                })
+                .collect();
+            for key in &doomed {
+                table.remove(key.as_slice()).map_err(err)?;
+            }
+            doomed.len()
+        };
+        txn.commit().map_err(err)?;
+        Ok(removed)
+    }
+
     /// Forgets one replica's entry. Not used by the engine itself -- a
     /// device that misses writes simply never gets the entry -- but it is
     /// how a test manufactures that state without taking a vdev offline.

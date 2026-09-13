@@ -709,109 +709,92 @@ impl Pool {
         Self::open_set(vdev_roots, true)
     }
 
+    /// Adds a blank device to an existing pool, offline (ARCHITECTURE.md
+    /// §15.10: "adding a device is a resilver rather than a migration").
+    /// `vdev_roots` is the pool's current set; `new_root` must hold no pool.
+    /// Returns the slot the device was given.
+    ///
+    /// Two cases, one operation. With every slot occupied, the pool grows:
+    /// each existing device's current superblock slot is rewritten in
+    /// place with `vdev_count + 1` (same generation, so the same ring
+    /// slot -- nothing older is left to win a tie), and the new device
+    /// gets the last id. With exactly one slot empty, the new device
+    /// takes that slot and nothing else changes -- which is how a dead
+    /// device is replaced. In both cases the new device is written at
+    /// generation 0, so the next `open_replicated` sees it trailing and
+    /// resilvers everything onto it before the pool serves.
+    ///
+    /// Offline because the fan-out writers hold their device list for the
+    /// life of a mount; growing that list under a live writer is a
+    /// different piece of work.
+    pub fn attach_vdev(vdev_roots: &[&Path], new_root: &Path) -> Result<u16, PoolError> {
+        let membership = check_membership(vdev_roots, true)?;
+        let (new_id, new_count) = match membership.missing_vdevs.as_slice() {
+            [] => (membership.vdev_count, membership.vdev_count + 1),
+            [one] => (*one, membership.vdev_count),
+            many => {
+                return Err(PoolError::InvalidArgument(format!(
+                    "pool is missing vdevs {many:?}; attach replaces one device at a time"
+                )));
+            }
+        };
+
+        // Hold every lock for the duration: nobody may mount while the
+        // count is being changed underneath them.
+        let mut locks = Vec::with_capacity(vdev_roots.len() + 1);
+        for root in vdev_roots {
+            locks.push(acquire_pool_lock(root)?);
+        }
+        std::fs::create_dir_all(new_root)?;
+        locks.push(acquire_pool_lock(new_root)?);
+        let new_backend = FileBackend::open(new_root)?;
+        if read_superblock(&new_backend)?.is_some() {
+            return Err(PoolError::AlreadyExists(new_root.display().to_string()));
+        }
+
+        // Existing members first. If this is interrupted part-way, the
+        // pool reads as "N+1 vdevs with slot N missing", which is exactly
+        // the state a rerun handles as a replacement.
+        if new_count != membership.vdev_count {
+            for (slot, root) in &membership.members {
+                let backend = FileBackend::open(root)?;
+                let mut updated = *slot;
+                updated.vdev_count = new_count;
+                finalize_superblock_slot_checksum(&mut updated);
+                write_superblock_slot(&backend, &updated)?;
+            }
+        }
+        // Whatever the index remembers about this slot describes copies on
+        // a device that is gone (replacement) or never existed (growth
+        // after an interrupted attach). Left in place, resilver would see
+        // every hash as already present and copy nothing. No index at all
+        // is fine: the next mount rebuilds one from every device it has.
+        let index_file = index_path(vdev_roots[0]);
+        if index_file.exists()
+            && let Ok(mut index) = RedbIndex::open(&index_file)
+        {
+            let dropped = index.delete_vdev_locations(new_id)?;
+            if dropped > 0 {
+                tracing::info!("attach: dropped {dropped} stale index entries for vdev {new_id}");
+            }
+        }
+
+        let mut fresh = membership.members[0].0;
+        fresh.vdev_id = new_id;
+        fresh.vdev_count = new_count;
+        fresh.generation = 0;
+        finalize_superblock_slot_checksum(&mut fresh);
+        write_superblock_slot(&new_backend, &fresh)?;
+        Ok(new_id)
+    }
+
     fn open_set(given_roots: &[&Path], allow_missing: bool) -> Result<Self, PoolError> {
-        if given_roots.is_empty() {
-            return Err(PoolError::InvalidArgument(
-                "a pool needs at least one vdev".into(),
-            ));
-        }
-        // Read every superblock first, so membership is judged on what the
-        // devices say about themselves and not on the order they were
-        // named in.
-        let mut members: Vec<(SuperblockSlot, &Path)> = Vec::with_capacity(given_roots.len());
-        for root in given_roots {
-            let backend = FileBackend::open(root)?;
-            let slot = read_superblock(&backend)?.ok_or_else(|| {
-                PoolError::Format(format!(
-                    "no valid superblock found at {} — was create-pool run?",
-                    root.display()
-                ))
-            })?;
-            members.push((slot, root));
-        }
-
-        // Membership check (§15.6), before anything trusts these devices.
-        let expected_uuid = members[0].0.pool_uuid;
-        let vdev_count = members[0].0.vdev_count;
-        for (s, root) in &members {
-            if s.pool_uuid != expected_uuid {
-                return Err(PoolError::Format(format!(
-                    "{} belongs to a different pool — refusing to mount it as a member",
-                    root.display()
-                )));
-            }
-            if s.vdev_count != vdev_count {
-                return Err(PoolError::Format(format!(
-                    "{} says the pool has {} vdevs but {} says {}",
-                    root.display(),
-                    s.vdev_count,
-                    members[0].1.display(),
-                    vdev_count
-                )));
-            }
-        }
-        if !allow_missing {
-            if members.len() != vdev_count as usize {
-                return Err(PoolError::Format(format!(
-                    "{} says the pool has {} vdevs but {} were given",
-                    members[0].1.display(),
-                    vdev_count,
-                    members.len()
-                )));
-            }
-            for (idx, (s, root)) in members.iter().enumerate() {
-                if s.vdev_id as usize != idx {
-                    return Err(PoolError::Format(format!(
-                        "{} is vdev {} but was given in position {idx} — devices must be passed in vdev_id order",
-                        root.display(),
-                        s.vdev_id
-                    )));
-                }
-            }
-        }
-        members.sort_by_key(|(s, _)| s.vdev_id);
-        for pair in members.windows(2) {
-            if pair[0].0.vdev_id == pair[1].0.vdev_id {
-                return Err(PoolError::Format(format!(
-                    "{} and {} both claim to be vdev {}",
-                    pair[0].1.display(),
-                    pair[1].1.display(),
-                    pair[0].0.vdev_id
-                )));
-            }
-        }
-        if members[0].0.vdev_id != PRIMARY_VDEV_ID {
-            return Err(PoolError::Format(format!(
-                "vdev {PRIMARY_VDEV_ID} is not among the devices given — it holds the index and cannot be absent yet"
-            )));
-        }
-        let present: HashSet<u16> = members.iter().map(|(s, _)| s.vdev_id).collect();
-        let missing_vdevs: Vec<u16> = (0..vdev_count).filter(|id| !present.contains(id)).collect();
-
-        // §15.5: the highest generation across the set is the truth. The
-        // primary must hold it, because the index and every default read
-        // live there; a primary that is *behind* another device would need
-        // that device promoted, which is not done yet. Refusing is the
-        // honest answer -- mounting would serve an old root while newer
-        // data sits on the other device, unreachable.
-        let newest = members.iter().map(|(s, _)| s.generation).max().unwrap_or(0);
-        if members[0].0.generation < newest {
-            let ahead: Vec<String> = members
-                .iter()
-                .filter(|(s, _)| s.generation == newest)
-                .map(|(s, r)| format!("vdev {} at {}", s.vdev_id, r.display()))
-                .collect();
-            return Err(PoolError::Format(format!(
-                "vdev 0 is at generation {} but {} at generation {newest}: cannot mount from a stale primary",
-                members[0].0.generation,
-                ahead.join(", ")
-            )));
-        }
-        let stale_vdevs: Vec<u16> = members
-            .iter()
-            .filter(|(s, _)| s.generation < newest)
-            .map(|(s, _)| s.vdev_id)
-            .collect();
+        let Membership {
+            members,
+            missing_vdevs,
+            stale_vdevs,
+            ..
+        } = check_membership(given_roots, allow_missing)?;
 
         let vdev_roots: Vec<&Path> = members.iter().map(|(_, r)| *r).collect();
         let pool_root = vdev_roots[0];
@@ -846,7 +829,7 @@ impl Pool {
                 let mut readers = HashMap::new();
                 let mut locations = HashMap::new();
                 let max_segment_id = scan_segments(pool_root, &mut readers, &mut locations)?;
-                let index = rebuild_index(&index_file, &locations, slot.vdev_id, slot.generation)?;
+                let index = rebuild_index(&index_file, &locations, &vdevs, slot.generation)?;
                 // The slow path's full scan already covers every segment
                 // unconditionally, so it has no analog of the fast path's
                 // "index might be missing recent, un-checkpointed
@@ -4053,8 +4036,8 @@ fn scan_segments(
 /// missing or corrupt.
 fn rebuild_index(
     index_file: &Path,
-    locations: &HashMap<Hash32, ExtentLocation>,
-    vdev_id: u16,
+    primary_locations: &HashMap<Hash32, ExtentLocation>,
+    vdevs: &[Vdev],
     generation: u64,
 ) -> Result<RedbIndex, PoolError> {
     let mut index = match RedbIndex::open(index_file) {
@@ -4064,8 +4047,25 @@ fn rebuild_index(
             RedbIndex::create(index_file)?
         }
     };
-    for (&hash, &loc) in locations {
-        index.put_chunk_location(hash, vdev_id, loc)?;
+    // The primary's scan is already in hand; every other device gets its
+    // own, because its copies sit at its own offsets and an index that
+    // knew only the primary's would leave read failover with nothing to
+    // fail over to (§15.1).
+    for vdev in vdevs {
+        if vdev.id == PRIMARY_VDEV_ID {
+            for (&hash, &loc) in primary_locations {
+                index.put_chunk_location(hash, vdev.id, loc)?;
+            }
+            continue;
+        }
+        let (readers, _) = open_all_segment_readers(&vdev.root)?;
+        let mut locations = HashMap::new();
+        for (&(_, segment_id, _), reader) in &readers {
+            scan_one_segment(reader, segment_id, &mut locations)?;
+        }
+        for (hash, loc) in locations {
+            index.put_chunk_location(hash, vdev.id, loc)?;
+        }
     }
     index.checkpoint(generation)?;
     Ok(index)
@@ -4134,6 +4134,131 @@ fn owner_shard_rescan(
 /// writers that deliberately never open a `Pool` -- notably `lchfs-fsck`'s
 /// `rebuild_index`, which rewrites (and may delete and recreate)
 /// `INDEX.redb` -- can take the same guard instead of racing a live mount.
+/// What a set of devices says about itself, once every superblock has been
+/// read and the identity checks of §15.6 have passed. `members` is sorted
+/// by `vdev_id`, with vdev 0 first.
+struct Membership<'a> {
+    members: Vec<(SuperblockSlot, &'a Path)>,
+    vdev_count: u16,
+    /// Slots with no device among `members`.
+    missing_vdevs: Vec<u16>,
+    /// Members whose generation trails the newest -- they missed writes.
+    stale_vdevs: Vec<u16>,
+}
+
+/// Reads every superblock and judges membership on what the devices say
+/// about themselves, not on the order they were named in: same
+/// `pool_uuid`, same `vdev_count`, distinct `vdev_id`s, vdev 0 present and
+/// holding the newest generation. With `allow_missing` false the set must
+/// also be complete and given in `vdev_id` order.
+fn check_membership<'a>(given_roots: &[&'a Path], allow_missing: bool) -> Result<Membership<'a>, PoolError> {
+    if given_roots.is_empty() {
+        return Err(PoolError::InvalidArgument(
+            "a pool needs at least one vdev".into(),
+        ));
+    }
+    let mut members: Vec<(SuperblockSlot, &Path)> = Vec::with_capacity(given_roots.len());
+    for root in given_roots {
+        let backend = FileBackend::open(root)?;
+        let slot = read_superblock(&backend)?.ok_or_else(|| {
+            PoolError::Format(format!(
+                "no valid superblock found at {} — was create-pool run?",
+                root.display()
+            ))
+        })?;
+        members.push((slot, root));
+    }
+
+    let expected_uuid = members[0].0.pool_uuid;
+    let vdev_count = members[0].0.vdev_count;
+    for (s, root) in &members {
+        if s.pool_uuid != expected_uuid {
+            return Err(PoolError::Format(format!(
+                "{} belongs to a different pool — refusing to mount it as a member",
+                root.display()
+            )));
+        }
+        if s.vdev_count != vdev_count {
+            return Err(PoolError::Format(format!(
+                "{} says the pool has {} vdevs but {} says {}",
+                root.display(),
+                s.vdev_count,
+                members[0].1.display(),
+                vdev_count
+            )));
+        }
+    }
+    if !allow_missing {
+        if members.len() != vdev_count as usize {
+            return Err(PoolError::Format(format!(
+                "{} says the pool has {} vdevs but {} were given",
+                members[0].1.display(),
+                vdev_count,
+                members.len()
+            )));
+        }
+        for (idx, (s, root)) in members.iter().enumerate() {
+            if s.vdev_id as usize != idx {
+                return Err(PoolError::Format(format!(
+                    "{} is vdev {} but was given in position {idx} — devices must be passed in vdev_id order",
+                    root.display(),
+                    s.vdev_id
+                )));
+            }
+        }
+    }
+    members.sort_by_key(|(s, _)| s.vdev_id);
+    for pair in members.windows(2) {
+        if pair[0].0.vdev_id == pair[1].0.vdev_id {
+            return Err(PoolError::Format(format!(
+                "{} and {} both claim to be vdev {}",
+                pair[0].1.display(),
+                pair[1].1.display(),
+                pair[0].0.vdev_id
+            )));
+        }
+    }
+    if members[0].0.vdev_id != PRIMARY_VDEV_ID {
+        return Err(PoolError::Format(format!(
+            "vdev {PRIMARY_VDEV_ID} is not among the devices given — it holds the index and cannot be absent yet"
+        )));
+    }
+    let present: HashSet<u16> = members.iter().map(|(s, _)| s.vdev_id).collect();
+    let missing_vdevs: Vec<u16> = (0..vdev_count).filter(|id| !present.contains(id)).collect();
+
+    // §15.5: the highest generation across the set is the truth. The
+    // primary must hold it, because the index and every default read live
+    // there; a primary that is *behind* another device would need that
+    // device promoted, which is not done yet. Refusing is the honest
+    // answer -- mounting would serve an old root while newer data sits on
+    // the other device, unreachable.
+    let newest = members.iter().map(|(s, _)| s.generation).max().unwrap_or(0);
+    if members[0].0.generation < newest {
+        let ahead: Vec<String> = members
+            .iter()
+            .filter(|(s, _)| s.generation == newest)
+            .map(|(s, r)| format!("vdev {} at {}", s.vdev_id, r.display()))
+            .collect();
+        return Err(PoolError::Format(format!(
+            "vdev 0 is at generation {} but {} at generation {newest}: cannot mount from a stale primary",
+            members[0].0.generation,
+            ahead.join(", ")
+        )));
+    }
+    let stale_vdevs: Vec<u16> = members
+        .iter()
+        .filter(|(s, _)| s.generation < newest)
+        .map(|(s, _)| s.vdev_id)
+        .collect();
+
+    Ok(Membership {
+        members,
+        vdev_count,
+        missing_vdevs,
+        stale_vdevs,
+    })
+}
+
 fn acquire_pool_lock(pool_root: &Path) -> Result<Flock<std::fs::File>, PoolError> {
     let path = pool_root.join("LOCK");
     let file = std::fs::OpenOptions::new()

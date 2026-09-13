@@ -128,7 +128,7 @@ fn fsck_rebuild_index_is_refused_while_a_pool_is_locked() {
     let pool = Pool::create(dir.path(), small_params()).unwrap();
     pool.checkpoint().unwrap();
 
-    let result = lchfs_fsck::rebuild_index(dir.path());
+    let result = lchfs_fsck::rebuild_index(dir.path(), &[]);
     assert!(
         matches!(result, Err(lchfs_fsck::FsckError::PoolLocked(_))),
         "expected PoolLocked, got {result:?}"
@@ -136,5 +136,5 @@ fn fsck_rebuild_index_is_refused_while_a_pool_is_locked() {
     drop(pool);
 
     // ...and succeeds once the pool is released.
-    lchfs_fsck::rebuild_index(dir.path()).expect("rebuild should work once unlocked");
+    lchfs_fsck::rebuild_index(dir.path(), &[]).expect("rebuild should work once unlocked");
 }

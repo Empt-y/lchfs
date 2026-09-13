@@ -31,6 +31,17 @@ enum Command {
         #[arg(long)]
         rebuild_index: bool,
     },
+    /// Add a blank device to a pool, or replace a dead one, offline
+    /// (ARCHITECTURE.md §15.10). The next mount resilvers onto it.
+    AttachVdev {
+        /// vdev 0's root.
+        pool: PathBuf,
+        /// The pool's other current devices, if any.
+        #[arg(long = "vdev")]
+        vdevs: Vec<PathBuf>,
+        /// The blank device to add.
+        new_device: PathBuf,
+    },
     /// Snapshot management (ARCHITECTURE.md §6).
     Snapshot {
         #[command(subcommand)]
@@ -56,6 +67,16 @@ pub fn run() -> anyhow::Result<()> {
         Command::Mount { pool, mountpoint } => mount(&pool, &mountpoint),
         Command::Fsck { pool, vdevs, verify_index, rebuild_index } => {
             fsck(&pool, &vdevs, verify_index, rebuild_index)
+        }
+        Command::AttachVdev { pool, vdevs, new_device } => {
+            let mut roots: Vec<&std::path::Path> = vec![pool.as_path()];
+            roots.extend(vdevs.iter().map(|p| p.as_path()));
+            let id = lchfs_store::Pool::attach_vdev(&roots, &new_device)?;
+            println!(
+                "{} attached as vdev {id}. Mount with every device to resilver it.",
+                new_device.display()
+            );
+            Ok(())
         }
         Command::Snapshot { action } => snapshot(action),
         Command::Stats { pool } => stats(&pool),
@@ -98,8 +119,9 @@ fn fsck(
     // time crash recovery and spawn its background checkpoint/coalesce/
     // dedup threads, neither of which this one-shot diagnostic needs.
     if rebuild_index {
-        lchfs_fsck::rebuild_index(pool)?;
-        println!("INDEX.redb rebuilt.");
+        let others: Vec<&std::path::Path> = other_vdevs.iter().map(|p| p.as_path()).collect();
+        lchfs_fsck::rebuild_index(pool, &others)?;
+        println!("INDEX.redb rebuilt from {} vdev(s).", others.len() + 1);
     }
 
     let live_roots = lchfs_fsck::collect_live_roots(pool)?;
