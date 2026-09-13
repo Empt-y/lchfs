@@ -1365,6 +1365,14 @@ impl Pool {
         self.0.attach_vdev_live(new_root)
     }
 
+    /// Brings a device that has data back into a mounted pool: one that
+    /// faulted under this mount, or one that was absent when it was
+    /// mounted. Copies only what it missed. Returns the slot and what was
+    /// copied.
+    pub fn online_vdev(&self, root: &Path) -> Result<(u16, ResilverReport), PoolError> {
+        self.0.online_vdev(root)
+    }
+
     /// What mount-time resilvering did, per vdev that needed it. Empty when
     /// every device was already at the primary's generation.
     pub fn mount_resilver(&self) -> &[(u16, ResilverReport)] {
@@ -2692,10 +2700,121 @@ impl PoolShared {
         // device that is gone; see `attach_vdev`. Done before the slot is
         // online, so no live write can record into it in between.
         self.persisted_index.write().delete_vdev_locations(new_id)?;
+        let member = VdevSet::member(Vdev::new(new_id, new_root.to_path_buf()), backend, lock);
+        let report = self.join_live(member)?;
+        tracing::info!(
+            "attached {} as vdev {new_id}: {} records copied, {} unrecoverable",
+            new_root.display(),
+            report.healed,
+            report.unrecoverable.len()
+        );
+        Ok((new_id, report))
+    }
 
+    /// Brings back a device that has data: one that faulted under this
+    /// mount, or one that was absent at mount and is now plugged in. The
+    /// counterpart of `attach_vdev_live` for a non-blank device, and the
+    /// live counterpart of the resilver a mount runs for a stale member.
+    ///
+    /// Its old index entries are kept: they describe records it really
+    /// holds, and the resilver copies only what it lacks -- the delta,
+    /// which is §15.5's whole argument. If it faulted under this mount
+    /// its lock and ring are still held and are reused; if it was absent
+    /// they are acquired now.
+    fn online_vdev(&self, root: &Path) -> Result<(u16, ResilverReport), PoolError> {
+        let _one_at_a_time = self.attach_lock.lock();
+        if !backend::superblock_path(root).exists() {
+            return Err(PoolError::Format(format!(
+                "{} holds no superblock; a blank device is attached, not brought online",
+                root.display()
+            )));
+        }
+        let probe = FileBackend::open(root)?;
+        let slot = read_superblock(&probe)?.ok_or_else(|| {
+            PoolError::Format(format!("no valid superblock found at {}", root.display()))
+        })?;
+        if slot.pool_uuid != self.pool_uuid {
+            return Err(PoolError::Format(format!(
+                "{} belongs to a different pool",
+                root.display()
+            )));
+        }
+        let id = slot.vdev_id;
+        if self.vdevs.is_online(id) {
+            return Err(PoolError::InvalidArgument(format!("vdev {id} is already online")));
+        }
+        if id >= self.vdevs.count() {
+            return Err(PoolError::Format(format!(
+                "{} claims to be vdev {id} of a pool with {} slots",
+                root.display(),
+                self.vdevs.count()
+            )));
+        }
+        let current = self.namespace.lock().generation;
+        if slot.generation > current {
+            return Err(PoolError::Format(format!(
+                "{} is at generation {} but this mount is at {current}; it cannot be behind a device that is ahead of it",
+                root.display(),
+                slot.generation
+            )));
+        }
+        drop(probe);
+
+        let member = match self.vdevs.take_faulted(id) {
+            Some(member) => {
+                if member.vdev.root != root {
+                    return Err(PoolError::InvalidArgument(format!(
+                        "vdev {id} faulted at {} and is being brought back at {}; give the same path",
+                        member.vdev.root.display(),
+                        root.display()
+                    )));
+                }
+                member
+            }
+            None => {
+                let lock = acquire_pool_lock(root)?;
+                let backend = FileBackend::open(root)?;
+                VdevSet::member(Vdev::new(id, root.to_path_buf()), backend, lock)
+            }
+        };
+        let report = self.join_live(member)?;
+        tracing::info!(
+            "vdev {id} at {} back online: {} records copied, {} unrecoverable",
+            root.display(),
+            report.healed,
+            report.unrecoverable.len()
+        );
+        Ok((id, report))
+    }
+
+    /// The sequence both `attach_vdev_live` and `online_vdev` end with.
+    /// The order is what makes it safe under load:
+    ///
+    /// 1. The device joins the online set, marked as catching up, so
+    ///    checkpoints leave its superblock alone until step 4.
+    /// 2. Every fan-out writer -- each shard's data writer, the meta
+    ///    writer, each shard's delta log -- is rolled to a fresh segment
+    ///    under its own lock. That is the whole barrier, and it costs the
+    ///    write path nothing: a record is indexed by the committer under
+    ///    the same shard lock before its write is acknowledged (and a meta
+    ///    object under the meta lock), so once a writer has been rolled,
+    ///    everything on its previous segment is already in the index,
+    ///    under that segment's slots -- which do not include the new
+    ///    device, which is true, and exactly what step 3 is for. After
+    ///    this, nothing appended anywhere can miss the new device.
+    /// 3. The device is resilvered from the index. Everything before the
+    ///    rollover is there; everything after fanned out to the device
+    ///    directly.
+    /// 4. The device stops catching up and a checkpoint publishes every
+    ///    member's superblock.
+    ///
+    /// A crash before step 4 leaves the device's superblock behind (or,
+    /// for a blank device, absent); the pool reads as one slot short or
+    /// stale and mounts degraded or resilvers, and a rerun finishes it.
+    fn join_live(&self, member: vdevs::Member) -> Result<ResilverReport, PoolError> {
+        let id = member.vdev.id;
         // 1.
-        self.vdevs
-            .attach(VdevSet::member(Vdev::new(new_id, new_root.to_path_buf()), backend, lock));
+        self.vdevs.attach(member);
 
         // 2.
         self.committer_pool.roll_all_writers()?;
@@ -2710,18 +2829,12 @@ impl PoolShared {
         // there is nothing to tell them.
 
         // 3.
-        let report = self.resilver(new_id)?;
+        let report = self.resilver(id)?;
 
         // 4.
-        self.vdevs.finish_catch_up(new_id);
+        self.vdevs.finish_catch_up(id);
         self.run_checkpoint()?;
-        tracing::info!(
-            "attached {} as vdev {new_id}: {} records copied, {} unrecoverable",
-            new_root.display(),
-            report.healed,
-            report.unrecoverable.len()
-        );
-        Ok((new_id, report))
+        Ok(report)
     }
 
     /// Gets (creating if absent) the per-inode lock serializing this

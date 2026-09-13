@@ -203,6 +203,14 @@ impl VdevSet {
         state.members.sort_by_key(|m| m.vdev.id);
     }
 
+    /// Takes a faulted member back out of the set, for `online_vdev` to
+    /// re-admit through `attach` once the device is known to work again.
+    pub(crate) fn take_faulted(&self, id: u16) -> Option<Member> {
+        let mut state = self.state.write();
+        let pos = state.faulted.iter().position(|m| m.vdev.id == id)?;
+        Some(state.faulted.remove(pos))
+    }
+
     pub(crate) fn finish_catch_up(&self, id: u16) {
         self.state.write().catching_up.remove(&id);
     }
