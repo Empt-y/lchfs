@@ -198,3 +198,49 @@ fn a_detach_interrupted_between_survivors_is_recoverable() {
     assert!(!pool.is_degraded());
     assert_eq!(read_file(&pool, "f", data.len()), data);
 }
+
+// ---- Live ----------------------------------------------------------------
+
+/// The same proof as the offline detach, on a mounted pool, with writes
+/// continuing afterwards on the smaller set.
+#[test]
+fn a_device_leaves_a_mounted_pool() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let one = payload(51);
+    let two = payload(52);
+    let pool = Pool::create_replicated(&[a.path(), b.path()], small_params()).unwrap();
+    let ino = pool.create_file(1, "one", 0o644).unwrap();
+    pool.write(ino, 0, &one).unwrap();
+    pool.checkpoint().unwrap();
+
+    assert_eq!(pool.detach_vdev_live().unwrap(), 1);
+    assert_eq!(pool.vdev_status().len(), 1, "{:?}", pool.vdev_status());
+    assert!(!pool.is_degraded());
+    assert!(!b.path().join("SUPERBLOCK").exists());
+
+    let ino2 = pool.create_file(1, "two", 0o644).unwrap();
+    pool.write(ino2, 0, &two).unwrap();
+    pool.checkpoint().unwrap();
+    assert_eq!(read_file(&pool, "one", one.len()), one);
+    drop(pool);
+
+    // A plain single-device pool now, and b is no member of anything.
+    let pool = Pool::open(a.path()).unwrap();
+    assert_eq!(read_file(&pool, "two", two.len()), two);
+    assert!(Pool::open_replicated(&[a.path(), b.path()]).is_err());
+    let err = pool.detach_vdev_live().unwrap_err().to_string();
+    assert!(err.contains("nothing to detach"), "{err}");
+}
+
+#[test]
+fn the_primary_cannot_leave_while_mounted() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    drop(Pool::create_replicated(&[a.path(), b.path()], small_params()).unwrap());
+    // Mount without vdev 0: vdev 1 is the primary *and* the last slot.
+    let pool = Pool::open_degraded(&[b.path()]).unwrap();
+    assert_eq!(pool.primary_vdev(), 1);
+    let err = pool.detach_vdev_live().unwrap_err().to_string();
+    assert!(err.contains("primary"), "{err}");
+}

@@ -236,6 +236,7 @@ pub fn handle(pool: &Pool, request: &Value) -> anyhow::Result<Value> {
                 .collect::<Vec<_>>()))
         }
         "promote" => Ok(json!({ "primary": pool.promote_primary()? })),
+        "detach" => Ok(json!({ "detached": pool.detach_vdev_live()? })),
         other => anyhow::bail!("unknown command {other:?}"),
     }
 }

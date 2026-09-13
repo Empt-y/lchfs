@@ -108,6 +108,9 @@ enum PoolAction {
     Offline { root: PathBuf, vdev: u16 },
     /// Replace a faulted primary now rather than waiting for the failover task.
     Promote { root: PathBuf },
+    /// Remove the highest-numbered device while mounted, after proving
+    /// the rest can stand alone.
+    Detach { root: PathBuf },
     /// Every corruption detected since mount, with what was done about it.
     Corruption {
         root: PathBuf,
@@ -345,6 +348,7 @@ fn pool_control(action: PoolAction) -> anyhow::Result<()> {
         PoolAction::Online { root, device } => (root, json!({ "cmd": "online", "path": abs(device)? })),
         PoolAction::Offline { root, vdev } => (root, json!({ "cmd": "offline", "vdev": vdev })),
         PoolAction::Promote { root } => (root, json!({ "cmd": "promote" })),
+        PoolAction::Detach { root } => (root, json!({ "cmd": "detach" })),
         PoolAction::Corruption { root, clear } => (root, json!({ "cmd": "corruption", "clear": clear })),
     };
     let reply = control::request(&root.join(control::SOCKET_NAME), &req)?;

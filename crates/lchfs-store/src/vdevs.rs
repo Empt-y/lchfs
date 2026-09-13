@@ -36,6 +36,10 @@ pub(crate) struct VdevSetState {
     pub faulted: Vec<Member>,
     /// How many slots the pool has, whether or not each has a device here.
     pub count: u16,
+    /// Slots an operator took offline on purpose. A faulted device is
+    /// brought back automatically when it answers again; one taken
+    /// offline is not -- `online` is the operator's to say.
+    pub offlined: HashSet<u16>,
     /// Devices that are online for *writes* but whose superblock must not
     /// yet be advanced: a live attach in progress. Their generation stays
     /// behind until the resilver that fills them completes, so a crash
@@ -61,6 +65,7 @@ impl VdevSet {
             state: RwLock::new(VdevSetState {
                 members,
                 faulted: Vec::new(),
+                offlined: HashSet::new(),
                 count,
                 catching_up: HashSet::new(),
             }),
@@ -237,10 +242,51 @@ impl VdevSet {
 
     /// Takes a faulted member back out of the set, for `online_vdev` to
     /// re-admit through `attach` once the device is known to work again.
+    /// Clears any operator-offline mark: bringing it back is the decision.
     pub(crate) fn take_faulted(&self, id: u16) -> Option<Member> {
         let mut state = self.state.write();
+        state.offlined.remove(&id);
         let pos = state.faulted.iter().position(|m| m.vdev.id == id)?;
         Some(state.faulted.remove(pos))
+    }
+
+    /// Marks a fault as the operator's doing, so automatic rejoin leaves
+    /// the device alone.
+    pub(crate) fn mark_offlined(&self, id: u16) {
+        self.state.write().offlined.insert(id);
+    }
+
+    /// Faulted devices that were not taken offline on purpose, with their
+    /// roots: what automatic rejoin probes.
+    pub fn faulted_unintended(&self) -> Vec<Vdev> {
+        let state = self.state.read();
+        state
+            .faulted
+            .iter()
+            .filter(|m| !state.offlined.contains(&m.vdev.id))
+            .map(|m| m.vdev.clone())
+            .collect()
+    }
+
+    /// Removes the last slot from the pool: the member (online or
+    /// faulted) is dropped, releasing its lock and ring, and the count
+    /// shrinks by one. The caller has proven the survivors complete and
+    /// rolls the writers afterwards.
+    pub(crate) fn detach_last(&self) -> Option<Member> {
+        let mut state = self.state.write();
+        let id = state.count.checked_sub(1)?;
+        let member = match state.members.iter().position(|m| m.vdev.id == id) {
+            Some(pos) => Some(state.members.remove(pos)),
+            None => state
+                .faulted
+                .iter()
+                .position(|m| m.vdev.id == id)
+                .map(|pos| state.faulted.remove(pos)),
+        };
+        state.catching_up.remove(&id);
+        state.offlined.remove(&id);
+        state.count = id;
+        member
     }
 
     pub(crate) fn finish_catch_up(&self, id: u16) {

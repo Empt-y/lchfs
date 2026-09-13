@@ -181,3 +181,46 @@ fn repeated_fault_and_rejoin_under_load_loses_nothing() {
     drop(pool);
     clean_replicas(a.path(), b.path()).unwrap();
 }
+
+/// A device that faulted on its own comes back on its own once it
+/// answers again; one an operator took offline does not.
+#[test]
+fn a_faulted_device_that_answers_again_rejoins_by_itself() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let pool = Pool::create_replicated(&[a.path(), b.path()], small_params()).unwrap();
+    let ino = pool.create_file(1, "f", 0o644).unwrap();
+    pool.write(ino, 0, &payload(61)).unwrap();
+
+    fault_injection::kill(b.path());
+    pool.write(ino, 0, &payload(62)).unwrap();
+    assert_eq!(health(&pool, 1), VdevHealth::Faulted);
+    // Dead devices are not brought back: nothing changes in this window.
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    assert_eq!(health(&pool, 1), VdevHealth::Faulted);
+
+    fault_injection::revive(b.path());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(12);
+    while health(&pool, 1) != VdevHealth::Online && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert_eq!(health(&pool, 1), VdevHealth::Online, "the failover task should have brought b back");
+    pool.checkpoint().unwrap();
+    drop(pool);
+    clean_replicas(a.path(), b.path()).unwrap();
+}
+
+#[test]
+fn a_device_taken_offline_on_purpose_stays_offline() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let pool = Pool::create_replicated(&[a.path(), b.path()], small_params()).unwrap();
+    pool.offline_vdev(1).unwrap();
+    assert_eq!(health(&pool, 1), VdevHealth::Faulted);
+    // Well past a probe interval: the device answers, and is left alone.
+    std::thread::sleep(std::time::Duration::from_millis(7500));
+    assert_eq!(health(&pool, 1), VdevHealth::Faulted);
+    let (id, _) = pool.online_vdev(b.path()).unwrap();
+    assert_eq!(id, 1);
+    assert_eq!(health(&pool, 1), VdevHealth::Online);
+}

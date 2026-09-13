@@ -237,6 +237,35 @@ const SCRUB_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 /// rebuild cannot run; this task is where it runs instead. Writes fail
 /// for at most this long after the primary dies before the index moves.
 const FAILOVER_INTERVAL: Duration = Duration::from_secs(1);
+/// How often a faulted device is asked whether it works again.
+const REJOIN_PROBE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Whether a faulted device is usable again: its superblock reads, and a
+/// file can be created and removed under its segment tree. A device that
+/// vanished (its `segments` is not a directory) or is read-only fails
+/// the probe and stays faulted. Under fault injection a killed root is
+/// still dead, so a test's device comes back only when it is revived.
+fn device_answers(root: &Path) -> bool {
+    #[cfg(feature = "fault-injection")]
+    if segment::fault_injection::is_dead(root) {
+        return false;
+    }
+    let ring_ok = FileBackend::open(root)
+        .ok()
+        .and_then(|b| read_superblock(&b).ok().flatten())
+        .is_some();
+    if !ring_ok {
+        return false;
+    }
+    let segments = root.join("segments");
+    if !segments.is_dir() {
+        return false;
+    }
+    let probe = segments.join(".lchfs-probe");
+    let writable = std::fs::write(&probe, b"probe").is_ok();
+    let _ = std::fs::remove_file(&probe);
+    writable
+}
 
 fn index_path(pool_root: &Path) -> PathBuf {
     pool_root.join("INDEX.redb")
@@ -1510,7 +1539,15 @@ impl Pool {
             return Err(PoolError::InvalidArgument(format!("vdev {id} is not online")));
         }
         self.0.vdevs.fault(id);
+        self.0.vdevs.mark_offlined(id);
         Ok(())
+    }
+
+    /// Removes the highest-numbered device while mounted: the live form
+    /// of `detach_vdev`, with the same proof first. Returns the slot that
+    /// left; its segment files are the caller's to wipe.
+    pub fn detach_vdev_live(&self) -> Result<u16, PoolError> {
+        self.0.detach_vdev_live()
     }
 
     /// The identity every device of this pool carries (ARCHITECTURE.md
@@ -1900,12 +1937,38 @@ impl PoolShared {
         *self.scrub_task.lock() = Some(scrub_task);
 
         let failover_shared = Arc::clone(self);
+        let mut last_probe: HashMap<u16, std::time::Instant> = HashMap::new();
         let failover_task =
             background::PeriodicTask::spawn("lchfs-failover", FAILOVER_INTERVAL, move || {
                 if failover_shared.vdevs.primary_faulted()
                     && let Err(e) = failover_shared.promote_primary()
                 {
                     tracing::error!("failover: could not promote a new primary: {e}");
+                }
+                // A device that faulted on its own is probed now and then;
+                // if it answers, it is brought back. One an operator took
+                // offline is left alone.
+                let now = std::time::Instant::now();
+                for vdev in failover_shared.vdevs.faulted_unintended() {
+                    let due = last_probe
+                        .get(&vdev.id)
+                        .is_none_or(|t| now.duration_since(*t) >= REJOIN_PROBE_INTERVAL);
+                    if !due || !device_answers(&vdev.root) {
+                        continue;
+                    }
+                    last_probe.insert(vdev.id, now);
+                    match failover_shared.online_vdev(&vdev.root) {
+                        Ok((id, report)) => tracing::info!(
+                            "vdev {id} answered again and was brought back: {} records copied",
+                            report.healed
+                        ),
+                        Err(e) => {
+                            tracing::warn!("vdev {} answered but could not rejoin: {e}", vdev.id);
+                            // Whatever join_live left half-done, the device
+                            // is not to be trusted: back to faulted.
+                            failover_shared.vdevs.fault(vdev.id);
+                        }
+                    }
                 }
             });
         *self.failover_task.lock() = Some(failover_task);
@@ -2548,6 +2611,75 @@ impl PoolShared {
             log.pop_front();
         }
         log.push_back(event);
+    }
+
+    /// Live detach. The proof is the offline one's -- resilver every
+    /// survivor, scrub, refuse if anything would lose its last verified
+    /// copy -- run on the mounted pool with the leaving device still a
+    /// member, so it is still a source to heal from. Then the slot goes:
+    /// out of the set (count shrinks, lock and ring released), every
+    /// writer rolled so no new segment includes it, its index entries
+    /// dropped, its ring erased, and a checkpoint publishes the smaller
+    /// count on every survivor. The ring is erased before the checkpoint
+    /// for the same reason as offline: a crash in between leaves the set
+    /// reading as "last slot empty", which the offline detach finishes.
+    fn detach_vdev_live(&self) -> Result<u16, PoolError> {
+        let _one_at_a_time = self.attach_lock.lock();
+        let count = self.vdevs.count();
+        if count < 2 {
+            return Err(PoolError::InvalidArgument(
+                "a single-vdev pool has nothing to detach".into(),
+            ));
+        }
+        let leaving = count - 1;
+        if leaving == self.primary() {
+            return Err(PoolError::InvalidArgument(format!(
+                "vdev {leaving} is this mount's primary and holds its index; it cannot leave while mounted"
+            )));
+        }
+        for vdev in self.vdevs.online() {
+            if vdev.id == leaving {
+                continue;
+            }
+            let report = self.resilver(vdev.id)?;
+            if !report.unrecoverable.is_empty() {
+                return Err(PoolError::Format(format!(
+                    "vdev {} is missing {} records that no device can supply; refusing to detach",
+                    vdev.id,
+                    report.unrecoverable.len()
+                )));
+            }
+        }
+        for report in self.scrub()? {
+            if report.vdev_id != leaving && !report.unrecoverable.is_empty() {
+                return Err(PoolError::Format(format!(
+                    "vdev {} holds {} corrupt records that no device can supply; refusing to detach",
+                    report.vdev_id,
+                    report.unrecoverable.len()
+                )));
+            }
+        }
+
+        let member = self.vdevs.detach_last();
+        self.committer_pool.roll_all_writers()?;
+        {
+            let mut meta_writer = self.meta_writer.lock();
+            self.roll_meta_writer(&mut meta_writer)?;
+        }
+        for log in &self.shard_delta_logs {
+            log.lock().roll_over()?;
+        }
+        self.persisted_index.write().delete_vdev_locations(leaving)?;
+        if let Some(member) = member {
+            let ring = backend::superblock_path(&member.vdev.root);
+            drop(member);
+            if ring.exists() {
+                std::fs::remove_file(ring)?;
+            }
+        }
+        self.run_checkpoint()?;
+        tracing::info!("vdev {leaving} detached; the pool now has {} slots", leaving);
+        Ok(leaving)
     }
 
     /// Failover for the one single point of failure §16.1 left: the

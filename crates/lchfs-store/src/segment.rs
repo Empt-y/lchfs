@@ -468,7 +468,66 @@ impl SegmentWriter {
     /// checkpoint durability barriers (ARCHITECTURE.md §3), which fsync
     /// still-open segments long before they fill up and get sealed.
     pub fn fsync(&mut self) -> io::Result<()> {
-        self.each_replica(|file| file.sync_all())
+        self.sync_replicas()
+    }
+
+    /// `each_replica(sync_all)`, but with the syncs issued together. A
+    /// synchronous fan-out makes the slowest device set the latency
+    /// (§15.9); issuing the syncs serially made it the *sum*. On one disk
+    /// there is nothing to gain and a thread per extra device to pay, so
+    /// this only bothers when there is more than one replica -- which is
+    /// when they can be on different disks.
+    fn sync_replicas(&mut self) -> io::Result<()> {
+        if self.files.len() < 2 {
+            return self.each_replica(|file| file.sync_all());
+        }
+        #[cfg(feature = "fault-injection")]
+        let dead: Vec<bool> = self.roots.iter().map(|r| fault_injection::is_dead(r)).collect();
+        #[cfg(not(feature = "fault-injection"))]
+        let dead: Vec<bool> = vec![false; self.files.len()];
+        let results: Vec<io::Result<()>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = self
+                .files
+                .iter()
+                .zip(&dead)
+                .map(|(file, &is_dead)| {
+                    scope.spawn(move || {
+                        if is_dead {
+                            Err(io::Error::other("fault injected"))
+                        } else {
+                            file.sync_all()
+                        }
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_else(|_| Err(io::Error::other("fsync thread panicked"))))
+                .collect()
+        });
+        // Apply the outcomes with the same bookkeeping a serial pass does.
+        let mut i = 0;
+        let mut last_err = None;
+        for result in results {
+            match result {
+                Ok(()) => i += 1,
+                Err(e) => {
+                    let id = self.vdev_ids.remove(i);
+                    self.files.remove(i);
+                    self.roots.remove(i);
+                    tracing::error!(
+                        "vdev {id}: fsync of segment {} failed ({e}); dropping it from this segment's fan-out",
+                        self.segment_id
+                    );
+                    self.faulted.push(id);
+                    last_err = Some(e);
+                }
+            }
+        }
+        match last_err {
+            Some(e) if self.files.is_empty() => Err(e),
+            _ => Ok(()),
+        }
     }
 
     /// Seal the segment: write record count, aggregate fingerprint hash,
@@ -506,7 +565,7 @@ impl SegmentWriter {
 
         // Seal is only durable once every replica that still holds the
         // segment has it.
-        self.each_replica(|file| file.sync_all())?;
+        self.sync_replicas()?;
         Ok(std::mem::take(&mut self.faulted))
     }
 }
@@ -537,7 +596,7 @@ pub mod fault_injection {
         dead().lock().unwrap().remove(root);
     }
 
-    pub(crate) fn is_dead(root: &Path) -> bool {
+    pub fn is_dead(root: &Path) -> bool {
         dead().lock().unwrap().contains(root)
     }
 }
