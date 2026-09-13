@@ -1476,6 +1476,24 @@ impl Pool {
         self.0.vdevs.status()
     }
 
+    /// Takes a device out of service on purpose -- to pull it cleanly, or
+    /// to stop using one that is misbehaving short of failing. Exactly
+    /// what a fault does, at an operator's request; `online_vdev` brings
+    /// it back. The primary cannot be taken offline: its index is the
+    /// mount's.
+    pub fn offline_vdev(&self, id: u16) -> Result<(), PoolError> {
+        if id == self.0.primary_id {
+            return Err(PoolError::InvalidArgument(format!(
+                "vdev {id} is this mount's primary and holds its index; remount with another primary instead"
+            )));
+        }
+        if !self.0.vdevs.is_online(id) {
+            return Err(PoolError::InvalidArgument(format!("vdev {id} is not online")));
+        }
+        self.0.vdevs.fault(id);
+        Ok(())
+    }
+
     /// The identity every device of this pool carries (ARCHITECTURE.md
     /// §15.6), and what `discover` groups devices by.
     pub fn pool_uuid(&self) -> [u8; 16] {

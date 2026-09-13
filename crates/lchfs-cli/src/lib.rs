@@ -1,6 +1,8 @@
 //! LCHFS CLI. ARCHITECTURE.md §11: `clap`-based commands
 //! create-pool, mount, fsck, snapshot {create,list,delete}, stats.
 
+pub mod control;
+
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -76,6 +78,11 @@ enum Command {
         #[arg(long = "vdev")]
         vdevs: Vec<PathBuf>,
     },
+    /// Talk to a mounted pool over its control socket.
+    Pool {
+        #[command(subcommand)]
+        action: PoolAction,
+    },
     /// Snapshot management (ARCHITECTURE.md §6).
     Snapshot {
         #[command(subcommand)]
@@ -83,6 +90,22 @@ enum Command {
     },
     /// Print pool statistics.
     Stats { pool: PathBuf },
+}
+
+#[derive(Subcommand)]
+enum PoolAction {
+    /// Every slot's health, the repair counters, and what mount did.
+    Status { root: PathBuf },
+    /// Verify every record on every online device and heal what fails.
+    Scrub { root: PathBuf },
+    /// Copy onto a device everything it is missing.
+    Resilver { root: PathBuf, vdev: u16 },
+    /// Add a blank device and fill it.
+    Attach { root: PathBuf, device: PathBuf },
+    /// Bring back a device that faulted or was absent at mount.
+    Online { root: PathBuf, device: PathBuf },
+    /// Stop using a device, cleanly.
+    Offline { root: PathBuf, vdev: u16 },
 }
 
 #[derive(Subcommand)]
@@ -136,6 +159,7 @@ pub fn run() -> anyhow::Result<()> {
             println!("vdev {id} detached; its segment files can be deleted.");
             Ok(())
         }
+        Command::Pool { action } => pool_control(action),
         Command::Snapshot { action } => snapshot(action),
         Command::Stats { pool } => stats(&pool),
     }
@@ -209,6 +233,8 @@ fn mount(
         );
     }
     let pool = std::sync::Arc::new(pool);
+    let _control = control::ControlServer::start(std::sync::Arc::clone(&pool), control::socket_path(&pool))?;
+    eprintln!("control socket: {}", control::socket_path(&pool).display());
     let fs = lchfs_fuse::LchfsFilesystem::new(pool);
     // `DefaultPermissions`: the kernel enforces normal read/write/traverse
     // permission checks against each inode's reported mode/uid/gid (lchfs
@@ -292,6 +318,27 @@ fn fsck(
         }
         anyhow::bail!("fsck found {} error(s)", findings.len());
     }
+}
+
+fn pool_control(action: PoolAction) -> anyhow::Result<()> {
+    use serde_json::json;
+    let abs = |p: &PathBuf| -> anyhow::Result<String> {
+        Ok(std::fs::canonicalize(p)
+            .or_else(|_| std::env::current_dir().map(|d| d.join(p)))?
+            .display()
+            .to_string())
+    };
+    let (root, req) = match &action {
+        PoolAction::Status { root } => (root, json!({ "cmd": "status" })),
+        PoolAction::Scrub { root } => (root, json!({ "cmd": "scrub" })),
+        PoolAction::Resilver { root, vdev } => (root, json!({ "cmd": "resilver", "vdev": vdev })),
+        PoolAction::Attach { root, device } => (root, json!({ "cmd": "attach", "path": abs(device)? })),
+        PoolAction::Online { root, device } => (root, json!({ "cmd": "online", "path": abs(device)? })),
+        PoolAction::Offline { root, vdev } => (root, json!({ "cmd": "offline", "vdev": vdev })),
+    };
+    let reply = control::request(&root.join(control::SOCKET_NAME), &req)?;
+    println!("{}", serde_json::to_string_pretty(&reply)?);
+    Ok(())
 }
 
 fn snapshot(action: SnapshotAction) -> anyhow::Result<()> {

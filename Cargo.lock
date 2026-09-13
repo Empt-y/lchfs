@@ -615,6 +615,9 @@ dependencies = [
  "lchfs-fuse",
  "lchfs-index",
  "lchfs-store",
+ "serde_json",
+ "tempfile",
+ "tracing",
  "tracing-subscriber",
 ]
 
