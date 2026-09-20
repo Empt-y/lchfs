@@ -87,6 +87,31 @@ fn every_command_round_trips_over_the_socket() {
 /// A socket left behind by a mount that died is replaced; one that a
 /// live mount answers on is not.
 #[test]
+fn the_stripe_policy_is_set_and_reported_over_the_socket() {
+    let a = tempfile::tempdir().unwrap();
+    let pool = Arc::new(Pool::create(a.path(), small_params()).unwrap());
+    let sock = socket_path(&pool);
+    let _server = ControlServer::start(Arc::clone(&pool), sock.clone()).unwrap();
+
+    let status = request(&sock, &json!({ "cmd": "stripe-status" })).unwrap();
+    assert_eq!(status["policy"]["enabled"], false);
+    assert_eq!(status["striped_segments"], 0);
+    assert_eq!(status["online_vdevs"], 1);
+
+    let err = request(&sock, &json!({ "cmd": "set-stripe", "k": 1, "m": 1 })).unwrap_err().to_string();
+    assert!(err.contains("stripe policy"), "{err}");
+    let set = request(&sock, &json!({ "cmd": "set-stripe", "k": 2, "m": 1, "min_age_segments": 3 })).unwrap();
+    assert_eq!(set["k"], 2);
+    assert_eq!(set["m"], 1);
+    assert_eq!(set["min_age_segments"], 3);
+    assert_eq!(set["enabled"], true);
+    let status = request(&sock, &json!({ "cmd": "stripe-status" })).unwrap();
+    assert_eq!(status["policy"]["k"], 2);
+    assert_eq!(status["enough_devices"], false, "one device cannot hold a 2+1 stripe");
+    assert_eq!(pool.stripe_policy().k, 2);
+}
+
+#[test]
 fn a_stale_socket_is_replaced_but_a_live_one_is_not() {
     let a = tempfile::tempdir().unwrap();
     let pool = Arc::new(Pool::create(a.path(), small_params()).unwrap());

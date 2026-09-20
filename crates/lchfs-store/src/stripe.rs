@@ -96,6 +96,19 @@ pub fn scan_body(body: &[u8]) -> Vec<(ExtentRecordHeader, u32)> {
     out
 }
 
+/// A shard is written only where the device's ring is: never into the
+/// empty path a pulled device leaves behind.
+fn require_device(root: &Path) -> io::Result<()> {
+    if crate::backend::superblock_path(root).is_file() {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("{} has no superblock; not writing a shard there", root.display()),
+        ))
+    }
+}
+
 fn rs(k: u8, m: u8) -> io::Result<ReedSolomon> {
     ReedSolomon::new(k as usize, m as usize).map_err(|e| io::Error::other(format!("reed-solomon: {e:?}")))
 }
@@ -146,6 +159,7 @@ pub fn write_stripe(
             body_hash,
             shard_hash: Hash32::of(shard),
         };
+        require_device(&vdev.root)?;
         std::fs::create_dir_all(segment_dir(&vdev.root, StreamKind::Data))?;
         let path = shard_path(&vdev.root, segment_id, i as u8);
         let file = std::fs::OpenOptions::new()
@@ -173,6 +187,7 @@ pub fn rebuild_shard(reader: &StripeReader, shard_index: u8, onto: &Vdev) -> io:
     let mut mine = desc.clone();
     mine.shard_index = shard_index;
     mine.shard_hash = Hash32::of(&shard);
+    require_device(&onto.root)?;
     std::fs::create_dir_all(segment_dir(&onto.root, StreamKind::Data))?;
     let path = shard_path(&onto.root, reader.segment_id, shard_index);
     let file = std::fs::OpenOptions::new()

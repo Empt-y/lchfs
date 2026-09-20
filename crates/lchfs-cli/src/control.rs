@@ -122,12 +122,23 @@ fn health_name(h: VdevHealth) -> &'static str {
     }
 }
 
+fn stripe_policy_json(pool: &Pool) -> Value {
+    let p = pool.stripe_policy();
+    json!({
+        "k": p.k,
+        "m": p.m,
+        "min_age_segments": p.min_age_segments,
+        "enabled": p.enabled(),
+    })
+}
+
 fn resilver_json(r: &lchfs_store::ResilverReport) -> Value {
     json!({
         "examined": r.examined,
         "missing": r.missing,
         "healed": r.healed,
         "unrecoverable": r.unrecoverable.len(),
+        "shards_rebuilt": r.shards_rebuilt,
     })
 }
 
@@ -188,6 +199,9 @@ pub fn handle(pool: &Pool, request: &Value) -> anyhow::Result<Value> {
                     "corrupt": r.corrupt,
                     "healed": r.healed,
                     "unrecoverable": r.unrecoverable.len(),
+                    "shards_verified": r.shards_verified,
+                    "shards_corrupt": r.shards_corrupt,
+                    "shards_rebuilt": r.shards_rebuilt,
                 }))
                 .collect::<Vec<_>>()))
         }
@@ -237,6 +251,44 @@ pub fn handle(pool: &Pool, request: &Value) -> anyhow::Result<Value> {
         }
         "promote" => Ok(json!({ "primary": pool.promote_primary()? })),
         "detach" => Ok(json!({ "detached": pool.detach_vdev_live()? })),
+        "set-stripe" => {
+            let small = |name: &str| -> anyhow::Result<u8> {
+                let v = arg(request, name)?
+                    .as_u64()
+                    .ok_or_else(|| anyhow::anyhow!("{name} must be a number"))?;
+                u8::try_from(v).map_err(|_| anyhow::anyhow!("{name} must be at most 255"))
+            };
+            let (k, m) = (small("k")?, small("m")?);
+            let min_age = match request.get("min_age_segments") {
+                None | Some(Value::Null) => None,
+                Some(v) => Some(
+                    v.as_u64()
+                        .and_then(|a| u32::try_from(a).ok())
+                        .ok_or_else(|| anyhow::anyhow!("min_age_segments must be a number"))?,
+                ),
+            };
+            pool.set_stripe_policy(k, m, min_age)?;
+            Ok(stripe_policy_json(pool))
+        }
+        "stripe-status" => {
+            let s = pool.stripe_status();
+            Ok(json!({
+                "policy": stripe_policy_json(pool),
+                "online_vdevs": s.online_vdevs,
+                "enough_devices": s.k as u16 + s.m as u16 <= s.online_vdevs,
+                "striped_segments": s.striped_segments,
+                "segments_missing_shards": s.segments_missing_shards,
+                "unreadable_segments": s.unreadable_segments,
+                "logical_bytes": s.logical_bytes,
+                "shard_bytes": s.shard_bytes,
+                "shard_bytes_by_vdev": s.shard_bytes_by_vdev
+                    .iter()
+                    .map(|(id, b)| json!({ "vdev": id, "bytes": b }))
+                    .collect::<Vec<_>>(),
+                "mirrored_cost_bytes": s.mirrored_cost_bytes,
+                "saved_bytes": s.mirrored_cost_bytes.saturating_sub(s.shard_bytes),
+            }))
+        }
         other => anyhow::bail!("unknown command {other:?}"),
     }
 }

@@ -81,6 +81,25 @@ pub struct FileBackend {
 }
 
 impl FileBackend {
+    /// Opens a device's ring without creating anything: for probing a
+    /// device that may not be there. `open` creates the directory and an
+    /// empty ring, which on the path of a pulled device leaves a blank
+    /// impostor for the real device to come back to.
+    pub fn open_existing(vdev_root: &Path) -> io::Result<Self> {
+        let path = superblock_path(vdev_root);
+        if !path.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{} has no superblock", vdev_root.display()),
+            ));
+        }
+        let file = OpenOptions::new().read(true).write(true).open(&path)?;
+        Ok(Self {
+            root: vdev_root.to_path_buf(),
+            file,
+        })
+    }
+
     pub fn open(vdev_root: &Path) -> io::Result<Self> {
         std::fs::create_dir_all(vdev_root)?;
         let path = superblock_path(vdev_root);

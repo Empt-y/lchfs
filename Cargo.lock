@@ -729,6 +729,7 @@ dependencies = [
  "lchfs-format",
  "lchfs-index",
  "lchfs-store",
+ "reed-solomon-erasure",
  "serde",
  "tempfile",
  "thiserror",

@@ -33,9 +33,9 @@ fn append_records(w: &mut SegmentWriter, payloads: &[&[u8]]) -> Vec<lchfs_format
 /// header page and the seal footer.
 #[test]
 fn every_vdev_receives_a_byte_identical_segment() {
-    let a = tempfile::tempdir().unwrap();
-    let b = tempfile::tempdir().unwrap();
-    let c = tempfile::tempdir().unwrap();
+    let a = device();
+    let b = device();
+    let c = device();
 
     let mut w =
         SegmentWriter::create(&[a.path(), b.path(), c.path()], 42, StreamKind::Data, 0).unwrap();
@@ -56,8 +56,8 @@ fn every_vdev_receives_a_byte_identical_segment() {
 /// recovered bytes at a fresh offset on one device only.)
 #[test]
 fn a_record_reads_back_identically_from_any_vdev() {
-    let a = tempfile::tempdir().unwrap();
-    let b = tempfile::tempdir().unwrap();
+    let a = device();
+    let b = device();
 
     let mut w = SegmentWriter::create(&[a.path(), b.path()], 1, StreamKind::Data, 0).unwrap();
     let payload = b"content addressed bytes";
@@ -74,8 +74,8 @@ fn a_record_reads_back_identically_from_any_vdev() {
 
 #[test]
 fn delta_segments_fan_out_too() {
-    let a = tempfile::tempdir().unwrap();
-    let b = tempfile::tempdir().unwrap();
+    let a = device();
+    let b = device();
 
     let mut w = SegmentWriter::create_delta(&[a.path(), b.path()], 3, 0).unwrap();
     append_records(&mut w, &[b"delta entry"]);
@@ -103,6 +103,15 @@ fn a_writer_with_no_vdevs_is_rejected() {
 
 use lchfs_format::PoolParams;
 use lchfs_store::Pool;
+
+/// A device is where its ring is: a writer refuses to create a segment
+/// on a root without one, so a bare directory is given a ring first.
+fn device() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    lchfs_store::backend::FileBackend::open(dir.path()).unwrap();
+    dir
+}
+
 
 fn small_params() -> PoolParams {
     PoolParams {
@@ -145,8 +154,8 @@ fn tree(dir: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf,
 /// vdev, byte-identically, and the pool reopens from the set.
 #[test]
 fn a_two_vdev_pool_replicates_real_file_content() {
-    let a = tempfile::tempdir().unwrap();
-    let b = tempfile::tempdir().unwrap();
+    let a = device();
+    let b = device();
 
     let payload = vec![0xA5u8; 40_000]; // multi-chunk at these params
     {
@@ -173,9 +182,9 @@ fn a_two_vdev_pool_replicates_real_file_content() {
 
 #[test]
 fn a_device_from_another_pool_is_refused() {
-    let a = tempfile::tempdir().unwrap();
-    let b = tempfile::tempdir().unwrap();
-    let foreign = tempfile::tempdir().unwrap();
+    let a = device();
+    let b = device();
+    let foreign = device();
 
     drop(Pool::create_replicated(&[a.path(), b.path()], small_params()).unwrap());
     drop(Pool::create(foreign.path(), small_params()).unwrap());
@@ -189,8 +198,8 @@ fn a_device_from_another_pool_is_refused() {
 
 #[test]
 fn devices_given_out_of_vdev_order_are_refused() {
-    let a = tempfile::tempdir().unwrap();
-    let b = tempfile::tempdir().unwrap();
+    let a = device();
+    let b = device();
     drop(Pool::create_replicated(&[a.path(), b.path()], small_params()).unwrap());
 
     let err = Pool::open_replicated(&[b.path(), a.path()]).unwrap_err();
@@ -202,8 +211,8 @@ fn devices_given_out_of_vdev_order_are_refused() {
 
 #[test]
 fn opening_a_two_vdev_pool_with_one_device_is_refused() {
-    let a = tempfile::tempdir().unwrap();
-    let b = tempfile::tempdir().unwrap();
+    let a = device();
+    let b = device();
     drop(Pool::create_replicated(&[a.path(), b.path()], small_params()).unwrap());
 
     // Degraded mount is a designed future capability (§15.8), not something
@@ -226,7 +235,7 @@ fn a_scan_recovers_the_records_behind_a_damaged_stretch() {
     use lchfs_store::segment::ScanEnd;
     use std::io::{Seek, SeekFrom, Write};
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = device();
     let payloads: Vec<Vec<u8>> = (0..12u8).map(|i| vec![i; 3000 + i as usize * 7]).collect();
     let mut w = SegmentWriter::create(&[dir.path()], 7, StreamKind::Data, 0).unwrap();
     let locs = append_records(&mut w, &payloads.iter().map(|p| p.as_slice()).collect::<Vec<_>>());
@@ -280,7 +289,7 @@ fn a_scan_recovers_the_records_behind_a_damaged_stretch() {
 fn a_clean_tail_is_not_mistaken_for_damage() {
     use lchfs_store::segment::ScanEnd;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = device();
     let mut w = SegmentWriter::create(&[dir.path()], 8, StreamKind::Data, 0).unwrap();
     append_records(&mut w, &[b"one", b"two", b"three"]);
     w.fsync().unwrap();
@@ -314,7 +323,7 @@ fn a_clean_tail_is_not_mistaken_for_damage() {
 fn a_forged_uncompressed_len_is_refused_rather_than_allocated() {
     use lchfs_format::{ExtentRecordHeader, finalize_header_checksum};
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = device();
     let mut w = SegmentWriter::create(&[dir.path()], 5, StreamKind::Data, 0).unwrap();
     // Compressible enough to be stored as zstd.
     let payload = vec![0u8; 8192];
@@ -357,7 +366,7 @@ fn a_forged_uncompressed_len_is_refused_rather_than_allocated() {
 #[test]
 fn a_resync_through_megabytes_of_garbage_is_bounded() {
     use std::io::Write;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = device();
     let mut w = SegmentWriter::create(&[dir.path()], 6, StreamKind::Data, 0).unwrap();
     let first = append_records(&mut w, &[b"before the garbage"]);
     drop(w);

@@ -58,7 +58,13 @@ pub struct Appended {
 }
 
 struct ShardDataWriter {
-    writer: SegmentWriter,
+    /// The segment this shard is appending to, created on the first
+    /// append and closed by `close_segment` -- so an idle shard owns no
+    /// file, and a mount that never writes to a shard leaves nothing on
+    /// disk for it.
+    writer: Option<SegmentWriter>,
+    /// When the segment last took a record; what `seal_if_idle` reads.
+    last_append: std::time::Instant,
     /// The slots `writer`'s segment fans out to, shared with every
     /// completion it produces.
     vdev_ids: Arc<[u16]>,
@@ -85,12 +91,16 @@ impl ShardDataWriter {
         uncompressed_len: u32,
         payload: &[u8],
     ) -> io::Result<Appended> {
-        if self.writer.current_size() + payload.len() as u64 > self.segment_cap_bytes {
-            self.roll_over()?;
-        }
-        let result = self
+        if self
             .writer
-            .append(kind, content_hash, codec_id, uncompressed_len, payload, Vec::new());
+            .as_ref()
+            .is_some_and(|w| w.current_size() + payload.len() as u64 > self.segment_cap_bytes)
+        {
+            self.close_segment()?;
+        }
+        let writer = self.open_segment()?;
+        let result = writer.append(kind, content_hash, codec_id, uncompressed_len, payload, Vec::new());
+        self.last_append = std::time::Instant::now();
         self.report_faults();
         Ok(Appended {
             location: result?,
@@ -102,12 +112,40 @@ impl ShardDataWriter {
     /// refreshes the slot list handed out with each completion so the
     /// index is told only the devices that still take this segment.
     fn report_faults(&mut self) {
-        for id in self.writer.take_faults() {
+        let Some(writer) = self.writer.as_mut() else { return };
+        for id in writer.take_faults() {
             self.vdevs.fault(id);
         }
-        if self.vdev_ids.as_ref() != self.writer.vdev_ids() {
-            self.vdev_ids = self.writer.vdev_ids().into();
+        if self.vdev_ids.as_ref() != writer.vdev_ids() {
+            self.vdev_ids = writer.vdev_ids().into();
         }
+    }
+
+    /// The current segment, created on the online set if there is none.
+    fn open_segment(&mut self) -> io::Result<&mut SegmentWriter> {
+        if self.writer.is_none() {
+            let new_id = self.next_segment_id.fetch_add(1, Ordering::Relaxed);
+            let online = self.vdevs.online();
+            let mut writer = SegmentWriter::create_on(&online, new_id, StreamKind::Data, self.shard_id)?;
+            for id in writer.take_faults() {
+                self.vdevs.fault(id);
+            }
+            self.vdev_ids = writer.vdev_ids().into();
+            self.writer = Some(writer);
+        }
+        Ok(self.writer.as_mut().expect("just created"))
+    }
+
+    /// Seals the current segment if it has taken no record for `idle`.
+    /// What the checkpoint calls so a segment that stopped growing short
+    /// of the cap still becomes a sealed, sweepable, stripeable segment
+    /// rather than staying open for the life of the mount.
+    fn seal_if_idle(&mut self, idle: std::time::Duration) -> io::Result<bool> {
+        if self.writer.is_none() || self.last_append.elapsed() < idle {
+            return Ok(false);
+        }
+        self.close_segment()?;
+        Ok(true)
     }
 
     /// Hands every pending record to the index in one transaction. Runs
@@ -126,18 +164,15 @@ impl ShardDataWriter {
         result
     }
 
-    fn roll_over(&mut self) -> io::Result<()> {
+    /// Seals the current segment, if any; the next append opens a fresh
+    /// one on the online set as it stands then. What every barrier that
+    /// needs "no segment in flight includes device X" calls.
+    fn close_segment(&mut self) -> io::Result<()> {
         // Everything on the old segment is indexed before it is left
         // behind: the invariant a live attach's barrier rests on.
         self.flush_index()?;
-        let new_id = self.next_segment_id.fetch_add(1, Ordering::Relaxed);
-        let online = self.vdevs.online();
-        let new_writer = SegmentWriter::create_on(&online, new_id, StreamKind::Data, self.shard_id)?;
-        let old = std::mem::replace(&mut self.writer, new_writer);
-        // A device that could not take the new segment is faulted here;
-        // and the old segment's seal is the last chance to learn a
-        // replica failed on it.
-        self.report_faults();
+        let Some(old) = self.writer.take() else { return Ok(()) };
+        // The seal is the last chance to learn a replica failed on it.
         let faults = old.seal()?;
         for id in faults {
             self.vdevs.fault(id);
@@ -146,9 +181,11 @@ impl ShardDataWriter {
     }
 
     fn fsync(&mut self) -> io::Result<()> {
-        let result = self.writer.fsync();
-        self.report_faults();
-        result?;
+        if let Some(writer) = self.writer.as_mut() {
+            let result = writer.fsync();
+            self.report_faults();
+            result?;
+        }
         self.flush_index()
     }
 }
@@ -180,19 +217,15 @@ impl LogicalShard {
         next_segment_id: Arc<AtomicU64>,
         indexer: Arc<OnceLock<Indexer>>,
     ) -> io::Result<Self> {
-        let initial_id = next_segment_id.fetch_add(1, Ordering::Relaxed);
-        let mut writer = SegmentWriter::create_on(&vdevs.online(), initial_id, StreamKind::Data, id)?;
-        for faulted in writer.take_faults() {
-            vdevs.fault(faulted);
-        }
         Ok(Self {
             id,
             ring: ArrayQueue::new(ring_capacity),
             claimed: AtomicBool::new(false),
             pending: AtomicBool::new(false),
             data: Mutex::new(ShardDataWriter {
-                vdev_ids: writer.vdev_ids().into(),
-                writer,
+                vdev_ids: vdevs.online().iter().map(|v| v.id).collect::<Vec<u16>>().into(),
+                writer: None,
+                last_append: std::time::Instant::now(),
                 pending_index: Vec::with_capacity(INDEX_BATCH),
                 indexer,
                 vdevs,
@@ -387,9 +420,21 @@ impl CommitterPool {
 
     pub fn roll_all_writers(&self) -> io::Result<()> {
         for shard in &self.shards {
-            shard.data.lock().roll_over()?;
+            shard.data.lock().close_segment()?;
         }
         Ok(())
+    }
+
+    /// Seals every shard's segment that has taken nothing for `idle`;
+    /// returns how many were sealed. Called from the checkpoint.
+    pub fn seal_idle_writers(&self, idle: std::time::Duration) -> io::Result<usize> {
+        let mut sealed = 0;
+        for shard in &self.shards {
+            if shard.data.lock().seal_if_idle(idle)? {
+                sealed += 1;
+            }
+        }
+        Ok(sealed)
     }
 
     pub fn push(&self, op: IngressOp) {
@@ -451,6 +496,13 @@ impl CommitterPool {
         }
         for handle in self.workers.drain(..) {
             let _ = handle.join();
+        }
+        // A clean shutdown leaves no segment open: what stays Open on
+        // disk is, by construction, a crash's, and mount seals it.
+        for shard in &self.shards {
+            if let Err(e) = shard.data.lock().close_segment() {
+                tracing::error!("shard {}: sealing its segment at shutdown failed ({e})", shard.id);
+            }
         }
     }
 }

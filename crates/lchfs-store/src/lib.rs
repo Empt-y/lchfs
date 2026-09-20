@@ -224,6 +224,15 @@ const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
 /// interval -- this is idle-cycle background work, not foreground-
 /// critical durability (ARCHITECTURE.md §5).
 const COALESCE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// A shard's data segment that has taken no record for this long is
+/// sealed at the next checkpoint. Segments otherwise seal only at the
+/// cap, which a shard that writes less than 128 MiB per mount never
+/// reaches -- and only sealed segments are swept, coalesced or striped
+/// (§6, §17.2). Long enough that a file being written in bursts keeps
+/// its segment; short enough that data is cold, in every daemon's eyes,
+/// within minutes of going quiet.
+const IDLE_SEGMENT_SEAL: Duration = Duration::from_secs(30);
 /// How often the Dedup Index Scanner runs. Shorter than the coalesce
 /// interval: its pass is cheap (header scans + index lookups, no
 /// physical rewrite), and faster convergence bounds how long duplicate
@@ -251,7 +260,10 @@ fn device_answers(root: &Path) -> bool {
     if segment::fault_injection::is_dead(root) {
         return false;
     }
-    let ring_ok = FileBackend::open(root)
+    // Probing must not create: `FileBackend::open` would leave a blank
+    // ring on a pulled device's path, and the device coming back to that
+    // path would find an impostor in its place.
+    let ring_ok = FileBackend::open_existing(root)
         .ok()
         .and_then(|b| read_superblock(&b).ok().flatten())
         .is_some();
@@ -378,6 +390,70 @@ impl RepairStats {
     }
 }
 
+/// The erasure-coding policy (ARCHITECTURE.md §17.2.5) as it stands on a
+/// mounted pool: `PoolParams`'s three stripe fields, changeable live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StripePolicyParams {
+    /// Data shards; 0 (with `m` 0) means never stripe.
+    pub k: u8,
+    /// Parity shards.
+    pub m: u8,
+    /// Sealed segments past the sweep grace window before a segment
+    /// counts as cold.
+    pub min_age_segments: u32,
+}
+
+impl From<&PoolParams> for StripePolicyParams {
+    fn from(p: &PoolParams) -> Self {
+        Self {
+            k: p.stripe_k,
+            m: p.stripe_m,
+            min_age_segments: p.stripe_min_age_segments,
+        }
+    }
+}
+
+impl StripePolicyParams {
+    pub fn enabled(&self) -> bool {
+        self.k >= 2 && self.m >= 1
+    }
+}
+
+/// A shape that can never work is refused; a pool with fewer devices than
+/// `k + m` is allowed, since the conversion pass waits until it has enough.
+fn validate_stripe_shape(k: u8, m: u8) -> Result<(), PoolError> {
+    if (k, m) != (0, 0) && (k < 2 || m < 1 || k as u16 + m as u16 > 255) {
+        return Err(PoolError::InvalidArgument(format!(
+            "stripe policy k={k} m={m} is not valid: need k >= 2, m >= 1, k + m <= 255, or 0/0 for none"
+        )));
+    }
+    Ok(())
+}
+
+/// What `Pool::stripe_status` reports (ARCHITECTURE.md §17.2).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StripeStatus {
+    pub k: u8,
+    pub m: u8,
+    pub min_age_segments: u32,
+    pub online_vdevs: u16,
+    /// Segments currently held as shards rather than mirror copies.
+    pub striped_segments: u64,
+    /// Of those, how many are short at least one shard right now.
+    pub segments_missing_shards: u64,
+    /// Of those, how many are short so many that they cannot be read.
+    pub unreadable_segments: u64,
+    /// Segment body bytes held striped.
+    pub logical_bytes: u64,
+    /// Bytes the shards occupy, in total and per online device (header
+    /// pages included; a shard that fails to verify is not counted).
+    pub shard_bytes: u64,
+    pub shard_bytes_by_vdev: Vec<(u16, u64)>,
+    /// What the same segments would occupy mirrored on every online
+    /// device (header pages included, like `shard_bytes`).
+    pub mirrored_cost_bytes: u64,
+}
+
 /// Point-in-time copy of the repair counters (`Pool::repair_stats`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RepairStatsSnapshot {
@@ -484,6 +560,11 @@ impl std::fmt::Debug for Pool {
 struct PoolShared {
     pool_root: PathBuf,
     pool_params: PoolParams,
+    /// The erasure-coding policy (ARCHITECTURE.md §17.2.5), the one part
+    /// of `pool_params` that changes on a mounted pool: `set_stripe_policy`
+    /// writes it, the conversion pass and the checkpoint read it. Never on
+    /// the write or read path.
+    stripe_policy: Mutex<StripePolicyParams>,
     /// Pool/vdev identity (ARCHITECTURE.md §15.6). Generated at `create`,
     /// read back from the superblock at `open`, and rewritten unchanged by
     /// every checkpoint -- a checkpoint must never mint a new identity, or
@@ -595,16 +676,7 @@ impl Pool {
         // pool with fewer devices than k + m is allowed -- the conversion
         // pass is a no-op until it has enough -- but a shape that can
         // never work is not.
-        if (params.stripe_k, params.stripe_m) != (0, 0)
-            && (params.stripe_k < 2
-                || params.stripe_m < 1
-                || params.stripe_k as u16 + params.stripe_m as u16 > 255)
-        {
-            return Err(PoolError::InvalidArgument(format!(
-                "stripe policy k={} m={} is not valid: need k >= 2, m >= 1, k + m <= 255, or 0/0 for none",
-                params.stripe_k, params.stripe_m
-            )));
-        }
+        validate_stripe_shape(params.stripe_k, params.stripe_m)?;
         let pool_root = vdev_roots[0];
         let mut members = Vec::with_capacity(vdev_roots.len());
         for (id, root) in vdev_roots.iter().enumerate() {
@@ -709,6 +781,7 @@ impl Pool {
         let shared = Arc::new(PoolShared {
             pool_root: pool_root.to_path_buf(),
             pool_params: params,
+            stripe_policy: Mutex::new(StripePolicyParams::from(&params)),
             // A fresh pool mints its identity once, here. Phase 1 pools are
             // single-vdev; `vdev_count` becomes meaningful when a pool is
             // created across several devices (ARCHITECTURE.md §15.6).
@@ -924,6 +997,7 @@ impl Pool {
         // still a member (if present) and so still a source to heal from.
         {
             let pool = Self::open_degraded(vdev_roots)?;
+            pool.0.unstripe_for_detach(leaving)?;
             for id in 0..leaving {
                 let report = pool.resilver(id)?;
                 if !report.unrecoverable.is_empty() {
@@ -1437,6 +1511,7 @@ impl Pool {
         let shared = Arc::new(PoolShared {
             pool_root: pool_root.to_path_buf(),
             pool_params: root.pool_params,
+            stripe_policy: Mutex::new(StripePolicyParams::from(&root.pool_params)),
             // Read back, never regenerated -- minting a new identity on open
             // would make the pool stop matching its own vdevs.
             pool_uuid: slot.pool_uuid,
@@ -1499,6 +1574,7 @@ impl Pool {
                 .mount_resilver = reports;
         }
 
+        shared.seal_orphaned_segments()?;
         shared.spawn_background_threads();
 
         Ok(Self(shared))
@@ -1581,6 +1657,32 @@ impl Pool {
     /// left; its segment files are the caller's to wipe.
     pub fn detach_vdev_live(&self) -> Result<u16, PoolError> {
         self.0.detach_vdev_live()
+    }
+
+    /// Seals every shard's data segment that has taken no record for
+    /// `idle` -- what each checkpoint does with `IDLE_SEGMENT_SEAL` on
+    /// its own; exposed so tooling and tests can make data cold now.
+    /// Returns how many segments were sealed.
+    pub fn seal_idle_segments(&self, idle: Duration) -> Result<usize, PoolError> {
+        Ok(self.0.committer_pool.seal_idle_writers(idle)?)
+    }
+
+    /// Sets the erasure-coding policy for future conversions
+    /// (ARCHITECTURE.md §17.2.5); `0, 0` disables conversion. Existing
+    /// stripes are left as they are. Checkpoints, so it persists.
+    pub fn set_stripe_policy(&self, k: u8, m: u8, min_age_segments: Option<u32>) -> Result<(), PoolError> {
+        self.0.set_stripe_policy(k, m, min_age_segments)
+    }
+
+    /// The erasure-coding policy in force.
+    pub fn stripe_policy(&self) -> StripePolicyParams {
+        *self.0.stripe_policy.lock()
+    }
+
+    /// Every striped segment counted, with what the shards cost against a
+    /// full mirror of the same data (ARCHITECTURE.md §17.2).
+    pub fn stripe_status(&self) -> StripeStatus {
+        self.0.stripe_status()
     }
 
     /// The identity every device of this pool carries (ARCHITECTURE.md
@@ -1926,6 +2028,55 @@ impl PoolShared {
     /// must run after this `PoolShared` is wrapped in its `Arc` (`create`/
     /// `open` do so immediately after construction), since each timer's
     /// closure needs its own `Arc<PoolShared>` clone.
+    /// Seals every data and meta segment replica left `Open` on disk.
+    /// Nothing this process owns is open yet but the meta writer's own
+    /// segment (its data writers create segments on first use), so an
+    /// Open segment at mount is a crash's, or an old unmount's -- and a
+    /// segment nobody will ever seal is one the sweep, the coalescer and
+    /// the conversion pass never look at (§6, §17.2). Each replica is
+    /// sealed from its own scan, since a device that faulted mid-segment
+    /// holds fewer records than its siblings and a footer from one file
+    /// written on another would cut the longer one short. An Open replica
+    /// with no records is deleted instead: an empty file a writer opened
+    /// and never used.
+    fn seal_orphaned_segments(&self) -> Result<(), PoolError> {
+        let online = self.vdevs.online();
+        let live_meta = self.meta_writer.lock().segment_id();
+        let mut sealed = 0u64;
+        let mut removed = 0u64;
+        for kind in [StreamKind::Data, StreamKind::Meta] {
+            let mut ids: Vec<u64> = online
+                .iter()
+                .flat_map(|v| segment::segment_ids_on(&v.root, kind))
+                .collect();
+            ids.sort_unstable();
+            ids.dedup();
+            for id in ids {
+                if kind == StreamKind::Meta && id == live_meta {
+                    continue;
+                }
+                for (writer, records) in SegmentWriter::reopen_open_replicas(&online, id, kind)? {
+                    if records == 0 {
+                        let root = &writer.vdev_roots()[0];
+                        let path = segment::segment_path(root, id, kind);
+                        drop(writer);
+                        std::fs::remove_file(path)?;
+                        removed += 1;
+                    } else {
+                        for vdev_id in writer.seal()? {
+                            self.vdevs.fault(vdev_id);
+                        }
+                        sealed += 1;
+                    }
+                }
+            }
+        }
+        if sealed + removed > 0 {
+            tracing::info!("mount: sealed {sealed} orphaned open segment replica(s), removed {removed} empty one(s)");
+        }
+        Ok(())
+    }
+
     fn spawn_background_threads(self: &Arc<Self>) {
         let checkpoint_shared = Arc::clone(self);
         let checkpoint_task = background::PeriodicTask::spawn(
@@ -2038,10 +2189,11 @@ impl PoolShared {
         let snapshot_table = self.current_snapshot_table()?;
         live_roots.extend(snapshot_table.entries.iter().map(|e| e.root_hash));
 
+        let current = *self.stripe_policy.lock();
         let policy = coalesce::StripePolicy {
-            k: self.pool_params.stripe_k,
-            m: self.pool_params.stripe_m,
-            min_age_segments: self.pool_params.stripe_min_age_segments,
+            k: current.k,
+            m: current.m,
+            min_age_segments: current.min_age_segments,
             ..coalesce::StripePolicy::default()
         };
         self.coalesce.lock().run_pass_with(
@@ -2425,8 +2577,16 @@ impl PoolShared {
             // the one shard that holds it, reconstructed if that shard is
             // gone; never healed as a mirror -- a missing shard is
             // rebuilt by resilver, not by a read.
-            return match self.stripe_reader(preferred.segment_id).and_then(|r| Ok(r.read_record(preferred)?)) {
-                Ok((_, bytes)) => Ok(bytes),
+            let outcome = self.stripe_reader(preferred.segment_id).and_then(|r| {
+                let missing = r.missing();
+                let bytes = r.read_record(preferred)?.1;
+                if !missing.is_empty() {
+                    self.note_missing_shards(&r.desc.devices, &missing, hash, preferred, ino);
+                }
+                Ok(bytes)
+            });
+            return match outcome {
+                Ok(bytes) => Ok(bytes),
                 Err(e) => {
                     self.record_corruption(CorruptionEvent {
                         at: SystemTime::now(),
@@ -2706,6 +2866,7 @@ impl PoolShared {
                 "vdev {leaving} is this mount's primary and holds its index; it cannot leave while mounted"
             )));
         }
+        self.unstripe_for_detach(leaving)?;
         for vdev in self.vdevs.online() {
             if vdev.id == leaving {
                 continue;
@@ -2849,6 +3010,111 @@ impl PoolShared {
         self.seal_heal_writers()?;
         report.shards_rebuilt = self.rebuild_shards_on(vdev_id)?;
         Ok(report)
+    }
+
+    /// The detach guard for erasure coding (§17.2.4): a stripe's device
+    /// list is written once into every shard's descriptor and never
+    /// edited, so a device that holds shards cannot leave with its stripes
+    /// intact. Every stripe naming `leaving` is decoded back into a
+    /// mirrored segment on the online set first -- keeping every record;
+    /// the sweep sorts out the dead ones later -- and detach then proves
+    /// the survivors over mirrors alone. Refuses if any such stripe is
+    /// short of `k` readable shards: that data would leave with the
+    /// device. With the pool below `k + m` devices afterwards the
+    /// conversion pass is a no-op, as §17.2.3 says; with enough left, the
+    /// repacked segments go cold again and are re-striped over the
+    /// devices that remain.
+    fn unstripe_for_detach(&self, leaving: u16) -> Result<usize, PoolError> {
+        self.committer_pool.flush_index()?;
+        let repacked = self
+            .coalesce
+            .lock()
+            .unstripe_segments_naming(leaving, &self.persisted_index, &self.next_segment_id)
+            .map_err(|e| {
+                PoolError::Format(format!(
+                    "a striped segment with a shard on vdev {leaving} cannot be repacked to mirrors ({e}); refusing to detach"
+                ))
+            })?;
+        if !repacked.is_empty() {
+            tracing::info!(
+                "detach: {} striped segment(s) with a shard on vdev {leaving} repacked to mirrors first",
+                repacked.len()
+            );
+        }
+        Ok(repacked.len())
+    }
+
+    /// `pool_params` as they stand now: the creation-time parameters with
+    /// the stripe policy as last set, which is what a checkpoint persists.
+    fn current_pool_params(&self) -> PoolParams {
+        let mut params = self.pool_params;
+        let policy = *self.stripe_policy.lock();
+        params.stripe_k = policy.k;
+        params.stripe_m = policy.m;
+        params.stripe_min_age_segments = policy.min_age_segments;
+        params
+    }
+
+    /// Changes the erasure-coding policy for future conversions
+    /// (§17.2.5). Existing stripes keep their descriptor's shape; nothing
+    /// is re-striped. `0, 0` turns conversion off. Persisted by the next
+    /// checkpoint, which this runs so the change survives a crash.
+    fn set_stripe_policy(&self, k: u8, m: u8, min_age_segments: Option<u32>) -> Result<(), PoolError> {
+        validate_stripe_shape(k, m)?;
+        {
+            let mut policy = self.stripe_policy.lock();
+            policy.k = k;
+            policy.m = m;
+            if let Some(age) = min_age_segments {
+                policy.min_age_segments = age;
+            }
+        }
+        self.run_checkpoint()?;
+        Ok(())
+    }
+
+    /// What erasure coding has done to this pool (§17.2): the policy,
+    /// every striped segment counted, and the bytes it costs against what
+    /// the same data would cost mirrored on every online device.
+    fn stripe_status(&self) -> StripeStatus {
+        let policy = *self.stripe_policy.lock();
+        let online = self.vdevs.online();
+        let mut status = StripeStatus {
+            k: policy.k,
+            m: policy.m,
+            min_age_segments: policy.min_age_segments,
+            online_vdevs: online.len() as u16,
+            shard_bytes_by_vdev: online.iter().map(|v| (v.id, 0)).collect(),
+            ..StripeStatus::default()
+        };
+        for segment_id in self.striped_segments() {
+            let Ok(reader) = self.stripe_reader(segment_id) else {
+                status.unreadable_segments += 1;
+                continue;
+            };
+            status.striped_segments += 1;
+            status.logical_bytes += reader.desc.logical_len;
+            let shard_cost = reader.desc.shard_size + segment::SEGMENT_HEADER_PAGE_SIZE;
+            for (i, &vdev_id) in reader.desc.devices.iter().enumerate() {
+                if let Some(entry) = status.shard_bytes_by_vdev.iter_mut().find(|(id, _)| *id == vdev_id)
+                    && reader.verify_shard(i as u8).unwrap_or(false)
+                {
+                    entry.1 += shard_cost;
+                }
+            }
+            let missing = reader.missing().len();
+            if missing > 0 {
+                status.segments_missing_shards += 1;
+                if reader.present() < reader.desc.k as usize {
+                    status.unreadable_segments += 1;
+                }
+            }
+        }
+        status.shard_bytes = status.shard_bytes_by_vdev.iter().map(|(_, b)| *b).sum();
+        // A mirror copy is a header page plus the body, on every device.
+        status.mirrored_cost_bytes =
+            (status.logical_bytes + status.striped_segments * segment::SEGMENT_HEADER_PAGE_SIZE) * online.len() as u64;
+        status
     }
 
     /// Rebuilds every shard that the stripes say belongs on `vdev_id` and
@@ -3069,6 +3335,37 @@ impl PoolShared {
         [StreamKind::Data, StreamKind::Meta]
             .into_iter()
             .find(|&k| segment::segment_path(&root, segment_id, k).exists())
+    }
+
+    /// A striped read that had to reconstruct is the cold-data failover
+    /// (§17.2.3), and is counted as one. A shard whose device is online
+    /// but whose root has vanished means the device was pulled: it is
+    /// faulted, as a failed write would fault it, so status says so and
+    /// the rejoin probe watches for it. A shard missing or unreadable on
+    /// a device that is still there is a corruption event against that
+    /// device; resilver and scrub rebuild it -- a read never does.
+    fn note_missing_shards(&self, devices: &[u16], missing: &[u8], hash: Hash32, loc: ExtentLocation, ino: Option<u64>) {
+        self.repair_stats.failovers.fetch_add(1, Ordering::Relaxed);
+        for &i in missing {
+            let vdev_id = devices[i as usize];
+            if !self.is_online(vdev_id) {
+                continue;
+            }
+            if self.vdevs.root_of(vdev_id).is_some_and(|root| !root.exists()) {
+                self.vdevs.fault(vdev_id);
+                continue;
+            }
+            self.record_corruption(CorruptionEvent {
+                at: SystemTime::now(),
+                vdev_id,
+                stream: StreamKind::Data,
+                hash,
+                location: Some(loc),
+                ino,
+                detail: format!("shard {i} of striped segment {} unreadable; reconstructed from its siblings", loc.segment_id),
+                healed: false,
+            });
+        }
     }
 
     /// Opens the stripe for `segment_id` against every online device.
@@ -4629,6 +4926,10 @@ impl PoolShared {
     fn run_checkpoint(&self) -> Result<(), PoolError> {
         let _checkpoint_guard = self.checkpoint_lock.lock();
 
+        // Segments that stopped growing are sealed first, so they are
+        // fsynced by the seal and cold to every daemon from here on.
+        self.committer_pool.seal_idle_writers(IDLE_SEGMENT_SEAL)?;
+
         // Barrier #1: every shard's committer has appended to its own
         // Data-stream segment since the last checkpoint; fsync all of them
         // before any parent hash referencing their contents is committed.
@@ -4859,7 +5160,7 @@ impl PoolShared {
             root_dir_ino: ROOT_DIR_INO,
             next_ino_counter,
             snapshot_table_hash,
-            pool_params: self.pool_params,
+            pool_params: self.current_pool_params(),
             shard_watermarks,
         };
         let (root_hash, root_location) = self.put_meta_object(ExtentKind::RootObject, &root)?;

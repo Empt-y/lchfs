@@ -8,6 +8,14 @@ use lchfs_store::segment::{SEGMENT_HEADER_PAGE_SIZE, SegmentReader, SegmentWrite
 use lchfs_store::stripe::{StripeReader, rebuild_shard, shard_path, shards_on, write_stripe};
 use std::path::PathBuf;
 
+/// A device is where its ring is: a writer refuses to create a segment
+/// on a root without one, so a bare directory is given a ring first.
+fn device() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    lchfs_store::backend::FileBackend::open(dir.path()).unwrap();
+    dir
+}
+
 /// A sealed mirrored segment on one device, with records of varied sizes
 /// -- enough to span several shards at k=2 or k=3.
 fn sealed_segment(root: &std::path::Path, id: u64) -> Vec<(ExtentLocation, Vec<u8>)> {
@@ -42,8 +50,8 @@ fn root_of(devs: &[Vdev]) -> impl Fn(u16) -> Option<PathBuf> + '_ {
 
 #[test]
 fn every_record_reads_back_through_the_stripe() {
-    let src = tempfile::tempdir().unwrap();
-    let (a, b, c) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let src = device();
+    let (a, b, c) = (device(), device(), device());
     let records = sealed_segment(src.path(), 9);
     let body = body_of(src.path(), 9);
     let devs = devices(&[&a, &b, &c]);
@@ -72,8 +80,8 @@ fn every_record_reads_back_through_the_stripe() {
 
 #[test]
 fn a_missing_shard_is_reconstructed_on_read_and_rebuilt_on_disk() {
-    let src = tempfile::tempdir().unwrap();
-    let dirs: Vec<tempfile::TempDir> = (0..4).map(|_| tempfile::tempdir().unwrap()).collect();
+    let src = device();
+    let dirs: Vec<tempfile::TempDir> = (0..4).map(|_| device()).collect();
     let records = sealed_segment(src.path(), 11);
     let body = body_of(src.path(), 11);
     let devs: Vec<Vdev> = dirs.iter().enumerate().map(|(i, d)| Vdev::new(i as u16, d.path().to_path_buf())).collect();
@@ -98,7 +106,13 @@ fn a_missing_shard_is_reconstructed_on_read_and_rebuilt_on_disk() {
     // Byte-identical to what write_stripe would have produced: the same
     // header page and the same shard bytes.
     let fresh = tempfile::tempdir().unwrap();
-    let fresh_devs: Vec<Vdev> = (0..4).map(|i| Vdev::new(i, fresh.path().join(i.to_string()))).collect();
+    let fresh_devs: Vec<Vdev> = (0..4)
+        .map(|i| {
+            let root = fresh.path().join(i.to_string());
+            lchfs_store::backend::FileBackend::open(&root).unwrap();
+            Vdev::new(i, root)
+        })
+        .collect();
     write_stripe(&body, 11, 3, 1, &fresh_devs).unwrap();
     let original = std::fs::read(shard_path(&fresh_devs[1].root, 11, 1)).unwrap();
     assert_eq!(rebuilt, original);
@@ -106,8 +120,8 @@ fn a_missing_shard_is_reconstructed_on_read_and_rebuilt_on_disk() {
 
 #[test]
 fn a_parity_shard_can_go_too_and_more_than_m_cannot() {
-    let src = tempfile::tempdir().unwrap();
-    let dirs: Vec<tempfile::TempDir> = (0..4).map(|_| tempfile::tempdir().unwrap()).collect();
+    let src = device();
+    let dirs: Vec<tempfile::TempDir> = (0..4).map(|_| device()).collect();
     let records = sealed_segment(src.path(), 12);
     let body = body_of(src.path(), 12);
     let devs: Vec<Vdev> = dirs.iter().enumerate().map(|(i, d)| Vdev::new(i as u16, d.path().to_path_buf())).collect();
@@ -127,8 +141,8 @@ fn a_parity_shard_can_go_too_and_more_than_m_cannot() {
 
 #[test]
 fn a_corrupted_shard_fails_verification_and_the_record_check() {
-    let src = tempfile::tempdir().unwrap();
-    let dirs: Vec<tempfile::TempDir> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let src = device();
+    let dirs: Vec<tempfile::TempDir> = (0..3).map(|_| device()).collect();
     let records = sealed_segment(src.path(), 13);
     let body = body_of(src.path(), 13);
     let devs: Vec<Vdev> = dirs.iter().enumerate().map(|(i, d)| Vdev::new(i as u16, d.path().to_path_buf())).collect();

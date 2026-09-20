@@ -150,8 +150,8 @@ impl CoalesceDaemon {
     }
 
     /// Converts cold, mostly-live mirrored data segments into stripes
-    /// (§17.2.4 "conversion pass"). Bounded per pass so it never starves
-    /// the sweep. A segment is read from the primary and every record
+    /// (§17.2.4 "conversion pass"). Bounded in bytes per pass so it never
+    /// starves the sweep. A segment is read from the primary and every record
     /// verified before anything is written; a segment with a bad record
     /// is left for read failover and scrub to sort out first.
     fn stripe_cold_segments(
@@ -170,9 +170,9 @@ impl CoalesceDaemon {
         let Some(primary) = online.iter().find(|v| v.id == primary_id).cloned() else {
             return Ok(());
         };
-        let mut converted = 0;
+        let mut budget = policy.bytes_per_pass;
         for segment_id in GcEngine::aged_sealed_segments(&primary.root, policy.min_age_segments as usize) {
-            if converted >= policy.max_per_pass {
+            if budget == 0 {
                 break;
             }
             if !stripe::shards_on(&primary.root, segment_id).is_empty() {
@@ -188,6 +188,7 @@ impl CoalesceDaemon {
             if (live_bytes as f64 / total as f64) < policy.min_live_fraction {
                 continue;
             }
+            budget = budget.saturating_sub(total);
 
             // Read and verify every record from the primary's copy.
             let reader = SegmentReader::open(&primary.root, segment_id, StreamKind::Data)?;
@@ -241,7 +242,6 @@ impl CoalesceDaemon {
                 records.len(),
                 body.len()
             );
-            converted += 1;
         }
         Ok(())
     }
@@ -260,12 +260,9 @@ impl CoalesceDaemon {
     ) -> io::Result<()> {
         let online = self.vdevs.online();
         let striped_live = live.resolve_on(stripe::STRIPED, persisted_index).map_err(to_io_err)?;
-        let mut ids: Vec<u64> = online.iter().flat_map(|v| stripe::segment_ids_with_shards(&v.root)).collect();
-        ids.sort_unstable();
-        ids.dedup();
-        let mut repacked = 0;
-        for segment_id in ids {
-            if repacked >= policy.max_per_pass {
+        let mut budget = policy.bytes_per_pass;
+        for segment_id in self.striped_segment_ids(&online) {
+            if budget == 0 {
                 break;
             }
             let root_of = |id: u16| self.vdevs.root_of(id);
@@ -275,73 +272,128 @@ impl CoalesceDaemon {
             if total == 0 || (live_bytes as f64 / total as f64) >= self.gc.liveness_threshold() {
                 continue;
             }
-            let body = match reader.read_body(0, total) {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::warn!("stripe: segment {segment_id} cannot be reassembled for repack ({e})");
-                    continue;
-                }
-            };
             let empty = RoaringBitmap::new();
             let live_bitmap = striped_live.get(&segment_id).unwrap_or(&empty);
-            let pins = self.gc.pins();
-            let mut keep = Vec::new();
-            for (header, offset) in stripe::scan_body(&body) {
-                if live_bitmap.contains(offset) || pins.is_pinned(header.content_hash) {
-                    let loc = ExtentLocation {
-                        segment_id,
-                        offset,
-                        len: header.record_len,
-                    };
-                    let (full, raw) = reader.read_record_raw(loc).map_err(to_io_err)?;
-                    keep.push((full, raw));
-                }
+            budget = budget.saturating_sub(total);
+            if let Err(e) = self.unstripe(&reader, Some(live_bitmap), persisted_index, next_segment_id) {
+                tracing::warn!("stripe: segment {segment_id} cannot be repacked ({e})");
             }
-            let new_id = next_segment_id.fetch_add(1, Ordering::Relaxed);
-            let mut records = Vec::with_capacity(keep.len());
-            if !keep.is_empty() {
-                let mut writer = SegmentWriter::create_on(&online, new_id, StreamKind::Data, 0)?;
-                for (header, raw) in &keep {
-                    let new_loc = writer.append(
-                        header.kind,
-                        header.content_hash,
-                        header.codec_id,
-                        header.uncompressed_len,
-                        raw,
-                        header.backpointers.clone(),
-                    )?;
-                    records.push((header.content_hash, new_loc));
-                }
-                let written: Vec<u16> = writer.vdev_ids().to_vec();
-                for id in writer.seal()? {
-                    self.vdevs.fault(id);
-                }
-                persisted_index
-                    .write()
-                    .unstripe_segment(segment_id, &records, &written)
-                    .map_err(to_io_err)?;
-                for (hash, loc) in &records {
-                    self.gc_locations().put(*hash, *loc);
-                }
-            } else {
-                let dead: Vec<(Hash32, ExtentLocation)> = Vec::new();
-                persisted_index
-                    .write()
-                    .unstripe_segment(segment_id, &dead, &[])
-                    .map_err(to_io_err)?;
-            }
-            for vdev in &online {
-                for i in stripe::shards_on(&vdev.root, segment_id) {
-                    std::fs::remove_file(stripe::shard_path(&vdev.root, segment_id, i))?;
-                }
-            }
-            tracing::info!(
-                "stripe: segment {segment_id} repacked into mirrored segment {new_id} ({} live records kept)",
-                keep.len()
-            );
-            repacked += 1;
         }
         Ok(())
+    }
+
+    /// Every striped segment whose descriptor names `vdev_id` is decoded
+    /// back into a mirrored segment on the online set, keeping every
+    /// record (there is no mark to say which are dead; the sweep finds
+    /// out later). What detach needs before a device that holds shards
+    /// can leave (§17.2.4): a stripe's device list is written once and
+    /// never edited, so a shard cannot simply move to a survivor. Returns
+    /// the segments repacked; fails on the first stripe that is short of
+    /// `k` readable shards, with nothing half done.
+    pub fn unstripe_segments_naming(
+        &mut self,
+        vdev_id: u16,
+        persisted_index: &RwLock<RedbIndex>,
+        next_segment_id: &AtomicU64,
+    ) -> io::Result<Vec<u64>> {
+        let online = self.vdevs.online();
+        let mut repacked = Vec::new();
+        for segment_id in self.striped_segment_ids(&online) {
+            let root_of = |id: u16| self.vdevs.root_of(id);
+            let reader = stripe::StripeReader::open(segment_id, root_of, &online)?;
+            if !reader.desc.devices.contains(&vdev_id) {
+                continue;
+            }
+            self.unstripe(&reader, None, persisted_index, next_segment_id)?;
+            repacked.push(segment_id);
+        }
+        Ok(repacked)
+    }
+
+    /// Segment ids with a shard on any of `online`, ascending.
+    fn striped_segment_ids(&self, online: &[Vdev]) -> Vec<u64> {
+        let mut ids: Vec<u64> = online.iter().flat_map(|v| stripe::segment_ids_with_shards(&v.root)).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    /// Decodes one stripe into a fresh mirrored segment on the online
+    /// set and deletes the shards. With `live` given, only the records it
+    /// marks (or pinned ones) are kept; without it, every record is.
+    /// Index first, then the cache, then the shards go -- a crash before
+    /// the index write leaves the new segment an orphan the sweep
+    /// collects; after it, the shards are spare until deleted.
+    fn unstripe(
+        &mut self,
+        reader: &stripe::StripeReader,
+        live: Option<&RoaringBitmap>,
+        persisted_index: &RwLock<RedbIndex>,
+        next_segment_id: &AtomicU64,
+    ) -> io::Result<u64> {
+        let online = self.vdevs.online();
+        let segment_id = reader.segment_id;
+        let body = reader.read_body(0, reader.desc.logical_len)?;
+        let pins = self.gc.pins();
+        let mut keep = Vec::new();
+        for (header, offset) in stripe::scan_body(&body) {
+            let wanted = match live {
+                Some(bitmap) => bitmap.contains(offset) || pins.is_pinned(header.content_hash),
+                None => true,
+            };
+            if wanted {
+                let loc = ExtentLocation {
+                    segment_id,
+                    offset,
+                    len: header.record_len,
+                };
+                let (full, raw) = reader.read_record_raw(loc).map_err(to_io_err)?;
+                keep.push((full, raw));
+            }
+        }
+        let new_id = next_segment_id.fetch_add(1, Ordering::Relaxed);
+        let mut records = Vec::with_capacity(keep.len());
+        if !keep.is_empty() {
+            let mut writer = SegmentWriter::create_on(&online, new_id, StreamKind::Data, 0)?;
+            for (header, raw) in &keep {
+                let new_loc = writer.append(
+                    header.kind,
+                    header.content_hash,
+                    header.codec_id,
+                    header.uncompressed_len,
+                    raw,
+                    header.backpointers.clone(),
+                )?;
+                records.push((header.content_hash, new_loc));
+            }
+            let written: Vec<u16> = writer.vdev_ids().to_vec();
+            for id in writer.seal()? {
+                self.vdevs.fault(id);
+            }
+            persisted_index
+                .write()
+                .unstripe_segment(segment_id, &records, &written)
+                .map_err(to_io_err)?;
+            for (hash, loc) in &records {
+                self.gc_locations().put(*hash, *loc);
+            }
+        } else {
+            let dead: Vec<(Hash32, ExtentLocation)> = Vec::new();
+            persisted_index
+                .write()
+                .unstripe_segment(segment_id, &dead, &[])
+                .map_err(to_io_err)?;
+        }
+        for vdev in &online {
+            for i in stripe::shards_on(&vdev.root, segment_id) {
+                std::fs::remove_file(stripe::shard_path(&vdev.root, segment_id, i))?;
+            }
+        }
+        tracing::info!(
+            "stripe: segment {segment_id} repacked into mirrored segment {new_id} ({} records kept)",
+            keep.len()
+        );
+        Ok(new_id)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -492,8 +544,12 @@ pub struct StripePolicy {
     /// Only segments at least this live are worth striping; a mostly-dead
     /// one is repacked first and striped once it is full of live data.
     pub min_live_fraction: f64,
-    /// Conversions and repacks per pass, so neither starves the sweep.
-    pub max_per_pass: usize,
+    /// Segment bytes converted (and, separately, repacked) per pass, so
+    /// neither starves the sweep. In bytes, not segments: a segment seals
+    /// at every checkpoint of its committer shard, so under a real
+    /// workload sealed segments are a few MiB, not the 128 MiB cap, and a
+    /// count would convert almost nothing per pass.
+    pub bytes_per_pass: u64,
 }
 
 impl Default for StripePolicy {
@@ -503,7 +559,7 @@ impl Default for StripePolicy {
             m: 0,
             min_age_segments: 8,
             min_live_fraction: 0.9,
-            max_per_pass: 4,
+            bytes_per_pass: 512 * 1024 * 1024,
         }
     }
 }

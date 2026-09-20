@@ -7,9 +7,18 @@
 use lchfs_format::{CodecId, ExtentKind, Hash32};
 use lchfs_store::segment::{SegmentReader, SegmentWriter};
 
+/// A device is where its ring is: a writer refuses to create a segment
+/// on a root without one, so a bare directory is given a ring first.
+fn device() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    lchfs_store::backend::FileBackend::open(dir.path()).unwrap();
+    dir
+}
+
+
 #[test]
 fn delta_segment_round_trips_and_is_shard_scoped() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = device();
 
     let mut w7 = SegmentWriter::create_delta(&[dir.path()], 7, 0).unwrap();
     let payload = b"delta log entry payload";
@@ -63,7 +72,7 @@ fn delta_segment_round_trips_and_is_shard_scoped() {
 
 #[test]
 fn delta_segment_seal_round_trips_stream_kind_and_owner_shard() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = device();
     let w = SegmentWriter::create_delta(&[dir.path()], 3, 0).unwrap();
     w.seal().unwrap();
 

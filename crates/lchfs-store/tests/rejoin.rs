@@ -227,3 +227,44 @@ fn a_device_taken_offline_on_purpose_stays_offline() {
     assert_eq!(id, 1);
     assert_eq!(health(&pool, 1), VdevHealth::Online);
 }
+
+/// Found on a live mount (§17.3): the probe opened the device's ring with
+/// the creating open, so a pulled device's path grew a directory and a
+/// blank superblock while it was away -- and the real device, moved back
+/// to that path, landed inside the impostor. Probing must create nothing.
+#[test]
+fn probing_a_pulled_device_creates_nothing_at_its_path() {
+    let a = tempfile::tempdir().unwrap();
+    let parent = tempfile::tempdir().unwrap();
+    let b = parent.path().join("b");
+    let pool = Pool::create_replicated(&[a.path(), &b], small_params()).unwrap();
+    let ino = pool.create_file(1, "f", 0o644).unwrap();
+    pool.write(ino, 0, &payload(71)).unwrap();
+    pool.checkpoint().unwrap();
+
+    // Pull it. An open segment file survives its directory's rename, so
+    // the fault comes when the shard needs a new segment: the writer
+    // will not create one where no ring is.
+    let away = parent.path().join("b.pulled");
+    std::fs::rename(&b, &away).unwrap();
+    pool.seal_idle_segments(std::time::Duration::ZERO).unwrap();
+    pool.write(ino, 0, &payload(72)).unwrap();
+    pool.checkpoint().unwrap();
+    assert_eq!(health(&pool, 1), VdevHealth::Faulted);
+
+    // Several probe intervals later, nothing has appeared at the path.
+    std::thread::sleep(std::time::Duration::from_millis(7500));
+    assert!(!b.exists(), "the probe recreated the pulled device's path");
+
+    // Put it back where it was: the probe finds it and it rejoins.
+    std::fs::rename(&away, &b).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(12);
+    while health(&pool, 1) != VdevHealth::Online && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert_eq!(health(&pool, 1), VdevHealth::Online);
+    assert_eq!(read_file(&pool, "f", 30_000), payload(72));
+    pool.checkpoint().unwrap();
+    drop(pool);
+    clean_replicas(a.path(), &b).unwrap();
+}

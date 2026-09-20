@@ -6,6 +6,15 @@ use lchfs_format::{ExtentKind, Hash32};
 use lchfs_store::delta_log::{ShardCommitRecord, ShardDeltaLog};
 use std::io::{Seek, SeekFrom, Write};
 
+/// A device is where its ring is: a writer refuses to create a segment
+/// on a root without one, so a bare directory is given a ring first.
+fn device() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    lchfs_store::backend::FileBackend::open(dir.path()).unwrap();
+    dir
+}
+
+
 fn inode_record(tag: &str) -> ShardCommitRecord {
     let bytes = format!("inode-object-bytes-{tag}").into_bytes();
     let hash = Hash32::of(&bytes);
@@ -18,7 +27,7 @@ fn inode_record(tag: &str) -> ShardCommitRecord {
 
 #[test]
 fn commit_then_replay_from_zero_returns_all_entries_in_order() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = device();
     let mut log = ShardDeltaLog::open(&[dir.path().to_path_buf()], 0).unwrap();
 
     for i in 1..=5u64 {
@@ -38,7 +47,7 @@ fn commit_then_replay_from_zero_returns_all_entries_in_order() {
 
 #[test]
 fn replay_since_watermark_only_returns_newer_entries() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = device();
     let mut log = ShardDeltaLog::open(&[dir.path().to_path_buf()], 0).unwrap();
     for i in 1..=5u64 {
         log.commit(i, Hash32::of(format!("hash-{i}").as_bytes()), &[])
@@ -52,7 +61,7 @@ fn replay_since_watermark_only_returns_newer_entries() {
 
 #[test]
 fn state_survives_drop_and_reopen() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = device();
     {
         let mut log = ShardDeltaLog::open(&[dir.path().to_path_buf()], 2).unwrap();
         log.commit(10, Hash32::of(b"a"), &[]).unwrap();
@@ -74,7 +83,7 @@ fn state_survives_drop_and_reopen() {
 
 #[test]
 fn torn_trailing_record_is_tolerated_not_fatal() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = device();
     {
         let mut log = ShardDeltaLog::open(&[dir.path().to_path_buf()], 5).unwrap();
         log.commit(1, Hash32::of(b"first"), &[]).unwrap();
@@ -108,7 +117,7 @@ fn torn_trailing_record_is_tolerated_not_fatal() {
 
 #[test]
 fn missing_shard_superblock_degrades_to_fresh_state() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = device();
     // Never committed anything for this shard — open() must not error.
     let log = ShardDeltaLog::open(&[dir.path().to_path_buf()], 99).unwrap();
     let slot = log.read_shard_superblock().unwrap();
@@ -117,7 +126,7 @@ fn missing_shard_superblock_degrades_to_fresh_state() {
 
 #[test]
 fn corrupt_shard_superblock_degrades_to_fresh_state_not_a_hard_error() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = device();
     {
         let mut log = ShardDeltaLog::open(&[dir.path().to_path_buf()], 1).unwrap();
         log.commit(1, Hash32::of(b"x"), &[]).unwrap();

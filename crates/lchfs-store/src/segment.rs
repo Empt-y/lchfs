@@ -111,12 +111,34 @@ pub(crate) fn segment_dir(pool_root: &Path, kind: StreamKind) -> PathBuf {
 }
 
 pub(crate) fn segment_path(pool_root: &Path, segment_id: u64, kind: StreamKind) -> PathBuf {
-    let ext = match kind {
+    segment_dir(pool_root, kind).join(format!("{segment_id}.{}", stream_extension(kind)))
+}
+
+fn stream_extension(kind: StreamKind) -> &'static str {
+    match kind {
         StreamKind::Data => "aseg",
         StreamKind::Meta => "mseg",
         StreamKind::Delta => unreachable!("Delta streams are shard-scoped, use delta_segment_path"),
-    };
-    segment_dir(pool_root, kind).join(format!("{segment_id}.{ext}"))
+    }
+}
+
+/// Every segment id with a file of `kind` under a device root (the
+/// stream's own extension only; a shard file `<id>.ec<i>` is a stripe's).
+pub fn segment_ids_on(root: &Path, kind: StreamKind) -> Vec<u64> {
+    let ext = stream_extension(kind);
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(segment_dir(root, kind)) {
+        for e in rd.flatten() {
+            let path = e.path();
+            if path.extension().and_then(|x| x.to_str()) == Some(ext)
+                && let Some(id) = path.file_stem().and_then(|s| s.to_str()).and_then(|s| s.parse::<u64>().ok())
+            {
+                out.push(id);
+            }
+        }
+    }
+    out.sort_unstable();
+    out
 }
 
 /// Per-shard Delta stream directory (ARCHITECTURE.md §3, Phase E): each
@@ -245,6 +267,65 @@ impl SegmentWriter {
     /// Slots dropped from this segment's fan-out since the last call,
     /// because an operation on their file failed. The owner reports them
     /// to the pool's device set.
+    /// Reopens each replica of a segment left `Open` on disk by a process
+    /// that is gone -- a crash, or an unmount from before segments were
+    /// sealed at shutdown -- so it can be sealed. One writer per Open
+    /// replica, each built from a scan of *that* file: the footer needs
+    /// the record count and the fingerprint over content hashes in order,
+    /// and replicas of one segment can legitimately differ (a device that
+    /// faulted mid-segment holds fewer records than its siblings), so a
+    /// footer computed on one file must never be written on another. The
+    /// footer goes after the last record the scan found, so a torn tail
+    /// is dropped and a resync'd stretch behind good records is kept.
+    /// Replicas already sealed are left alone. Each entry is the writer
+    /// and its record count; one with no records is the caller's to
+    /// delete rather than seal.
+    pub fn reopen_open_replicas(vdevs: &[Vdev], segment_id: u64, kind: StreamKind) -> io::Result<Vec<(Self, u64)>> {
+        let mut out = Vec::new();
+        for vdev in vdevs {
+            let path = segment_path(&vdev.root, segment_id, kind);
+            if !path.exists() {
+                continue;
+            }
+            let reader = SegmentReader::open(&vdev.root, segment_id, kind).map_err(io::Error::other)?;
+            let header = reader.read_header().map_err(io::Error::other)?;
+            if header.state != SegmentState::Open {
+                continue;
+            }
+            let mut fingerprint = blake3::Hasher::new();
+            let mut record_count = 0u64;
+            let mut cursor = SEGMENT_HEADER_PAGE_SIZE;
+            for (record, offset) in reader.scan() {
+                fingerprint.update(&record.content_hash.0);
+                record_count += 1;
+                cursor = cursor.max(offset as u64 + record.record_len as u64);
+            }
+            let file = match OpenOptions::new().read(true).write(true).open(&path) {
+                Ok(file) => file,
+                Err(e) => {
+                    tracing::error!("vdev {}: cannot reopen segment {segment_id} ({e}); leaving it open", vdev.id);
+                    continue;
+                }
+            };
+            out.push((
+                Self {
+                    files: vec![file],
+                    vdev_ids: vec![vdev.id],
+                    roots: vec![vdev.root.clone()],
+                    faulted: Vec::new(),
+                    segment_id,
+                    stream_kind: kind,
+                    owner_shard: header.owner_shard,
+                    cursor,
+                    record_count,
+                    fingerprint,
+                },
+                record_count,
+            ));
+        }
+        Ok(out)
+    }
+
     pub fn take_faults(&mut self) -> Vec<u16> {
         std::mem::take(&mut self.faulted)
     }
@@ -298,6 +379,11 @@ impl SegmentWriter {
         &self.vdev_ids
     }
 
+    /// The device roots this writer's segment still fans out to.
+    pub fn vdev_roots(&self) -> &[PathBuf] {
+        &self.roots
+    }
+
     /// Opens the segment on every device `path_for` can place it on. A
     /// device where the directory or the file cannot be created -- gone
     /// from the filesystem, read-only, full -- is left out and recorded in
@@ -325,8 +411,14 @@ impl SegmentWriter {
             let injected = fault_injection::is_dead(&vdev.root);
             #[cfg(not(feature = "fault-injection"))]
             let injected = false;
+            // A device is where its ring is. Creating a segment tree on a
+            // path whose ring is gone -- a device pulled, a mountpoint
+            // with nothing mounted -- would write into an impostor, so
+            // that device is dropped from this segment instead.
             let opened = if injected {
                 Err(io::Error::other("fault injected"))
+            } else if !crate::backend::superblock_path(&vdev.root).is_file() {
+                Err(io::Error::new(io::ErrorKind::NotFound, "device has no superblock at its root"))
             } else {
                 path_for(vdev).and_then(|path| {
                     OpenOptions::new()

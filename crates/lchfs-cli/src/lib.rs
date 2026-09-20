@@ -16,7 +16,15 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Initialize a new pool at the given path.
-    CreatePool { path: PathBuf },
+    CreatePool {
+        path: PathBuf,
+        /// Erasure-code cold segments as K data + M parity shards once the
+        /// pool has K+M devices (ARCHITECTURE.md §17.2). Both or neither.
+        #[arg(long, requires = "stripe_m")]
+        stripe_k: Option<u8>,
+        #[arg(long, requires = "stripe_k")]
+        stripe_m: Option<u8>,
+    },
     /// Mount a pool at the given mountpoint via FUSE3.
     Mount {
         /// Any one of the pool's devices (vdev 0 unless --scan is given).
@@ -72,6 +80,11 @@ enum Command {
         verify_index: bool,
         #[arg(long)]
         rebuild_index: bool,
+        /// Rewrite any missing or corrupt shard of an erasure-coded
+        /// segment from its siblings (ARCHITECTURE.md §17.2), on the
+        /// devices given, before checking.
+        #[arg(long)]
+        rebuild_shard: bool,
     },
     /// Add a blank device to a pool, or replace a dead one, offline
     /// (ARCHITECTURE.md §15.10). The next mount resilvers onto it.
@@ -134,6 +147,21 @@ enum PoolAction {
         #[arg(long)]
         clear: bool,
     },
+    /// Set the erasure-coding policy for future conversions of cold
+    /// segments (ARCHITECTURE.md §17.2.5): K data + M parity shards, or
+    /// 0 0 to stop converting. Existing stripes keep their shape.
+    SetStripe {
+        root: PathBuf,
+        k: u8,
+        m: u8,
+        /// How many sealed segments past the sweep grace window a
+        /// segment must be before it counts as cold.
+        #[arg(long)]
+        min_age_segments: Option<u32>,
+    },
+    /// What erasure coding has done: the policy, striped segments, and
+    /// bytes saved against a full mirror.
+    StripeStatus { root: PathBuf },
 }
 
 #[derive(Subcommand)]
@@ -148,7 +176,7 @@ pub fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::CreatePool { path } => create_pool(&path),
+        Command::CreatePool { path, stripe_k, stripe_m } => create_pool(&path, stripe_k, stripe_m),
         Command::Mount { pool, mountpoint, vdevs, scan, degraded } => {
             mount(&pool, &vdevs, &scan, degraded, &mountpoint)
         }
@@ -156,7 +184,7 @@ pub fn run() -> anyhow::Result<()> {
         Command::ServeNfs { pool, listen, vdevs, scan, degraded } => {
             serve_nfs(&pool, &vdevs, &scan, degraded, &listen)
         }
-        Command::Fsck { pool, vdevs, scan, verify_index, rebuild_index } => {
+        Command::Fsck { pool, vdevs, scan, verify_index, rebuild_index, rebuild_shard } => {
             let mut vdevs = vdevs;
             if !scan.is_empty() {
                 let uuid = lchfs_fsck::read_superblock(&pool)?.pool_uuid;
@@ -171,7 +199,7 @@ pub fn run() -> anyhow::Result<()> {
                     }
                 }
             }
-            fsck(&pool, &vdevs, verify_index, rebuild_index)
+            fsck(&pool, &vdevs, verify_index, rebuild_index, rebuild_shard)
         }
         Command::AttachVdev { pool, vdevs, new_device } => {
             let mut roots: Vec<&std::path::Path> = vec![pool.as_path()];
@@ -196,9 +224,22 @@ pub fn run() -> anyhow::Result<()> {
     }
 }
 
-fn create_pool(path: &std::path::Path) -> anyhow::Result<()> {
-    let pool = lchfs_store::Pool::create(path, lchfs_format::PoolParams::default())?;
+fn create_pool(path: &std::path::Path, stripe_k: Option<u8>, stripe_m: Option<u8>) -> anyhow::Result<()> {
+    let mut params = lchfs_format::PoolParams::default();
+    if let (Some(k), Some(m)) = (stripe_k, stripe_m) {
+        params.stripe_k = k;
+        params.stripe_m = m;
+    }
+    let pool = lchfs_store::Pool::create(path, params)?;
     println!("pool {} created at {}", lchfs_format::pool_uuid_hex(&pool.pool_uuid()), path.display());
+    if params.stripe_k > 0 {
+        println!(
+            "cold segments will be erasure-coded {}+{} once the pool has {} devices",
+            params.stripe_k,
+            params.stripe_m,
+            params.stripe_k as u16 + params.stripe_m as u16
+        );
+    }
     Ok(())
 }
 
@@ -325,34 +366,46 @@ fn fsck(
     other_vdevs: &[PathBuf],
     verify_index: bool,
     rebuild_index: bool,
+    rebuild_shard: bool,
 ) -> anyhow::Result<()> {
     // No `Pool::open` here: fsck deliberately reads the pool directory
     // directly (see lchfs-fsck's module doc comment) rather than going
     // through the live engine -- opening a `Pool` would also run mount-
     // time crash recovery and spawn its background checkpoint/coalesce/
     // dedup threads, neither of which this one-shot diagnostic needs.
+    let mut roots: Vec<&std::path::Path> = vec![pool];
+    roots.extend(other_vdevs.iter().map(|p| p.as_path()));
+    if rebuild_shard {
+        let rebuilt = lchfs_fsck::rebuild_shards(&roots)?;
+        for r in &rebuilt {
+            println!(
+                "Rebuilt shard {} of striped segment {} onto vdev {}.",
+                r.shard_index, r.segment_id, r.vdev_id
+            );
+        }
+        println!("{} shard(s) rebuilt.", rebuilt.len());
+    }
     if rebuild_index {
         let others: Vec<&std::path::Path> = other_vdevs.iter().map(|p| p.as_path()).collect();
         lchfs_fsck::rebuild_index(pool, &others)?;
         println!("INDEX.redb rebuilt from {} vdev(s).", others.len() + 1);
     }
 
+    // The walk audits vdev 0's mirrored segments; striped segments are
+    // read through the shards on every device given (§17.2).
     let live_roots = lchfs_fsck::collect_live_roots(pool)?;
     let mut report = if verify_index {
-        lchfs_fsck::verify_index(pool, &live_roots)
+        lchfs_fsck::verify_index_devices(&roots, &live_roots)
     } else {
-        lchfs_fsck::check(pool, &live_roots)
+        lchfs_fsck::check_devices(&roots, &live_roots)
     };
     println!("Objects visited: {}", report.objects_visited);
 
-    // The DAG walk above audits vdev 0. With the other devices named, the
-    // replicas are compared against each other too; without them, say so
-    // when the pool is replicated rather than quietly checking one device
-    // of several.
+    // With the other devices named, the replicas are compared against
+    // each other too; without them, say so when the pool is replicated
+    // rather than quietly checking one device of several.
     let superblock = lchfs_fsck::read_superblock(pool)?;
     if !other_vdevs.is_empty() {
-        let mut roots: Vec<&std::path::Path> = vec![pool];
-        roots.extend(other_vdevs.iter().map(|p| p.as_path()));
         let replicas = lchfs_fsck::check_replicas(&roots);
         println!(
             "Records compared across {} vdevs: {}",
@@ -406,6 +459,11 @@ fn pool_control(action: PoolAction) -> anyhow::Result<()> {
         PoolAction::Promote { root } => (root, json!({ "cmd": "promote" })),
         PoolAction::Detach { root } => (root, json!({ "cmd": "detach" })),
         PoolAction::Corruption { root, clear } => (root, json!({ "cmd": "corruption", "clear": clear })),
+        PoolAction::SetStripe { root, k, m, min_age_segments } => (
+            root,
+            json!({ "cmd": "set-stripe", "k": k, "m": m, "min_age_segments": min_age_segments }),
+        ),
+        PoolAction::StripeStatus { root } => (root, json!({ "cmd": "stripe-status" })),
     };
     let reply = control::request(&root.join(control::SOCKET_NAME), &req)?;
     println!("{}", serde_json::to_string_pretty(&reply)?);

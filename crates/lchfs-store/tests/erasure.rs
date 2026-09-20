@@ -191,7 +191,7 @@ fn a_stripe_that_goes_mostly_dead_is_repacked_to_a_mirror() {
     pool.checkpoint().unwrap();
     drop(pool);
     let roots = lchfs_fsck::collect_live_roots(a.path()).unwrap();
-    let report = lchfs_fsck::check(a.path(), &roots);
+    let report = lchfs_fsck::check_devices(&[a.path(), b.path(), c.path()], &roots);
     assert!(report.is_clean(), "{:?}", report.errors);
 }
 
@@ -204,4 +204,213 @@ fn two_devices_get_no_stripes_and_bad_shapes_are_refused() {
     drop(pool);
     let err = Pool::create(&a.path().join("x"), striped_params(1, 1)).unwrap_err().to_string();
     assert!(err.contains("stripe policy"), "{err}");
+}
+
+/// A stripe's device list is written once; a device that holds shards
+/// cannot leave until every stripe naming it is a mirror again
+/// (§17.2.4 "detach").
+#[test]
+fn detach_repacks_the_stripes_that_name_the_leaving_device() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let c = tempfile::tempdir().unwrap();
+    let striped = {
+        let pool = populated_and_striped(&[a.path(), b.path(), c.path()], 2, 1);
+        let status = pool.stripe_status();
+        assert_eq!(status.striped_segments as usize, segment_ids_with_shards(a.path()).len());
+        assert_eq!(status.segments_missing_shards, 0);
+        assert!(status.shard_bytes < status.mirrored_cost_bytes, "{status:?}");
+        assert_eq!(status.shard_bytes_by_vdev.len(), 3);
+        pool.checkpoint().unwrap();
+        segment_ids_with_shards(a.path())
+    };
+    assert!(!striped.is_empty());
+
+    assert_eq!(Pool::detach_vdev(&[a.path(), b.path(), c.path()]).unwrap(), 2);
+    for root in [a.path(), b.path()] {
+        assert!(segment_ids_with_shards(root).is_empty(), "every 2+1 stripe named vdev 2 and must be a mirror again");
+    }
+    assert!(!c.path().join("SUPERBLOCK").exists());
+
+    let pool = Pool::open_replicated(&[a.path(), b.path()]).unwrap();
+    for i in 0..14u32 {
+        assert_eq!(read_file(&pool, &format!("f{i}"), 30_000), payload(i));
+    }
+    assert_eq!(pool.stripe_status().striped_segments, 0);
+    // Two devices cannot hold a 2+1 stripe: the pass stays a no-op.
+    for _ in 0..4 {
+        pool.run_gc_and_coalesce_pass().unwrap();
+    }
+    assert!(segment_ids_with_shards(a.path()).is_empty());
+    pool.checkpoint().unwrap();
+    drop(pool);
+    let roots = lchfs_fsck::collect_live_roots(a.path()).unwrap();
+    let report = lchfs_fsck::check_devices(&[a.path(), b.path()], &roots);
+    assert!(report.is_clean(), "{:?}", report.errors);
+    let report = lchfs_fsck::check_replicas(&[a.path(), b.path()]);
+    assert!(report.is_clean(), "{:?}", report.errors);
+}
+
+#[test]
+fn live_detach_repacks_stripes_and_leaves_unrelated_ones_alone() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let c = tempfile::tempdir().unwrap();
+    let d = tempfile::tempdir().unwrap();
+    // Four devices, 2+1 stripes: the conversion pass takes the first
+    // three online devices, so no stripe names vdev 3.
+    let pool = populated_and_striped(&[a.path(), b.path(), c.path(), d.path()], 2, 1);
+    let striped = segment_ids_with_shards(a.path());
+    assert!(!striped.is_empty());
+    assert!(segment_ids_with_shards(d.path()).is_empty(), "no stripe should have a shard on vdev 3");
+
+    assert_eq!(pool.detach_vdev_live().unwrap(), 3);
+    assert_eq!(segment_ids_with_shards(a.path()), striped, "stripes not naming the leaver are untouched");
+    for i in 0..14u32 {
+        assert_eq!(read_file(&pool, &format!("f{i}"), 30_000), payload(i));
+    }
+
+    // Now vdev 2 leaves: every stripe names it, so every one is repacked
+    // to a mirror first, and the pool reads whole after.
+    assert_eq!(pool.detach_vdev_live().unwrap(), 2);
+    assert!(segment_ids_with_shards(a.path()).is_empty());
+    assert!(segment_ids_with_shards(b.path()).is_empty());
+    for i in 0..14u32 {
+        assert_eq!(read_file(&pool, &format!("f{i}"), 30_000), payload(i));
+    }
+    assert_eq!(pool.stripe_status().striped_segments, 0);
+    pool.checkpoint().unwrap();
+    drop(pool);
+    let roots = lchfs_fsck::collect_live_roots(a.path()).unwrap();
+    let report = lchfs_fsck::check_replicas(&[a.path(), b.path()]);
+    assert!(report.is_clean(), "{:?}", report.errors);
+    let report = lchfs_fsck::check_devices(&[a.path(), b.path()], &roots);
+    assert!(report.is_clean(), "{:?}", report.errors);
+}
+
+#[test]
+fn detach_refuses_when_a_stripe_cannot_be_read_back() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let c = tempfile::tempdir().unwrap();
+    drop(populated_and_striped(&[a.path(), b.path(), c.path()], 2, 1));
+    let striped = segment_ids_with_shards(a.path());
+    // Take two of a stripe's three shards away: one shard cannot rebuild
+    // a 2+1 stripe, and that data must not leave with vdev 2.
+    let id = striped[0];
+    for root in [a.path(), b.path()] {
+        for i in lchfs_store::stripe::shards_on(root, id) {
+            std::fs::remove_file(lchfs_store::stripe::shard_path(root, id, i)).unwrap();
+        }
+    }
+    let err = Pool::detach_vdev(&[a.path(), b.path(), c.path()]).unwrap_err().to_string();
+    assert!(err.contains("refusing to detach"), "{err}");
+    assert!(c.path().join("SUPERBLOCK").exists(), "nothing was changed");
+}
+
+#[test]
+fn the_stripe_policy_changes_live_and_persists() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let c = tempfile::tempdir().unwrap();
+    let pool = Pool::create_replicated(&[a.path(), b.path(), c.path()], striped_params(0, 0)).unwrap();
+    assert!(!pool.stripe_policy().enabled());
+    for i in 0..14u32 {
+        let ino = pool.create_file(1, &format!("f{i}"), 0o644).unwrap();
+        pool.write(ino, 0, &payload(i)).unwrap();
+    }
+    pool.checkpoint().unwrap();
+    for _ in 0..8 {
+        pool.run_gc_and_coalesce_pass().unwrap();
+    }
+    assert!(segment_ids_with_shards(a.path()).is_empty(), "policy off: nothing striped");
+
+    let err = pool.set_stripe_policy(1, 1, None).unwrap_err().to_string();
+    assert!(err.contains("stripe policy"), "{err}");
+    pool.set_stripe_policy(2, 1, Some(0)).unwrap();
+    assert_eq!(
+        pool.stripe_policy(),
+        lchfs_store::StripePolicyParams { k: 2, m: 1, min_age_segments: 0 }
+    );
+    for _ in 0..8 {
+        pool.run_gc_and_coalesce_pass().unwrap();
+    }
+    let striped = segment_ids_with_shards(a.path());
+    assert!(!striped.is_empty(), "policy on: cold segments convert");
+    let status = pool.stripe_status();
+    assert_eq!((status.k, status.m), (2, 1));
+    assert_eq!(status.striped_segments as usize, striped.len());
+    drop(pool);
+
+    // Remount: the policy came back from the root object, as did the
+    // stripes.
+    let pool = Pool::open_replicated(&[a.path(), b.path(), c.path()]).unwrap();
+    assert_eq!(pool.stripe_policy().k, 2);
+    for i in 0..14u32 {
+        assert_eq!(read_file(&pool, &format!("f{i}"), 30_000), payload(i));
+    }
+    // Off again: existing stripes stay, no new ones form.
+    pool.set_stripe_policy(0, 0, None).unwrap();
+    for i in 14..20u32 {
+        let ino = pool.create_file(1, &format!("f{i}"), 0o644).unwrap();
+        pool.write(ino, 0, &payload(i)).unwrap();
+    }
+    pool.checkpoint().unwrap();
+    for _ in 0..8 {
+        pool.run_gc_and_coalesce_pass().unwrap();
+    }
+    assert_eq!(segment_ids_with_shards(a.path()), striped);
+}
+
+/// A read that reconstructs is the cold-data failover and is accounted
+/// like one: a shard gone from a device that is still there is a
+/// corruption event against it, and a device whose root has vanished is
+/// faulted -- the pool must not read as healthy while serving from
+/// parity.
+#[test]
+fn a_reconstructing_read_is_counted_and_a_pulled_device_is_faulted() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let c = tempfile::tempdir().unwrap();
+    let pool = populated_and_striped(&[a.path(), b.path(), c.path()], 2, 1);
+    let striped = segment_ids_with_shards(c.path());
+    let id = striped[0];
+    for i in lchfs_store::stripe::shards_on(c.path(), id) {
+        std::fs::remove_file(lchfs_store::stripe::shard_path(c.path(), id, i)).unwrap();
+    }
+    // The location cache is what read_verified consults; a remount reads
+    // cold.
+    pool.checkpoint().unwrap();
+    drop(pool);
+    let pool = Pool::open_replicated(&[a.path(), b.path(), c.path()]).unwrap();
+    for i in 0..14u32 {
+        assert_eq!(read_file(&pool, &format!("f{i}"), 30_000), payload(i));
+    }
+    let stats = pool.repair_stats();
+    assert!(stats.failovers > 0, "{stats:?}");
+    let events = pool.corruption_events();
+    assert!(
+        events.iter().any(|e| e.vdev_id == 2 && e.location.is_some_and(|l| l.segment_id == id) && !e.healed),
+        "{events:?}"
+    );
+    assert_eq!(pool.vdev_status().iter().find(|s| s.id == 2).unwrap().health, lchfs_store::VdevHealth::Online);
+    // Resilver puts the shard back, and reads stop reconstructing.
+    assert_eq!(pool.resilver(2).unwrap().shards_rebuilt, 1);
+    let before = pool.repair_stats().failovers;
+    for i in 0..14u32 {
+        assert_eq!(read_file(&pool, &format!("f{i}"), 30_000), payload(i));
+    }
+    assert_eq!(pool.repair_stats().failovers, before);
+
+    // Pull the device: its root is gone, and the next cold read that
+    // needs it faults it.
+    let pulled = c.path().with_extension("pulled");
+    std::fs::rename(c.path(), &pulled).unwrap();
+    pool.clear_corruption_events();
+    for i in 0..14u32 {
+        assert_eq!(read_file(&pool, &format!("f{i}"), 30_000), payload(i));
+    }
+    assert_eq!(pool.vdev_status().iter().find(|s| s.id == 2).unwrap().health, lchfs_store::VdevHealth::Faulted);
+    assert!(pool.corruption_events().is_empty(), "a pulled device is a fault, not corruption");
+    std::fs::rename(&pulled, c.path()).unwrap();
 }

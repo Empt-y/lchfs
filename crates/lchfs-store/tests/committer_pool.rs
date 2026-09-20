@@ -9,6 +9,14 @@ use lchfs_store::segment::SegmentReader;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
+/// A device is where its ring is: a writer refuses to create a segment
+/// on a root without one, so a bare directory is given a ring first.
+fn device() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    lchfs_store::backend::FileBackend::open(dir.path()).unwrap();
+    dir
+}
+
 fn make_op(inode_id: u64, logical_offset: u64, payload: &[u8]) -> (IngressOp, crossbeam::channel::Receiver<std::io::Result<lchfs_store::ingress::Appended>>) {
     let hash = lchfs_format::Hash32::of(payload);
     let (tx, rx) = crossbeam::channel::bounded(1);
@@ -26,7 +34,7 @@ fn make_op(inode_id: u64, logical_offset: u64, payload: &[u8]) -> (IngressOp, cr
 
 #[test]
 fn ops_land_in_the_correct_shard_and_are_readable() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = device();
     let pool = CommitterPool::new(&[dir.path().to_path_buf()], 4, 2, 16, 1024 * 1024, Arc::new(AtomicU64::new(0)))
         .unwrap();
 
@@ -50,7 +58,7 @@ fn ops_land_in_the_correct_shard_and_are_readable() {
 
 #[test]
 fn per_producer_push_order_is_preserved_in_commit_order() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = device();
     let pool = CommitterPool::new(&[dir.path().to_path_buf()], 4, 3, 64, 1024 * 1024, Arc::new(AtomicU64::new(0)))
         .unwrap();
 
@@ -86,7 +94,7 @@ fn per_producer_push_order_is_preserved_in_commit_order() {
 
 #[test]
 fn concurrent_producers_to_different_inodes_all_complete() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = device();
     let pool = Arc::new(
         CommitterPool::new(&[dir.path().to_path_buf()], 8, 4, 32, 1024 * 1024, Arc::new(AtomicU64::new(0)))
             .unwrap(),

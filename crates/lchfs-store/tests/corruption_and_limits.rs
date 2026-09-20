@@ -41,7 +41,14 @@ fn corrupted_header_len_prefix_is_an_error_not_a_panic() {
     // The very first record in the data segment starts right after the
     // 4096-byte reserved header page; its first 4 bytes are the raw
     // `header_len` framing prefix, itself unprotected by any checksum.
-    let data_seg_path = dir.path().join("segments/data/0.aseg");
+    // Segments are created on first use, so the one data segment is
+    // whichever id the shard took, not 0.
+    let data_seg_path = std::fs::read_dir(dir.path().join("segments/data"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|x| x == "aseg"))
+        .expect("one data segment");
     let mut f = std::fs::OpenOptions::new()
         .read(true)
         .write(true)

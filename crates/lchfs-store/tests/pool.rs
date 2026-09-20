@@ -184,6 +184,30 @@ fn survives_checkpoint_and_reopen() {
     assert_eq!(&pool.read(f2, 0, 20_000).unwrap()[..], &expected[..]);
 }
 
+
+/// Total bytes of every data segment on a device -- segments are created
+/// on first use, so "the" data segment has no fixed id.
+fn data_segment_bytes(root: &std::path::Path) -> u64 {
+    std::fs::read_dir(root.join("segments/data"))
+        .unwrap()
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "aseg"))
+        .map(|e| e.metadata().unwrap().len())
+        .sum()
+}
+
+/// The one data segment file on a device.
+fn only_data_segment(root: &std::path::Path) -> std::path::PathBuf {
+    let mut files: Vec<_> = std::fs::read_dir(root.join("segments/data"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "aseg"))
+        .collect();
+    assert_eq!(files.len(), 1, "expected exactly one data segment: {files:?}");
+    files.pop().unwrap()
+}
+
 /// ARCHITECTURE.md §2: identical content must dedup to the same on-disk
 /// chunk rather than being stored twice.
 #[test]
@@ -195,16 +219,12 @@ fn identical_content_is_deduplicated() {
     let f1 = pool.create_file(1, "a.bin", 0o644).unwrap();
     pool.write(f1, 0, &content).unwrap();
     pool.checkpoint().unwrap();
-    let size_after_first = std::fs::metadata(dir.path().join("segments/data/0.aseg"))
-        .unwrap()
-        .len();
+    let size_after_first = data_segment_bytes(dir.path());
 
     let f2 = pool.create_file(1, "b.bin", 0o644).unwrap();
     pool.write(f2, 0, &content).unwrap();
     pool.checkpoint().unwrap();
-    let size_after_second = std::fs::metadata(dir.path().join("segments/data/0.aseg"))
-        .unwrap()
-        .len();
+    let size_after_second = data_segment_bytes(dir.path());
 
     assert_eq!(
         size_after_first, size_after_second,
@@ -226,7 +246,7 @@ fn corrupted_chunk_is_detected_on_read() {
     drop(pool);
 
     // Flip a byte well past the segment header page, inside chunk payload.
-    let data_seg_path = dir.path().join("segments/data/0.aseg");
+    let data_seg_path = only_data_segment(dir.path());
     let mut f = std::fs::OpenOptions::new()
         .read(true)
         .write(true)

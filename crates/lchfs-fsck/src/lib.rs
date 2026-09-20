@@ -14,17 +14,20 @@
 //! public API (`segment::SegmentReader`, `backend::FileBackend`) rather
 //! than any `pub(crate)`-only helper.
 
+pub mod stripes;
+
 use lchfs_format::{
     ChunkRef, ContentRef, DirectoryObject, ExtentLocation, ExtentRecordHeader, Hash32, InoMap, InodeKind,
     InodeObject, IndirectHashList, RootObject, SnapshotTable, StreamKind, SUPERBLOCK_MAGIC,
     SUPERBLOCK_SLOT_COUNT, SUPERBLOCK_SLOT_SIZE, SuperblockSlot, compute_superblock_slot_checksum,
 };
-use lchfs_index::{IndexStore, RedbIndex};
+use lchfs_index::{IndexStore, RedbIndex, STRIPED_VDEV};
 use lchfs_store::backend::{FileBackend, StorageBackend};
 use lchfs_store::segment::{SegmentError, SegmentReader};
 use serde::de::DeserializeOwned;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use stripes::Stripe;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -83,6 +86,14 @@ pub enum FsckError {
     Io(String),
     #[error("{stream} segment {segment_id}: bytes {from}..{to} are unparseable and were skipped over")]
     DamagedRegion { segment_id: u64, stream: &'static str, from: u32, to: u32 },
+    #[error("striped segment {segment_id}: shard {shard_index} is missing from vdev {vdev_id}")]
+    StripeShardMissing { segment_id: u64, shard_index: u8, vdev_id: u16 },
+    #[error("striped segment {segment_id}: shard {shard_index} on vdev {vdev_id} does not verify: {detail}")]
+    StripeShardCorrupt { segment_id: u64, shard_index: u8, vdev_id: u16, detail: String },
+    #[error("striped segment {segment_id}: {detail}")]
+    StripeInconsistent { segment_id: u64, detail: String },
+    #[error("striped segment {segment_id}: only {readable} shard(s) verify but {needed} are needed to read it")]
+    StripeUnrecoverable { segment_id: u64, readable: usize, needed: u8 },
 }
 
 /// Aggregated results of a full fsck run.
@@ -116,19 +127,26 @@ pub fn scan_all_segments(pool_root: &Path) -> Result<HashMap<Hash32, ExtentLocat
 pub struct Scanned {
     pub locations: HashMap<Hash32, ExtentLocation>,
     pub damaged: Vec<FsckError>,
+    /// Striped segments (§17.2), by id, when the scan was given every
+    /// device; their records are in `locations` too, at the offsets a
+    /// mirror copy would have had.
+    pub stripes: HashMap<u64, Stripe>,
 }
 
 /// `scan_all_segments`, also reporting the damage it scanned past.
+/// Mirrored segments only: shard files (`<id>.ec<i>`) belong to a stripe
+/// spread across devices and are scanned by `scan_devices`.
 pub fn scan_all_segments_reporting(pool_root: &Path) -> Result<Scanned, FsckError> {
     let mut locations = HashMap::new();
     let mut damaged = Vec::new();
-    for (sub, kind) in [("data", StreamKind::Data), ("meta", StreamKind::Meta)] {
+    for (sub, kind, ext) in [("data", StreamKind::Data, "aseg"), ("meta", StreamKind::Meta, "mseg")] {
         let dir = pool_root.join("segments").join(sub);
         let Ok(read_dir) = std::fs::read_dir(&dir) else {
             continue;
         };
         let mut ids: Vec<u64> = read_dir
             .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == ext))
             .filter_map(|e| {
                 e.path()
                     .file_stem()
@@ -157,7 +175,34 @@ pub fn scan_all_segments_reporting(pool_root: &Path) -> Result<Scanned, FsckErro
             }
         }
     }
-    Ok(Scanned { locations, damaged })
+    Ok(Scanned { locations, damaged, stripes: HashMap::new() })
+}
+
+/// `scan_all_segments_reporting` for a pool given as every device it
+/// has: the first root's mirrored segments, as before, plus every stripe
+/// whose shards are spread across the roots. Records in a stripe read
+/// like any other to the walk; a stripe that is short a shard, corrupt or
+/// inconsistent is a finding on top.
+pub fn scan_devices(vdev_roots: &[&Path]) -> Result<Scanned, FsckError> {
+    let mut scanned = scan_all_segments_reporting(vdev_roots[0])?;
+    let devices = device_ids(vdev_roots)?;
+    let stripe_scan = stripes::scan_stripes(&devices);
+    for (hash, loc) in stripe_scan.locations {
+        // A mirror copy the conversion pass has not deleted yet is the
+        // same bytes at the same offset; either way the location is one.
+        scanned.locations.entry(hash).or_insert(loc);
+    }
+    scanned.damaged.extend(stripe_scan.findings);
+    scanned.stripes = stripe_scan.stripes;
+    Ok(scanned)
+}
+
+/// `(vdev_id, root)` for each device, as its own superblock says.
+fn device_ids<'a>(vdev_roots: &[&'a Path]) -> Result<Vec<(u16, &'a Path)>, FsckError> {
+    vdev_roots
+        .iter()
+        .map(|root| read_superblock(root).map(|s| (s.vdev_id, *root)))
+        .collect()
 }
 
 /// Independently reads and validates the global superblock ring (same
@@ -271,6 +316,11 @@ struct Walker {
     pool_root: PathBuf,
     locations: HashMap<Hash32, ExtentLocation>,
     readers: HashMap<(u64, StreamKind), SegmentReader>,
+    /// Striped data segments, read through their shards when no mirror
+    /// copy is left on the root being walked.
+    stripes: HashMap<u64, Stripe>,
+    /// Striped segments already found to have no mirror copy on the root.
+    striped_only: HashSet<u64>,
     /// Every hash successfully read+verified during the walk, alongside
     /// the location it was actually found at -- `verify_index` cross-
     /// checks exactly this set against `INDEX.redb`.
@@ -279,13 +329,17 @@ struct Walker {
 }
 
 impl Walker {
-    fn new(pool_root: PathBuf, locations: HashMap<Hash32, ExtentLocation>) -> Self {
+    fn new(pool_root: PathBuf, scanned: Scanned) -> Self {
+        let mut report = FsckReport::default();
+        report.errors.extend(scanned.damaged);
         Self {
             pool_root,
-            locations,
+            locations: scanned.locations,
             readers: HashMap::new(),
+            stripes: scanned.stripes,
+            striped_only: HashSet::new(),
             visited: HashMap::new(),
-            report: FsckReport::default(),
+            report,
         }
     }
 
@@ -306,6 +360,28 @@ impl Walker {
             self.report.errors.push(FsckError::MissingObject { hash });
             return None;
         };
+        // A striped data segment has no mirror copy on this root: its
+        // records are read through the shards instead.
+        if stream == StreamKind::Data
+            && self.stripes.contains_key(&loc.segment_id)
+            && (self.striped_only.contains(&loc.segment_id)
+                || (!self.readers.contains_key(&(loc.segment_id, stream))
+                    && SegmentReader::open(&self.pool_root, loc.segment_id, stream).is_err()))
+        {
+            self.striped_only.insert(loc.segment_id);
+            let stripe = &self.stripes[&loc.segment_id];
+            return match stripe.read_record(loc) {
+                Ok(bytes) => {
+                    self.report.objects_visited += 1;
+                    self.visited.insert(hash, loc);
+                    Some(bytes)
+                }
+                Err(detail) => {
+                    self.report.errors.push(FsckError::UnreadableObject { hash, detail });
+                    None
+                }
+            };
+        }
         let reader = match self.reader(loc.segment_id, stream) {
             Ok(r) => r,
             Err(e) => {
@@ -471,7 +547,16 @@ impl Walker {
 /// snapshot) and verify content hashes and structural well-formedness.
 /// ARCHITECTURE.md §10.
 pub fn check(pool_root: &Path, live_roots: &[Hash32]) -> FsckReport {
-    let scanned = match scan_all_segments_reporting(pool_root) {
+    check_devices(&[pool_root], live_roots)
+}
+
+/// `check`, given every device of the pool: the walk audits the first
+/// root's mirrored segments and reads striped segments through the shards
+/// spread across all of them (§17.2). A single-device call on a pool with
+/// stripes reports each stripe as short of shards and its records as
+/// unreadable, which is the truth of what one device holds.
+pub fn check_devices(vdev_roots: &[&Path], live_roots: &[Hash32]) -> FsckReport {
+    let scanned = match scan_devices(vdev_roots) {
         Ok(m) => m,
         Err(e) => {
             let mut report = FsckReport::default();
@@ -479,8 +564,7 @@ pub fn check(pool_root: &Path, live_roots: &[Hash32]) -> FsckReport {
             return report;
         }
     };
-    let mut walker = Walker::new(pool_root.to_path_buf(), scanned.locations);
-    walker.report.errors.extend(scanned.damaged);
+    let mut walker = Walker::new(vdev_roots[0].to_path_buf(), scanned);
     for &root in live_roots {
         walker.walk_root(root);
     }
@@ -492,7 +576,14 @@ pub fn check(pool_root: &Path, live_roots: &[Hash32]) -> FsckReport {
 /// and agree on location. Structural/content-hash problems the walk
 /// itself finds are reported the same as `check`.
 pub fn verify_index(pool_root: &Path, live_roots: &[Hash32]) -> FsckReport {
-    let scanned = match scan_all_segments_reporting(pool_root) {
+    verify_index_devices(&[pool_root], live_roots)
+}
+
+/// `verify_index`, given every device, so striped records are walked and
+/// their `(hash, STRIPED)` entries checked like any other.
+pub fn verify_index_devices(vdev_roots: &[&Path], live_roots: &[Hash32]) -> FsckReport {
+    let pool_root = vdev_roots[0];
+    let scanned = match scan_devices(vdev_roots) {
         Ok(m) => m,
         Err(e) => {
             let mut report = FsckReport::default();
@@ -509,8 +600,7 @@ pub fn verify_index(pool_root: &Path, live_roots: &[Hash32]) -> FsckReport {
         }
     };
 
-    let mut walker = Walker::new(pool_root.to_path_buf(), scanned.locations);
-    walker.report.errors.extend(scanned.damaged);
+    let mut walker = Walker::new(pool_root.to_path_buf(), scanned);
     for &root in live_roots {
         walker.walk_root(root);
     }
@@ -568,6 +658,17 @@ pub fn rebuild_index(pool_root: &Path, other_vdevs: &[&Path]) -> Result<(), Fsck
                 .put_chunk_location(hash, *vdev_id, loc)
                 .map_err(|e| FsckError::Io(e.to_string()))?;
         }
+    }
+    // Striped segments have no mirror copy on any device; their records
+    // are indexed under the reserved slot (§17.2.2), or the fast mount
+    // path would find nothing to read them from.
+    let mut roots: Vec<&Path> = vec![pool_root];
+    roots.extend(other_vdevs.iter().copied());
+    let striped = stripes::scan_stripes(&device_ids(&roots)?);
+    for (hash, loc) in striped.locations {
+        index
+            .put_chunk_location(hash, STRIPED_VDEV, loc)
+            .map_err(|e| FsckError::Io(e.to_string()))?;
     }
     index
         .checkpoint(generation)
@@ -714,7 +815,44 @@ pub fn check_replicas(vdev_roots: &[&Path]) -> FsckReport {
             }
         }
     }
+
+    // Stripes are the replicas of cold data (§17.2): each one is checked
+    // across the devices its descriptor names.
+    let devices: Vec<(u16, &Path)> = members.iter().map(|(id, root, _)| (*id, *root)).collect();
+    let striped = stripes::scan_stripes(&devices);
+    report.objects_visited += striped.locations.len() as u64;
+    report.errors.extend(striped.findings);
     report
+}
+
+/// Checks every stripe across the devices given (§17.2.4 "fsck") and
+/// nothing else: descriptors agree, shards present and verified, parity
+/// consistent with the data, body hash intact.
+pub fn check_stripes(vdev_roots: &[&Path]) -> FsckReport {
+    let mut report = FsckReport::default();
+    match device_ids(vdev_roots) {
+        Ok(devices) => {
+            let scan = stripes::scan_stripes(&devices);
+            report.objects_visited = scan.locations.len() as u64;
+            report.errors = scan.findings;
+        }
+        Err(e) => report.errors.push(e),
+    }
+    report
+}
+
+/// Rewrites every missing or corrupt shard on the devices given from `k`
+/// good siblings (§17.2.4 "`--rebuild-shard`"). A stripe short of `k` is
+/// left as it is and stays a finding. Takes every device's pool lock: a
+/// mounted pool rebuilds its own shards.
+pub fn rebuild_shards(vdev_roots: &[&Path]) -> Result<Vec<stripes::RebuiltShard>, FsckError> {
+    let mut locks = Vec::with_capacity(vdev_roots.len());
+    for root in vdev_roots {
+        locks.push(lchfs_store::lock_pool(root).map_err(|e| FsckError::PoolLocked(format!("{e}")))?);
+    }
+    let devices = device_ids(vdev_roots)?;
+    let scan = stripes::scan_stripes(&devices);
+    stripes::rebuild_shards(&devices, &scan)
 }
 
 /// Reads one record from one vdev with the full verifying read, trying the
