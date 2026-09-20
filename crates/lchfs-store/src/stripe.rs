@@ -256,16 +256,24 @@ pub fn read_descriptor(path: &Path) -> io::Result<Option<StripeDescriptor>> {
     let file = File::open(path)?;
     let mut page = vec![0u8; SEGMENT_HEADER_PAGE_SIZE as usize];
     file.read_exact_at(&mut page, 0)?;
+    Ok(parse_descriptor_page(&page))
+}
+
+/// The descriptor in a shard file's header page, if the page is one:
+/// a `SegmentHeader` in `Striped` state, and a descriptor beside it.
+/// Pure on the bytes, so it can be fuzzed; nothing in it is trusted
+/// until `descriptor_is_sane` has looked.
+pub fn parse_descriptor_page(page: &[u8]) -> Option<StripeDescriptor> {
+    if page.len() < SEGMENT_HEADER_PAGE_SIZE as usize {
+        return None;
+    }
     let header_len = u32::from_le_bytes(page[0..4].try_into().unwrap()) as usize;
     if header_len == 0 || 4 + header_len > STRIPE_DESCRIPTOR_OFFSET {
-        return Ok(None);
+        return None;
     }
-    let header: SegmentHeader = match lchfs_format::decode(&page[4..4 + header_len]) {
-        Ok(h) => h,
-        Err(_) => return Ok(None),
-    };
+    let header: SegmentHeader = lchfs_format::decode(&page[4..4 + header_len]).ok()?;
     if header.magic != SEGMENT_HEADER_MAGIC || header.state != SegmentState::Striped {
-        return Ok(None);
+        return None;
     }
     let len = u32::from_le_bytes(
         page[STRIPE_DESCRIPTOR_OFFSET..STRIPE_DESCRIPTOR_OFFSET + 4]
@@ -273,9 +281,9 @@ pub fn read_descriptor(path: &Path) -> io::Result<Option<StripeDescriptor>> {
             .unwrap(),
     ) as usize;
     if len == 0 || STRIPE_DESCRIPTOR_OFFSET + 4 + len > page.len() {
-        return Ok(None);
+        return None;
     }
-    Ok(lchfs_format::decode(&page[STRIPE_DESCRIPTOR_OFFSET + 4..STRIPE_DESCRIPTOR_OFFSET + 4 + len]).ok())
+    lchfs_format::decode(&page[STRIPE_DESCRIPTOR_OFFSET + 4..STRIPE_DESCRIPTOR_OFFSET + 4 + len]).ok()
 }
 
 /// One striped segment, opened against whatever shards are reachable.

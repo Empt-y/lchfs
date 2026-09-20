@@ -15,12 +15,49 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 
+arbitrary = { version = "1", features = ["derive"] }
+tempfile = "3"
+
 [dependencies.lchfs-store]
 path = "../crates/lchfs-store"
+
+[dependencies.lchfs-fsck]
+path = "../crates/lchfs-fsck"
+
+[dependencies.lchfs-format]
+path = "../crates/lchfs-format"
 
 [[bin]]
 name = "extent_header"
 path = "fuzz_targets/extent_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "shard_page"
+path = "fuzz_targets/shard_page.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "segment_file"
+path = "fuzz_targets/segment_file.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "superblock_ring"
+path = "fuzz_targets/superblock_ring.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stripe_mutation"
+path = "fuzz_targets/stripe_mutation.rs"
 test = false
 doc = false
 bench = false

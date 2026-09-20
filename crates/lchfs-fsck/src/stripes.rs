@@ -148,24 +148,34 @@ fn read_shard_header(path: &Path) -> Result<Option<(SegmentHeader, StripeDescrip
     let file = File::open(path).map_err(|e| e.to_string())?;
     let mut page = vec![0u8; SEGMENT_HEADER_PAGE_SIZE as usize];
     file.read_exact_at(&mut page, 0).map_err(|e| e.to_string())?;
+    Ok(parse_shard_page(&page))
+}
+
+/// The header and descriptor in a shard file's header page, from the
+/// documented layout and nothing else: `[u32 len][SegmentHeader]` at 0,
+/// `[u32 len][StripeDescriptor]` at `STRIPE_DESCRIPTOR_OFFSET`. `None`
+/// for anything that is not a shard page. Pure on the bytes, so it can
+/// be fuzzed; must never panic.
+pub fn parse_shard_page(page: &[u8]) -> Option<(SegmentHeader, StripeDescriptor)> {
+    if page.len() < SEGMENT_HEADER_PAGE_SIZE as usize {
+        return None;
+    }
     let header_len = u32::from_le_bytes(page[0..4].try_into().unwrap()) as usize;
     if header_len == 0 || 4 + header_len > STRIPE_DESCRIPTOR_OFFSET {
-        return Ok(None);
+        return None;
     }
-    let Ok(header) = lchfs_format::decode::<SegmentHeader>(&page[4..4 + header_len]) else {
-        return Ok(None);
-    };
+    let header = lchfs_format::decode::<SegmentHeader>(&page[4..4 + header_len]).ok()?;
     if header.magic != SEGMENT_HEADER_MAGIC || header.state != SegmentState::Striped {
-        return Ok(None);
+        return None;
     }
     let at = STRIPE_DESCRIPTOR_OFFSET;
     let desc_len = u32::from_le_bytes(page[at..at + 4].try_into().unwrap()) as usize;
     if desc_len == 0 || at + 4 + desc_len > page.len() {
-        return Ok(None);
+        return None;
     }
-    Ok(lchfs_format::decode::<StripeDescriptor>(&page[at + 4..at + 4 + desc_len])
+    lchfs_format::decode::<StripeDescriptor>(&page[at + 4..at + 4 + desc_len])
         .ok()
-        .map(|d| (header, d)))
+        .map(|d| (header, d))
 }
 
 /// The fields every shard of one stripe must agree on.
