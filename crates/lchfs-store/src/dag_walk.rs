@@ -208,8 +208,16 @@ fn walk_inode(
                 resolve_and_read(ihl_hash, StreamKind::Meta, ctx, locations, readers, live)?;
             let ihl: IndirectHashList =
                 lchfs_format::decode(&ihl_bytes).map_err(|e| PoolError::Format(e.to_string()))?;
+            // A data chunk is a leaf: marking it needs its location, not
+            // its bytes. Reading it would make every pass read the whole
+            // live dataset, and one rotted chunk on the primary would
+            // abort every mark until scrub healed it -- verification is
+            // scrub's job, and read failover the reader's.
             for chunk in &ihl.chunks {
-                resolve_and_read(chunk.content_hash, StreamKind::Data, ctx, locations, readers, live)?;
+                let (loc, _) = locations
+                    .get_tagged(chunk.content_hash)
+                    .ok_or_else(|| PoolError::Format(format!("GC mark: {:?} not found in index", chunk.content_hash)))?;
+                live.mark(chunk.content_hash, loc);
             }
         }
         ContentRef::Inline(_) | ContentRef::SymlinkTarget(_) => {}

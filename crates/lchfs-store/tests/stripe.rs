@@ -140,7 +140,7 @@ fn a_parity_shard_can_go_too_and_more_than_m_cannot() {
 }
 
 #[test]
-fn a_corrupted_shard_fails_verification_and_the_record_check() {
+fn a_corrupted_shard_fails_verification_and_is_read_through_parity() {
     let src = device();
     let dirs: Vec<tempfile::TempDir> = (0..3).map(|_| device()).collect();
     let records = sealed_segment(src.path(), 13);
@@ -156,10 +156,16 @@ fn a_corrupted_shard_fails_verification_and_the_record_check() {
     let reader = StripeReader::open(13, root_of(&devs), &devs).unwrap();
     assert!(!reader.verify_shard(0).unwrap());
     assert!(reader.verify_shard(1).unwrap());
-    // The record whose bytes were hit fails its content-hash check, as it
-    // would in a mirrored segment; the scan-free framing keeps the rest.
-    let (loc0, _) = &records[0];
+    // The record whose bytes were hit fails its content-hash check on the
+    // straight read and is served through parity instead: a shard that
+    // is present but wrong is a missing shard as far as a read goes.
+    let (loc0, payload0) = &records[0];
+    assert_eq!(reader.read_record(*loc0).unwrap().1, *payload0);
+    // With no parity to fall back on, the failure is honest.
+    std::fs::remove_file(shard_path(&devs[2].root, 13, 2)).unwrap();
+    let reader = StripeReader::open(13, root_of(&devs), &devs).unwrap();
     assert!(reader.read_record(*loc0).is_err());
+    let reader = StripeReader::open(13, root_of(&devs), &devs).unwrap();
     let (loc_last, payload_last) = records.last().unwrap();
     assert_eq!(reader.read_record(*loc_last).unwrap().1, *payload_last);
     // And a plain SegmentReader refuses to treat a shard file as a segment.

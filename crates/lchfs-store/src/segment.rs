@@ -264,9 +264,6 @@ impl SegmentWriter {
         )
     }
 
-    /// Slots dropped from this segment's fan-out since the last call,
-    /// because an operation on their file failed. The owner reports them
-    /// to the pool's device set.
     /// Reopens each replica of a segment left `Open` on disk by a process
     /// that is gone -- a crash, or an unmount from before segments were
     /// sealed at shutdown -- so it can be sealed. One writer per Open
@@ -277,18 +274,31 @@ impl SegmentWriter {
     /// footer computed on one file must never be written on another. The
     /// footer goes after the last record the scan found, so a torn tail
     /// is dropped and a resync'd stretch behind good records is kept.
-    /// Replicas already sealed are left alone. Each entry is the writer
-    /// and its record count; one with no records is the caller's to
-    /// delete rather than seal.
-    pub fn reopen_open_replicas(vdevs: &[Vdev], segment_id: u64, kind: StreamKind) -> io::Result<Vec<(Self, u64)>> {
+    /// Replicas already sealed are left alone, and so is one whose header
+    /// page does not read or parse -- that is rot for scrub, not a reason
+    /// to stop. Each entry is the writer and its record count; one with
+    /// no records is the caller's to delete rather than seal.
+    pub fn reopen_open_replicas(vdevs: &[Vdev], segment_id: u64, kind: StreamKind) -> Vec<(Self, u64)> {
         let mut out = Vec::new();
         for vdev in vdevs {
             let path = segment_path(&vdev.root, segment_id, kind);
             if !path.exists() {
                 continue;
             }
-            let reader = SegmentReader::open(&vdev.root, segment_id, kind).map_err(io::Error::other)?;
-            let header = reader.read_header().map_err(io::Error::other)?;
+            let reader = match SegmentReader::open(&vdev.root, segment_id, kind) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!("vdev {}: segment {segment_id} does not open ({e}); leaving it", vdev.id);
+                    continue;
+                }
+            };
+            let header = match reader.read_header() {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::warn!("vdev {}: segment {segment_id} header does not read ({e}); leaving it", vdev.id);
+                    continue;
+                }
+            };
             if header.state != SegmentState::Open {
                 continue;
             }
@@ -323,9 +333,12 @@ impl SegmentWriter {
                 record_count,
             ));
         }
-        Ok(out)
+        out
     }
 
+    /// Slots dropped from this segment's fan-out since the last call,
+    /// because an operation on their file failed. The owner reports them
+    /// to the pool's device set.
     pub fn take_faults(&mut self) -> Vec<u16> {
         std::mem::take(&mut self.faulted)
     }

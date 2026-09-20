@@ -13,7 +13,7 @@
 //! only live extents" -- mark-and-sweep feeds directly into coalescing,
 //! it isn't a parallel concern.
 
-use crate::segment::SegmentReader;
+use crate::segment::{SegmentReader, segment_ids_on};
 use crate::vdevs::VdevSet;
 use crate::{SegmentReaders, StreamKind, Vdev, dag_walk};
 use crate::dag_walk::LiveSet;
@@ -209,21 +209,9 @@ impl GcEngine {
         vdev_root: &Path,
         live_sets: &HashMap<u64, RoaringBitmap>,
     ) -> Vec<u64> {
-        let dir = vdev_root.join("segments").join("data");
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            return Vec::new();
-        };
-
-        let mut segment_ids: Vec<u64> = entries
-            .flatten()
-            .filter_map(|e| {
-                e.path()
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .and_then(|s| s.parse::<u64>().ok())
-            })
-            .collect();
-        segment_ids.sort_unstable();
+        // Segment files of this stream only: a shard file `<id>.ec<i>`
+        // shares the stem and belongs to a stripe.
+        let segment_ids: Vec<u64> = segment_ids_on(vdev_root, StreamKind::Data);
 
         // Only ever consider *sealed* segments -- an Open segment is
         // still being actively written to by its shard's committer, never

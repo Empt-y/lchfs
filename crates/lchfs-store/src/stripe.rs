@@ -56,6 +56,29 @@ pub fn shards_on(root: &Path, segment_id: u64) -> Vec<u8> {
     out
 }
 
+/// Every segment id with a shard file on any of `vdevs`, ascending.
+pub fn striped_segment_ids(vdevs: &[Vdev]) -> Vec<u64> {
+    let mut ids: Vec<u64> = vdevs.iter().flat_map(|v| segment_ids_with_shards(&v.root)).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+/// A descriptor that can be acted on: a real Reed-Solomon shape, one
+/// device per shard, and sizes that fit the segment's u32 offsets. Read
+/// off disk unchecksummed, so every field is checked before it can size
+/// an allocation or index a vector.
+pub fn descriptor_is_sane(d: &StripeDescriptor) -> bool {
+    let total = d.k as usize + d.m as usize;
+    d.k >= 2
+        && d.m >= 1
+        && d.devices.len() == total
+        && d.shard_size > 0
+        && d.shard_size <= u32::MAX as u64
+        && (d.shard_index as usize) < total
+        && d.logical_len <= d.shard_size.saturating_mul(d.k as u64)
+}
+
 /// Every segment id that has at least one shard file under `root`.
 pub fn segment_ids_with_shards(root: &Path) -> Vec<u64> {
     let mut out = Vec::new();
@@ -271,22 +294,24 @@ impl StripeReader {
     /// shard's device. The descriptor comes from the first shard file
     /// found; devices that are offline simply contribute no shard.
     pub fn open(segment_id: u64, root_of: impl Fn(u16) -> Option<PathBuf>, candidates: &[Vdev]) -> io::Result<Self> {
+        // The descriptor comes from the first shard whose header page
+        // reads, parses and makes sense; a truncated or rotted shard file
+        // is skipped, not fatal -- its siblings may be fine.
         let mut desc = None;
-        for vdev in candidates {
+        'find: for vdev in candidates {
             for i in shards_on(&vdev.root, segment_id) {
-                if let Some(d) = read_descriptor(&shard_path(&vdev.root, segment_id, i))? {
+                if let Ok(Some(d)) = read_descriptor(&shard_path(&vdev.root, segment_id, i))
+                    && descriptor_is_sane(&d)
+                {
                     desc = Some(d);
-                    break;
+                    break 'find;
                 }
-            }
-            if desc.is_some() {
-                break;
             }
         }
         let Some(desc) = desc else {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                format!("no shard of segment {segment_id} on any offered device"),
+                format!("no usable shard of segment {segment_id} on any offered device"),
             ));
         };
         let paths: Vec<Option<PathBuf>> = desc
@@ -295,9 +320,17 @@ impl StripeReader {
             .enumerate()
             .map(|(i, &vdev_id)| root_of(vdev_id).map(|root| shard_path(&root, segment_id, i as u8)))
             .collect();
+        // A shard file is exactly a header page plus `shard_size` bytes;
+        // anything else is treated as absent, so a torn write never
+        // sizes a read.
+        let expected_len = SEGMENT_HEADER_PAGE_SIZE + desc.shard_size;
         let shards = paths
             .iter()
-            .map(|p| p.as_ref().and_then(|p| File::open(p).ok()))
+            .map(|p| {
+                p.as_ref()
+                    .and_then(|p| File::open(p).ok())
+                    .filter(|f| f.metadata().is_ok_and(|m| m.len() == expected_len))
+            })
             .collect();
         Ok(Self {
             segment_id,
@@ -338,20 +371,21 @@ impl StripeReader {
     }
 
     /// The rows `[start, end)` of every shard, reconstructing the ones
-    /// that are not readable from any `k` that are. Reed-Solomon is
-    /// position-independent, so a row range decodes on its own.
-    fn rows(&self, start: u64, end: u64) -> io::Result<Vec<Vec<u8>>> {
+    /// that are not readable -- or listed in `exclude` -- from any `k`
+    /// that are. Reed-Solomon is position-independent, so a row range
+    /// decodes on its own.
+    fn rows(&self, start: u64, end: u64, exclude: &[usize]) -> io::Result<Vec<Vec<u8>>> {
         let total = self.total();
         let mut rows: Vec<Option<Vec<u8>>> = Vec::with_capacity(total);
         for i in 0..total {
-            rows.push(self.read_shard_range(i, start, end)?);
+            rows.push(if exclude.contains(&i) { None } else { self.read_shard_range(i, start, end)? });
         }
         let present = rows.iter().filter(|r| r.is_some()).count();
         if present < self.desc.k as usize {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!(
-                    "segment {} stripe: only {present} of {total} shards readable, need {}",
+                    "segment {} stripe: only {present} of {total} shards usable, need {}",
                     self.segment_id, self.desc.k
                 ),
             ));
@@ -364,16 +398,44 @@ impl StripeReader {
         Ok(rows.into_iter().map(|r| r.expect("reconstructed")).collect())
     }
 
-    /// The whole of shard `i`, reconstructed if need be.
+    /// The whole of shard `i`, reconstructed from its siblings -- never
+    /// read from its own file, so a shard whose bytes are wrong is not
+    /// rewritten as it stands with a hash that now matches.
     pub fn reconstruct_shard(&self, i: u8) -> io::Result<Vec<u8>> {
-        let rows = self.rows(0, self.desc.shard_size)?;
+        let rows = self.rows(0, self.desc.shard_size, &[i as usize])?;
         Ok(rows[i as usize].clone())
+    }
+
+    /// Shard indices whose bytes `[off, off + len)` of the body fall in.
+    fn shards_for(&self, off: u64, len: u64) -> Vec<usize> {
+        if len == 0 {
+            return Vec::new();
+        }
+        let ss = self.desc.shard_size;
+        ((off / ss) as usize..=((off + len - 1) / ss) as usize).collect()
+    }
+
+    /// Whether a read of `loc` has to reconstruct: some shard it touches
+    /// is not readable.
+    pub fn reconstructs(&self, loc: ExtentLocation) -> bool {
+        let Ok(off) = Self::body_offset(loc) else { return false };
+        self.shards_for(off, loc.len as u64)
+            .into_iter()
+            .filter(|&i| i < self.shards.len())
+            .any(|i| self.shards[i].is_none())
     }
 
     /// Logical body bytes `[off, off + len)`, from the shard(s) that hold
     /// them; a shard that is missing is reconstructed for just that range.
     pub fn read_body(&self, off: u64, len: u64) -> io::Result<Vec<u8>> {
-        if off + len > self.desc.logical_len {
+        self.read_body_excluding(off, len, &[])
+    }
+
+    /// `read_body`, treating the shards in `exclude` as if they were
+    /// missing: what a retry does after a shard served bytes that did
+    /// not verify.
+    pub fn read_body_excluding(&self, off: u64, len: u64, exclude: &[usize]) -> io::Result<Vec<u8>> {
+        if off.checked_add(len).is_none_or(|end| end > self.desc.logical_len) {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 format!("read past the end of striped segment {}", self.segment_id),
@@ -387,10 +449,15 @@ impl StripeReader {
             let shard = (pos / ss) as usize;
             let within = pos % ss;
             let take = (ss - within).min(end - pos);
-            let piece = match self.read_shard_range(shard, within, within + take)? {
+            let direct = if exclude.contains(&shard) {
+                None
+            } else {
+                self.read_shard_range(shard, within, within + take)?
+            };
+            let piece = match direct {
                 Some(bytes) => bytes,
                 None => {
-                    let rows = self.rows(within, within + take)?;
+                    let rows = self.rows(within, within + take, exclude)?;
                     rows[shard].clone()
                 }
             };
@@ -400,25 +467,82 @@ impl StripeReader {
         Ok(out)
     }
 
-    fn body_offset(loc: ExtentLocation) -> u64 {
-        loc.offset as u64 - SEGMENT_HEADER_PAGE_SIZE
+    /// The whole logical body, checked against the descriptor's
+    /// `body_hash`. If the straight read does not match, each shard is
+    /// verified against its own hash and the ones that fail are
+    /// reconstructed from the rest; only a body that hashes right is
+    /// returned. What anything that *acts* on a stripe's contents --
+    /// repacking it, deleting its shards -- must read through.
+    pub fn verified_body(&self) -> io::Result<Vec<u8>> {
+        let body = self.read_body(0, self.desc.logical_len)?;
+        if Hash32::of(&body) == self.desc.body_hash {
+            return Ok(body);
+        }
+        let mut bad = Vec::new();
+        for i in 0..self.total() {
+            if self.shards[i].is_some() && !self.verify_shard(i as u8)? {
+                bad.push(i);
+            }
+        }
+        let body = self.read_body_excluding(0, self.desc.logical_len, &bad)?;
+        if Hash32::of(&body) == self.desc.body_hash {
+            return Ok(body);
+        }
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "segment {} stripe: body does not match its hash even with {} bad shard(s) reconstructed",
+                self.segment_id,
+                bad.len()
+            ),
+        ))
+    }
+
+    /// A location's offset is a file offset (header page included); a
+    /// location that points into the header page is not a record.
+    fn body_offset(loc: ExtentLocation) -> io::Result<u64> {
+        (loc.offset as u64).checked_sub(SEGMENT_HEADER_PAGE_SIZE).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, format!("offset {} is inside the header page", loc.offset))
+        })
+    }
+
+    /// The record's bytes, retried through parity when the shard that
+    /// served them produced something that does not verify: a shard
+    /// present but wrong is a missing shard as far as a read is
+    /// concerned, so long as `k` others are there.
+    fn record_bytes(
+        &self,
+        loc: ExtentLocation,
+        check: impl Fn(Vec<u8>) -> Result<(ExtentRecordHeader, Vec<u8>), SegmentError>,
+    ) -> Result<(ExtentRecordHeader, Vec<u8>), SegmentError> {
+        let (off, len) = (Self::body_offset(loc)?, loc.len as u64);
+        let first = check(self.read_body(off, len)?);
+        let Err(e) = first else { return first };
+        let touched = self.shards_for(off, len);
+        if self.present() <= self.desc.k as usize || touched.iter().all(|&i| self.shards[i].is_none()) {
+            return Err(e);
+        }
+        let bytes = self.read_body_excluding(off, len, &touched)?;
+        check(bytes)
     }
 
     /// `SegmentReader::read_record` for a striped segment: the same framing
     /// and content-hash checks, on bytes assembled from shards.
     pub fn read_record(&self, loc: ExtentLocation) -> Result<(ExtentRecordHeader, Vec<u8>), SegmentError> {
-        let bytes = self.read_body(Self::body_offset(loc), loc.len as u64)?;
-        let (header, payload) = decode_record_bytes(bytes)?;
-        let decompressed = verify_record(&header, payload, self.segment_id, loc.offset)?;
-        Ok((header, decompressed))
+        self.record_bytes(loc, |bytes| {
+            let (header, payload) = decode_record_bytes(bytes)?;
+            let decompressed = verify_record(&header, payload, self.segment_id, loc.offset)?;
+            Ok((header, decompressed))
+        })
     }
 
     /// `SegmentReader::read_record_raw` for a striped segment.
     pub fn read_record_raw(&self, loc: ExtentLocation) -> Result<(ExtentRecordHeader, Vec<u8>), SegmentError> {
-        let bytes = self.read_body(Self::body_offset(loc), loc.len as u64)?;
-        let (header, payload) = decode_record_bytes(bytes)?;
-        verify_record(&header, payload.clone(), self.segment_id, loc.offset)?;
-        Ok((header, payload))
+        self.record_bytes(loc, |bytes| {
+            let (header, payload) = decode_record_bytes(bytes)?;
+            verify_record(&header, payload.clone(), self.segment_id, loc.offset)?;
+            Ok((header, payload))
+        })
     }
 
     /// Verifies one shard file's bytes against the hash in its own

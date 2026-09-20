@@ -20,6 +20,7 @@ use lchfs_store::segment::{SEGMENT_HEADER_PAGE_SIZE, decode_record_bytes, verify
 use reed_solomon_erasure::galois_8::ReedSolomon;
 use std::collections::HashMap;
 use std::fs::File;
+use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
@@ -269,16 +270,23 @@ pub fn scan_stripes(devices: &[(u16, &Path)]) -> StripeScan {
             continue;
         };
         let total = desc.k as usize + desc.m as usize;
-        if desc.devices.len() != total || desc.k < 2 || desc.m < 1 || desc.shard_size == 0 {
+        if desc.devices.len() != total
+            || desc.k < 2
+            || desc.m < 1
+            || desc.shard_size == 0
+            || desc.shard_size > u32::MAX as u64
+            || desc.logical_len > desc.shard_size.saturating_mul(desc.k as u64)
+        {
             scan.findings.push(FsckError::StripeInconsistent {
                 segment_id,
                 detail: format!(
-                    "descriptor is malformed: k={} m={} shard_size={} devices={:?}",
-                    desc.k, desc.m, desc.shard_size, desc.devices
+                    "descriptor is malformed: k={} m={} shard_size={} logical_len={} devices={:?}",
+                    desc.k, desc.m, desc.shard_size, desc.logical_len, desc.devices
                 ),
             });
             continue;
         }
+        let expected_len = SEGMENT_HEADER_PAGE_SIZE + desc.shard_size;
 
         // Each shard's bytes against its own hash, on the device the
         // descriptor says it belongs on. A shard file that is there but
@@ -309,7 +317,18 @@ pub fn scan_stripes(devices: &[(u16, &Path)]) -> StripeScan {
                 });
                 continue;
             }
+            // The file is exactly a header page plus the shard, and that is
+            // checked before its claimed size is allowed to size a buffer:
+            // fsck reads corrupt pools for a living and must not be made
+            // to allocate by a number on disk.
             let bytes = File::open(&file.path).and_then(|f| {
+                let len = f.metadata()?.len();
+                if len != expected_len {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("file is {len} bytes, a shard of this stripe is {expected_len}"),
+                    ));
+                }
                 let mut buf = vec![0u8; desc.shard_size as usize];
                 f.read_exact_at(&mut buf, SEGMENT_HEADER_PAGE_SIZE).map(|()| (f, buf))
             });

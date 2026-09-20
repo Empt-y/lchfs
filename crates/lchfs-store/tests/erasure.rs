@@ -370,19 +370,23 @@ fn the_stripe_policy_changes_live_and_persists() {
 #[test]
 fn a_reconstructing_read_is_counted_and_a_pulled_device_is_faulted() {
     let a = tempfile::tempdir().unwrap();
-    let b = tempfile::tempdir().unwrap();
+    let parent = tempfile::tempdir().unwrap();
+    let b = parent.path().join("b");
     let c = tempfile::tempdir().unwrap();
-    let pool = populated_and_striped(&[a.path(), b.path(), c.path()], 2, 1);
-    let striped = segment_ids_with_shards(c.path());
+    let pool = populated_and_striped(&[a.path(), &b, c.path()], 2, 1);
+    let striped = segment_ids_with_shards(&b);
     let id = striped[0];
-    for i in lchfs_store::stripe::shards_on(c.path(), id) {
-        std::fs::remove_file(lchfs_store::stripe::shard_path(c.path(), id, i)).unwrap();
+    // b holds shard 1, a data shard: losing it makes reads of the records
+    // in it reconstruct (losing c's parity shard would not).
+    for i in lchfs_store::stripe::shards_on(&b, id) {
+        assert!(i < 2, "b holds a data shard");
+        std::fs::remove_file(lchfs_store::stripe::shard_path(&b, id, i)).unwrap();
     }
     // The location cache is what read_verified consults; a remount reads
     // cold.
     pool.checkpoint().unwrap();
     drop(pool);
-    let pool = Pool::open_replicated(&[a.path(), b.path(), c.path()]).unwrap();
+    let pool = Pool::open_replicated(&[a.path(), &b, c.path()]).unwrap();
     for i in 0..14u32 {
         assert_eq!(read_file(&pool, &format!("f{i}"), 30_000), payload(i));
     }
@@ -390,12 +394,12 @@ fn a_reconstructing_read_is_counted_and_a_pulled_device_is_faulted() {
     assert!(stats.failovers > 0, "{stats:?}");
     let events = pool.corruption_events();
     assert!(
-        events.iter().any(|e| e.vdev_id == 2 && e.location.is_some_and(|l| l.segment_id == id) && !e.healed),
+        events.iter().any(|e| e.vdev_id == 1 && e.location.is_some_and(|l| l.segment_id == id) && !e.healed),
         "{events:?}"
     );
-    assert_eq!(pool.vdev_status().iter().find(|s| s.id == 2).unwrap().health, lchfs_store::VdevHealth::Online);
+    assert_eq!(pool.vdev_status().iter().find(|s| s.id == 1).unwrap().health, lchfs_store::VdevHealth::Online);
     // Resilver puts the shard back, and reads stop reconstructing.
-    assert_eq!(pool.resilver(2).unwrap().shards_rebuilt, 1);
+    assert_eq!(pool.resilver(1).unwrap().shards_rebuilt, 1);
     let before = pool.repair_stats().failovers;
     for i in 0..14u32 {
         assert_eq!(read_file(&pool, &format!("f{i}"), 30_000), payload(i));
@@ -404,13 +408,176 @@ fn a_reconstructing_read_is_counted_and_a_pulled_device_is_faulted() {
 
     // Pull the device: its root is gone, and the next cold read that
     // needs it faults it.
-    let pulled = c.path().with_extension("pulled");
-    std::fs::rename(c.path(), &pulled).unwrap();
+    let pulled = parent.path().join("b.pulled");
+    std::fs::rename(&b, &pulled).unwrap();
     pool.clear_corruption_events();
     for i in 0..14u32 {
         assert_eq!(read_file(&pool, &format!("f{i}"), 30_000), payload(i));
     }
-    assert_eq!(pool.vdev_status().iter().find(|s| s.id == 2).unwrap().health, lchfs_store::VdevHealth::Faulted);
+    assert_eq!(pool.vdev_status().iter().find(|s| s.id == 1).unwrap().health, lchfs_store::VdevHealth::Faulted);
     assert!(pool.corruption_events().is_empty(), "a pulled device is a fault, not corruption");
-    std::fs::rename(&pulled, c.path()).unwrap();
+    std::fs::rename(&pulled, &b).unwrap();
+}
+
+/// Flips bytes at the start of data shard 0 of `id` on `root`: the
+/// first record of the segment, header and all, is now wrong on that
+/// device, and the shard's own hash no longer matches.
+fn corrupt_first_record_in_shard0(root: &Path, id: u64) {
+    let p = lchfs_store::stripe::shard_path(root, id, 0);
+    let mut bytes = std::fs::read(&p).unwrap();
+    for x in &mut bytes[4096..4096 + 300] {
+        *x ^= 0xa5;
+    }
+    std::fs::write(&p, &bytes).unwrap();
+}
+
+/// Which device holds shard 0 of `id`.
+fn holder_of_shard0<'a>(roots: &[&'a Path], id: u64) -> &'a Path {
+    roots
+        .iter()
+        .copied()
+        .find(|r| lchfs_store::stripe::shards_on(r, id).contains(&0))
+        .expect("shard 0 is somewhere")
+}
+
+/// A data shard that is present but wrong must be treated as missing
+/// by every reader: a read of the record it holds is served through
+/// parity rather than failing, scrub rebuilds the shard from its
+/// siblings rather than rewriting its own bytes with a matching hash,
+/// and fsck's independent parity check agrees afterwards.
+#[test]
+fn a_present_but_corrupt_shard_is_read_through_parity_and_rebuilt_from_siblings() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let c = tempfile::tempdir().unwrap();
+    let roots = [a.path(), b.path(), c.path()];
+    let pool = populated_and_striped(&roots, 2, 1);
+    let striped = segment_ids_with_shards(a.path());
+    let id = striped[0];
+    let holder = holder_of_shard0(&roots, id);
+    corrupt_first_record_in_shard0(holder, id);
+
+    // Every file still reads: the record in the corrupt shard comes back
+    // through the other two shards.
+    for i in 0..14u32 {
+        assert_eq!(read_file(&pool, &format!("f{i}"), 30_000), payload(i));
+    }
+
+    // Scrub sees the bad shard and rebuilds it -- and what it writes is
+    // what the siblings say, which fsck checks by recomputing parity.
+    let reports = pool.scrub().unwrap();
+    assert_eq!(reports.iter().map(|r| r.shards_corrupt).sum::<u64>(), 1, "{reports:?}");
+    assert_eq!(reports.iter().map(|r| r.shards_rebuilt).sum::<u64>(), 1, "{reports:?}");
+    pool.checkpoint().unwrap();
+    drop(pool);
+    let report = lchfs_fsck::check_stripes(&roots);
+    assert!(report.is_clean(), "{:?}", report.errors);
+    let live = lchfs_fsck::collect_live_roots(a.path()).unwrap();
+    let report = lchfs_fsck::check_devices(&roots, &live);
+    assert!(report.is_clean(), "{:?}", report.errors);
+}
+
+/// Detach decodes every stripe naming the leaver; a corrupt shard in one
+/// of them must be reconstructed, not copied forward -- and nothing may
+/// be lost.
+#[test]
+fn detach_repacks_through_a_corrupt_shard_without_losing_records() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let c = tempfile::tempdir().unwrap();
+    let roots = [a.path(), b.path(), c.path()];
+    drop(populated_and_striped(&roots, 2, 1));
+    let striped = segment_ids_with_shards(a.path());
+    for &id in &striped[..2] {
+        corrupt_first_record_in_shard0(holder_of_shard0(&roots, id), id);
+    }
+    assert_eq!(Pool::detach_vdev(&roots).unwrap(), 2);
+    let pool = Pool::open_replicated(&[a.path(), b.path()]).unwrap();
+    for i in 0..14u32 {
+        assert_eq!(read_file(&pool, &format!("f{i}"), 30_000), payload(i));
+    }
+    assert_eq!(pool.repair_stats().failovers, 0, "every record has an intact mirror copy");
+    pool.checkpoint().unwrap();
+    drop(pool);
+    let report = lchfs_fsck::check_replicas(&[a.path(), b.path()]);
+    assert!(report.is_clean(), "{:?}", report.errors);
+}
+
+/// A segment whose primary copy has rotted is not converted: the stripe
+/// would be built from the rot and the good mirrors deleted.
+#[test]
+fn a_segment_with_rot_on_the_primary_is_not_striped() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let c = tempfile::tempdir().unwrap();
+    let pool = Pool::create_replicated(&[a.path(), b.path(), c.path()], striped_params(2, 1)).unwrap();
+    for i in 0..14u32 {
+        let ino = pool.create_file(1, &format!("f{i}"), 0o644).unwrap();
+        pool.write(ino, 0, &payload(i)).unwrap();
+    }
+    pool.checkpoint().unwrap();
+    // Rot the first record of the oldest sealed segment on the primary
+    // only, before any pass has run.
+    let oldest = aseg_files(a.path())[0].clone();
+    let mut bytes = std::fs::read(&oldest).unwrap();
+    for x in &mut bytes[4096..4096 + 64] {
+        *x ^= 0xff;
+    }
+    std::fs::write(&oldest, &bytes).unwrap();
+    for _ in 0..8 {
+        pool.run_gc_and_coalesce_pass().unwrap();
+    }
+    let id: u64 = oldest.file_stem().unwrap().to_str().unwrap().parse().unwrap();
+    assert!(!segment_ids_with_shards(a.path()).contains(&id), "the rotted segment must stay mirrored");
+    assert!(b.path().join(format!("segments/data/{id}.aseg")).exists(), "its good mirrors must survive");
+    assert!(!segment_ids_with_shards(a.path()).is_empty(), "other segments still convert");
+    for i in 0..14u32 {
+        assert_eq!(read_file(&pool, &format!("f{i}"), 30_000), payload(i));
+    }
+}
+
+/// A descriptor is unchecksummed bytes off disk: a hostile one must make
+/// the read fail, never the process.
+#[test]
+fn a_hostile_descriptor_fails_the_read_and_nothing_else() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let c = tempfile::tempdir().unwrap();
+    let roots = [a.path(), b.path(), c.path()];
+    drop(populated_and_striped(&roots, 2, 1));
+    let id = segment_ids_with_shards(a.path())[0];
+    // Rewrite every shard's descriptor with shard_size = 0 and a device
+    // list too short for k + m.
+    for root in roots {
+        for i in lchfs_store::stripe::shards_on(root, id) {
+            let p = lchfs_store::stripe::shard_path(root, id, i);
+            let mut file = std::fs::read(&p).unwrap();
+            let at = lchfs_format::STRIPE_DESCRIPTOR_OFFSET;
+            let len = u32::from_le_bytes(file[at..at + 4].try_into().unwrap()) as usize;
+            let mut desc: lchfs_format::StripeDescriptor = lchfs_format::decode(&file[at + 4..at + 4 + len]).unwrap();
+            desc.shard_size = 0;
+            desc.devices.truncate(1);
+            let encoded = lchfs_format::encode(&desc).unwrap();
+            file[at..at + 4].copy_from_slice(&(encoded.len() as u32).to_le_bytes());
+            file[at + 4..at + 4 + encoded.len()].copy_from_slice(&encoded);
+            std::fs::write(&p, &file).unwrap();
+        }
+    }
+    let pool = Pool::open_replicated(&roots).unwrap();
+    let mut failed = 0;
+    for i in 0..14u32 {
+        let ino = pool.lookup(1, &format!("f{i}")).unwrap().unwrap();
+        if pool.read(ino, 0, 30_000).is_err() {
+            failed += 1;
+        }
+    }
+    assert!(failed > 0, "the records in that stripe are unreadable, not silently wrong");
+    assert!(pool.scrub().is_ok(), "scrub survives it too");
+    drop(pool);
+    let report = lchfs_fsck::check_stripes(&roots);
+    assert!(
+        report.errors.iter().any(|e| matches!(e, lchfs_fsck::FsckError::StripeInconsistent { segment_id, .. } if *segment_id == id)),
+        "{:?}",
+        report.errors
+    );
 }

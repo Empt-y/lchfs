@@ -446,7 +446,7 @@ pub struct StripeStatus {
     /// Segment body bytes held striped.
     pub logical_bytes: u64,
     /// Bytes the shards occupy, in total and per online device (header
-    /// pages included; a shard that fails to verify is not counted).
+    /// pages included; by file presence, not verified -- scrub verifies).
     pub shard_bytes: u64,
     pub shard_bytes_by_vdev: Vec<(u16, u64)>,
     /// What the same segments would occupy mirrored on every online
@@ -997,7 +997,10 @@ impl Pool {
         // still a member (if present) and so still a source to heal from.
         {
             let pool = Self::open_degraded(vdev_roots)?;
-            pool.0.unstripe_for_detach(leaving)?;
+            // Held for the whole proof: a conversion pass in this window
+            // would place shards on the leaving device.
+            let mut coalesce = pool.0.coalesce.lock();
+            pool.0.unstripe_for_detach(&mut coalesce, leaving)?;
             for id in 0..leaving {
                 let report = pool.resilver(id)?;
                 if !report.unrecoverable.is_empty() {
@@ -2024,10 +2027,6 @@ impl Drop for Pool {
 }
 
 impl PoolShared {
-    /// Spawns background threads that need to call back into `self` --
-    /// must run after this `PoolShared` is wrapped in its `Arc` (`create`/
-    /// `open` do so immediately after construction), since each timer's
-    /// closure needs its own `Arc<PoolShared>` clone.
     /// Seals every data and meta segment replica left `Open` on disk.
     /// Nothing this process owns is open yet but the meta writer's own
     /// segment (its data writers create segments on first use), so an
@@ -2038,14 +2037,22 @@ impl PoolShared {
     /// holds fewer records than its siblings and a footer from one file
     /// written on another would cut the longer one short. An Open replica
     /// with no records is deleted instead: an empty file a writer opened
-    /// and never used.
+    /// and never used. Nothing here can fail the mount: a header page
+    /// that does not read is that replica's problem for scrub, and a
+    /// device that cannot take the seal is faulted.
     fn seal_orphaned_segments(&self) -> Result<(), PoolError> {
-        let online = self.vdevs.online();
+        self.seal_orphaned_on(&self.vdevs.online())
+    }
+
+    /// `seal_orphaned_segments` for the devices given -- all of them at
+    /// mount; the one device on a rejoin, whose replicas were cut short
+    /// when it faulted and have been Open since.
+    fn seal_orphaned_on(&self, devices: &[Vdev]) -> Result<(), PoolError> {
         let live_meta = self.meta_writer.lock().segment_id();
         let mut sealed = 0u64;
         let mut removed = 0u64;
         for kind in [StreamKind::Data, StreamKind::Meta] {
-            let mut ids: Vec<u64> = online
+            let mut ids: Vec<u64> = devices
                 .iter()
                 .flat_map(|v| segment::segment_ids_on(&v.root, kind))
                 .collect();
@@ -2055,28 +2062,46 @@ impl PoolShared {
                 if kind == StreamKind::Meta && id == live_meta {
                     continue;
                 }
-                for (writer, records) in SegmentWriter::reopen_open_replicas(&online, id, kind)? {
+                for (writer, records) in SegmentWriter::reopen_open_replicas(devices, id, kind) {
+                    let vdev_id = writer.vdev_ids()[0];
                     if records == 0 {
                         let root = &writer.vdev_roots()[0];
                         let path = segment::segment_path(root, id, kind);
                         drop(writer);
-                        std::fs::remove_file(path)?;
-                        removed += 1;
-                    } else {
-                        for vdev_id in writer.seal()? {
-                            self.vdevs.fault(vdev_id);
+                        match std::fs::remove_file(path) {
+                            Ok(()) => removed += 1,
+                            Err(e) => {
+                                tracing::error!("vdev {vdev_id}: cannot remove empty segment {id} ({e}); faulting it");
+                                self.vdevs.fault(vdev_id);
+                            }
                         }
-                        sealed += 1;
+                    } else {
+                        match writer.seal() {
+                            Ok(faults) => {
+                                for f in faults {
+                                    self.vdevs.fault(f);
+                                }
+                                sealed += 1;
+                            }
+                            Err(e) => {
+                                tracing::error!("vdev {vdev_id}: cannot seal segment {id} ({e}); faulting it");
+                                self.vdevs.fault(vdev_id);
+                            }
+                        }
                     }
                 }
             }
         }
         if sealed + removed > 0 {
-            tracing::info!("mount: sealed {sealed} orphaned open segment replica(s), removed {removed} empty one(s)");
+            tracing::info!("sealed {sealed} orphaned open segment replica(s), removed {removed} empty one(s)");
         }
         Ok(())
     }
 
+    /// Spawns background threads that need to call back into `self` --
+    /// must run after this `PoolShared` is wrapped in its `Arc` (`create`/
+    /// `open` do so immediately after construction), since each timer's
+    /// closure needs its own `Arc<PoolShared>` clone.
     fn spawn_background_threads(self: &Arc<Self>) {
         let checkpoint_shared = Arc::clone(self);
         let checkpoint_task = background::PeriodicTask::spawn(
@@ -2578,10 +2603,9 @@ impl PoolShared {
             // gone; never healed as a mirror -- a missing shard is
             // rebuilt by resilver, not by a read.
             let outcome = self.stripe_reader(preferred.segment_id).and_then(|r| {
-                let missing = r.missing();
                 let bytes = r.read_record(preferred)?.1;
-                if !missing.is_empty() {
-                    self.note_missing_shards(&r.desc.devices, &missing, hash, preferred, ino);
+                if r.reconstructs(preferred) {
+                    self.note_missing_shards(&r.desc.devices, &r.missing(), hash, preferred, ino);
                 }
                 Ok(bytes)
             });
@@ -2866,7 +2890,11 @@ impl PoolShared {
                 "vdev {leaving} is this mount's primary and holds its index; it cannot leave while mounted"
             )));
         }
-        self.unstripe_for_detach(leaving)?;
+        // The daemon is kept out for the whole of this: a conversion pass
+        // between the repack and the slot leaving would put shards on the
+        // leaving device and build a stripe that is short from birth.
+        let mut coalesce = self.coalesce.lock();
+        self.unstripe_for_detach(&mut coalesce, leaving)?;
         for vdev in self.vdevs.online() {
             if vdev.id == leaving {
                 continue;
@@ -3023,12 +3051,11 @@ impl PoolShared {
     /// device. With the pool below `k + m` devices afterwards the
     /// conversion pass is a no-op, as §17.2.3 says; with enough left, the
     /// repacked segments go cold again and are re-striped over the
-    /// devices that remain.
-    fn unstripe_for_detach(&self, leaving: u16) -> Result<usize, PoolError> {
+    /// devices that remain. The caller holds the daemon's lock for the
+    /// whole detach, which is why it is passed in rather than taken.
+    fn unstripe_for_detach(&self, coalesce: &mut coalesce::CoalesceDaemon, leaving: u16) -> Result<usize, PoolError> {
         self.committer_pool.flush_index()?;
-        let repacked = self
-            .coalesce
-            .lock()
+        let repacked = coalesce
             .unstripe_segments_naming(leaving, &self.persisted_index, &self.next_segment_id)
             .map_err(|e| {
                 PoolError::Format(format!(
@@ -3095,15 +3122,17 @@ impl PoolShared {
             status.striped_segments += 1;
             status.logical_bytes += reader.desc.logical_len;
             let shard_cost = reader.desc.shard_size + segment::SEGMENT_HEADER_PAGE_SIZE;
+            // What is on disk, by file size -- a status request must not
+            // read and hash every shard of the pool; scrub does that.
+            let missing = reader.missing();
             for (i, &vdev_id) in reader.desc.devices.iter().enumerate() {
                 if let Some(entry) = status.shard_bytes_by_vdev.iter_mut().find(|(id, _)| *id == vdev_id)
-                    && reader.verify_shard(i as u8).unwrap_or(false)
+                    && !missing.contains(&(i as u8))
                 {
                     entry.1 += shard_cost;
                 }
             }
-            let missing = reader.missing().len();
-            if missing > 0 {
+            if !missing.is_empty() {
                 status.segments_missing_shards += 1;
                 if reader.present() < reader.desc.k as usize {
                     status.unreadable_segments += 1;
@@ -3151,15 +3180,7 @@ impl PoolShared {
 
     /// Every segment id with a shard file on any online device.
     fn striped_segments(&self) -> Vec<u64> {
-        let mut ids: Vec<u64> = self
-            .vdevs
-            .online()
-            .iter()
-            .flat_map(|v| stripe::segment_ids_with_shards(&v.root))
-            .collect();
-        ids.sort_unstable();
-        ids.dedup();
-        ids
+        stripe::striped_segment_ids(&self.vdevs.online())
     }
 
     /// Reads and verifies every record on every online vdev, healing what
@@ -3708,6 +3729,12 @@ impl PoolShared {
         }
         // The daemons read the live set at the start of each pass, so
         // there is nothing to tell them.
+        // A replica this device was writing when it faulted is still Open
+        // on it; every writer has just rolled, so nothing is appending to
+        // that segment any more and it is sealed from its own scan.
+        if let Some(vdev) = self.vdevs.online().into_iter().find(|v| v.id == id) {
+            self.seal_orphaned_on(&[vdev])?;
+        }
 
         // 3.
         let report = self.resilver(id)?;

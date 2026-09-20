@@ -172,3 +172,34 @@ fn copy_dir(from: &Path, to: &Path) {
         }
     }
 }
+
+/// One replica's header page rotted must not stop the pool mounting:
+/// that replica is left for scrub, the rest is sealed as usual.
+#[test]
+fn a_rotted_header_page_on_one_replica_does_not_fail_the_mount() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let image = tempfile::tempdir().unwrap();
+    let pool = Pool::create_replicated(&[a.path(), b.path()], params(false)).unwrap();
+    write_files(&pool, 4);
+    let (ia, ib) = (image.path().join("a"), image.path().join("b"));
+    copy_dir(a.path(), &ia);
+    copy_dir(b.path(), &ib);
+    drop(pool);
+    for root in [&ia, &ib] {
+        std::fs::remove_file(root.join("LOCK")).ok();
+    }
+    let (id, _, _) = data_segments(&ib)[0];
+    let p = ib.join(format!("segments/data/{id}.aseg"));
+    let mut bytes = std::fs::read(&p).unwrap();
+    for x in &mut bytes[..64] {
+        *x ^= 0xff;
+    }
+    std::fs::write(&p, &bytes).unwrap();
+
+    let pool = Pool::open_replicated(&[&ia, &ib]).unwrap();
+    for i in 0..4u32 {
+        assert_eq!(read_file(&pool, &format!("f{i}"), 30_000), payload(i));
+    }
+    assert!(data_segments(&ia).iter().all(|(_, s, _)| *s == SegmentState::Sealed));
+}
