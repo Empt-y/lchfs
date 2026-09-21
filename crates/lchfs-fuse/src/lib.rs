@@ -772,6 +772,29 @@ impl Filesystem for LchfsFilesystem {
         }
     }
 
+    /// A durability-conscious writer -- Postgres is the one that found this
+    /// missing -- fsyncs the *directory* to make a create, rename or unlink
+    /// in it durable, not just the file's data. A directory's entries are
+    /// namespace state in lchfs, made durable by a checkpoint, which is
+    /// exactly what `Pool::fsync` on a non-file inode runs. Without this the
+    /// default trait method returned ENOSYS and the barrier silently did
+    /// nothing: a crash could then lose a file the caller had been told was
+    /// safely created. Mirrors `fsync`; `Pool::fsync` dispatches on the
+    /// inode's kind.
+    fn fsyncdir(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: fuser::FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        match self.pool.fsync(ino.0) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(errno_for(&e)),
+        }
+    }
+
     fn destroy(&mut self) {
         // Kernel sends FUSE_DESTROY on a clean unmount; without this,
         // writes that no application explicitly `fsync`'d are silently
