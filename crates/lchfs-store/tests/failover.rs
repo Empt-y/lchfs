@@ -12,7 +12,7 @@
 //! the whole failure mode being guarded against is a read that succeeds
 //! while the pool is quietly one device away from losing the data.
 
-use lchfs_format::PoolParams;
+use lchfs_format::{PoolParams, StreamKind};
 use lchfs_index::RedbIndex;
 use lchfs_store::Pool;
 use std::path::{Path, PathBuf};
@@ -370,6 +370,20 @@ fn a_mirror_still_mounts_when_the_primary_has_lost_its_metadata() {
     }
 
     let pool = Pool::open_replicated(&[a.path(), b.path()]).unwrap();
+    // The mount had to fail over to get here, and the pool says so the
+    // same way a read after mount would: the counter moved, and every
+    // record served from b is a corruption event against a, unhealed
+    // (reads after this heal what they touch; the mount does not).
+    let stats = pool.repair_stats();
+    assert!(stats.failovers > 0, "mount failovers are not counted: {stats:?}");
+    let events = pool.corruption_events();
+    assert!(!events.is_empty(), "mount failovers are not recorded");
+    assert!(
+        events.iter().all(|e| e.vdev_id == 0 && e.stream == StreamKind::Meta && !e.healed),
+        "{events:?}"
+    );
+    assert_eq!(events.len() as u64, stats.failovers);
+
     assert_eq!(read_all(&pool, ino), payload());
     let d = pool.lookup(1, "dir").unwrap().expect("dir survives");
     let f = pool.lookup(d, "inner").unwrap().expect("inner survives");
@@ -406,6 +420,13 @@ fn delta_replay_at_mount_fails_over_too() {
     std::fs::remove_dir_all(&delta_dir).unwrap();
 
     let pool = Pool::open_replicated(&[a.path(), b.path()]).unwrap();
+    // Replay's failovers are accounted like the rest of the mount's.
+    assert!(pool.repair_stats().failovers > 0);
+    let events = pool.corruption_events();
+    assert!(
+        !events.is_empty() && events.iter().all(|e| e.vdev_id == 0 && e.stream == StreamKind::Delta && !e.healed),
+        "{events:?}"
+    );
     assert_eq!(pool.read(ino, 0, data.len() as u32).unwrap(), data);
 }
 

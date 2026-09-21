@@ -379,6 +379,34 @@ struct RepairStats {
     promotions: AtomicU64,
 }
 
+/// What the mount path had to do to get the pool up. `mount_read` runs
+/// before there is a pool to count against, so a failover or a
+/// reconstruction there used to leave only a log line; this carries them
+/// into the pool's counters and corruption log the moment it exists, so
+/// `pool status` and `pool corruption` say what the mount found, the same
+/// as a read after it would.
+#[derive(Default)]
+struct MountRepairs {
+    failovers: u64,
+    events: Vec<CorruptionEvent>,
+}
+
+impl MountRepairs {
+    fn failed_over(&mut self, vdev_id: u16, kind: StreamKind, hash: Hash32, loc: ExtentLocation, detail: String) {
+        self.failovers += 1;
+        self.events.push(CorruptionEvent {
+            at: SystemTime::now(),
+            vdev_id,
+            stream: kind,
+            hash,
+            location: Some(loc),
+            ino: None,
+            detail,
+            healed: false,
+        });
+    }
+}
+
 impl RepairStats {
     fn snapshot(&self) -> RepairStatsSnapshot {
         RepairStatsSnapshot {
@@ -1238,11 +1266,13 @@ impl Pool {
             };
 
         let persisted_index = persisted_index_inner;
+        let mut mount_repairs = MountRepairs::default();
 
         let root_bytes = mount_read(
             &mut readers,
             &vdevs,
             &persisted_index,
+            &mut mount_repairs,
             StreamKind::Meta,
             slot.root_hash,
             slot.root_location,
@@ -1257,6 +1287,7 @@ impl Pool {
             &mut readers,
             &vdevs,
             &persisted_index,
+            &mut mount_repairs,
             StreamKind::Meta,
             root.inomap_hash,
             inomap_loc,
@@ -1275,6 +1306,7 @@ impl Pool {
                 &mut readers,
                 &vdevs,
                 &persisted_index,
+                &mut mount_repairs,
                 StreamKind::Meta,
                 entry.current_object_hash,
                 loc,
@@ -1291,6 +1323,7 @@ impl Pool {
                     &mut readers,
                     &vdevs,
                     &persisted_index,
+                    &mut mount_repairs,
                     StreamKind::Meta,
                     *dir_hash,
                     dir_loc,
@@ -1394,7 +1427,7 @@ impl Pool {
                             entry.ino
                         ))
                     })?;
-                    let bytes = mount_read_delta(&vdevs, shard_id, *loc)?;
+                    let bytes = mount_read_delta(&vdevs, &mut mount_repairs, shard_id, *loc)?;
                     let inode: InodeObject = lchfs_format::decode(&bytes)
                         .map_err(|e| PoolError::Format(e.to_string()))?;
 
@@ -1413,7 +1446,7 @@ impl Pool {
                                 entry.ino
                             ))
                         })?;
-                        let ihl_bytes = mount_read_delta(&vdevs, shard_id, *ihl_loc)?;
+                        let ihl_bytes = mount_read_delta(&vdevs, &mut mount_repairs, shard_id, *ihl_loc)?;
                         let ihl: IndirectHashList = lchfs_format::decode(&ihl_bytes)
                             .map_err(|e| PoolError::Format(e.to_string()))?;
                         // Place each chunk at its own `logical_offset`, for
@@ -1440,6 +1473,7 @@ impl Pool {
                                 &mut readers,
                                 &vdevs,
                                 &persisted_index,
+                                &mut mount_repairs,
                                 StreamKind::Data,
                                 chunk.content_hash,
                                 *chunk_loc,
@@ -1522,7 +1556,7 @@ impl Pool {
             vdevs: Arc::clone(&vdev_set),
             mount_resilver: Vec::new(),
             attach_lock: Mutex::new(()),
-            corruption: Mutex::new(std::collections::VecDeque::new()),
+            corruption: Mutex::new(mount_repairs.events.into_iter().collect()),
             namespace: Mutex::new(namespace),
             file_state: Mutex::new(file_state_from_replay),
             open_files: Mutex::new(HashMap::new()),
@@ -1532,7 +1566,10 @@ impl Pool {
             persisted_index: Arc::clone(&persisted_index),
             readers: Mutex::new(readers),
             heal_writers: Mutex::new(HashMap::new()),
-            repair_stats: RepairStats::default(),
+            repair_stats: RepairStats {
+                failovers: AtomicU64::new(mount_repairs.failovers),
+                ..RepairStats::default()
+            },
             meta_writer: Mutex::new(meta_writer),
             next_segment_id,
             published_generation,
@@ -5339,6 +5376,7 @@ fn mount_read(
     readers: &mut SegmentReaders,
     vdevs: &[Vdev],
     index: &RedbIndex,
+    repairs: &mut MountRepairs,
     kind: StreamKind,
     hash: Hash32,
     loc: ExtentLocation,
@@ -5352,11 +5390,43 @@ fn mount_read(
     };
     let replicas = index.chunk_locations(hash).unwrap_or_default();
     if let Some(&(_, sloc)) = replicas.iter().find(|(v, _)| *v == stripe::STRIPED) {
-        // A cold record whose mirrors are gone: only its stripe has it.
+        // A cold record whose mirrors are gone: only its stripe has it,
+        // and the primary attempt above was bound to fail -- that is not
+        // corruption. Reconstructing is the cold-data failover, counted as one, and a
+        // shard that is missing on a device that is here for this mount
+        // is corruption on that device -- a device absent from the mount
+        // is just absent. Nothing is rebuilt here; resilver does that.
         let root_of = |id: u16| vdevs.iter().find(|v| v.id == id).map(|v| v.root.clone());
         if let Ok(reader) = stripe::StripeReader::open(sloc.segment_id, root_of, vdevs)
             && let Ok((_, bytes)) = reader.read_record(sloc)
         {
+            let missing = reader.missing();
+            if reader.reconstructs(sloc) {
+                tracing::warn!(
+                    "mount: {kind:?} record {hash:?} reconstructed from stripe {} with shard(s) {missing:?} missing",
+                    sloc.segment_id
+                );
+                repairs.failovers += 1;
+                for &i in &missing {
+                    let vdev_id = reader.desc.devices[i as usize];
+                    if !vdevs.iter().any(|v| v.id == vdev_id) {
+                        continue;
+                    }
+                    repairs.events.push(CorruptionEvent {
+                        at: SystemTime::now(),
+                        vdev_id,
+                        stream: StreamKind::Data,
+                        hash,
+                        location: Some(sloc),
+                        ino: None,
+                        detail: format!(
+                            "shard {i} of striped segment {} unreadable at mount; reconstructed from its siblings",
+                            sloc.segment_id
+                        ),
+                        healed: false,
+                    });
+                }
+            }
             return Ok(bytes);
         }
     }
@@ -5377,6 +5447,7 @@ fn mount_read(
                     primary.id,
                     vdev.id
                 );
+                repairs.failed_over(primary.id, kind, hash, loc, format!("{primary_err}; served from vdev {} at mount", vdev.id));
                 return Ok(bytes);
             }
         }
@@ -5387,18 +5458,31 @@ fn mount_read(
 /// `mount_read` for a shard's delta stream during replay. Delta segments
 /// fan out like every other stream and are never healed or repacked, so
 /// the same location on any other device is the only alternative there is.
-fn mount_read_delta(vdevs: &[Vdev], shard_id: u32, loc: ExtentLocation) -> Result<Vec<u8>, PoolError> {
-    let mut first_err = None;
+fn mount_read_delta(
+    vdevs: &[Vdev],
+    repairs: &mut MountRepairs,
+    shard_id: u32,
+    loc: ExtentLocation,
+) -> Result<Vec<u8>, PoolError> {
+    let mut first_err: Option<PoolError> = None;
     for vdev in vdevs {
         match SegmentReader::open_delta(&vdev.root, shard_id, loc.segment_id)
             .map_err(PoolError::from)
             .and_then(|r| r.read_record(loc).map_err(PoolError::from))
         {
-            Ok((_, bytes)) => {
-                if first_err.is_some() {
+            Ok((header, bytes)) => {
+                if let Some(e) = first_err {
                     tracing::warn!(
-                        "mount: delta record for shard {shard_id} unreadable on vdev 0; served from vdev {}",
+                        "mount: delta record for shard {shard_id} unreadable on vdev {} ({e}); served from vdev {}",
+                        vdevs[0].id,
                         vdev.id
+                    );
+                    repairs.failed_over(
+                        vdevs[0].id,
+                        StreamKind::Delta,
+                        header.content_hash,
+                        loc,
+                        format!("{e}; delta record of shard {shard_id} served from vdev {} at mount", vdev.id),
                     );
                 }
                 return Ok(bytes);

@@ -581,3 +581,60 @@ fn a_hostile_descriptor_fails_the_read_and_nothing_else() {
         report.errors
     );
 }
+
+/// The mount path reads stripes too: a file that dedups against cold
+/// data, fsync'd and not checkpointed, is replayed from the delta log at
+/// the next mount and its chunks are read out of the stripes they now
+/// live in. With a data shard gone that read reconstructs, and the mount
+/// has to say so the way a read after it would -- counted as a failover,
+/// recorded against the device the shard is missing from.
+#[test]
+fn replay_at_mount_reconstructs_striped_chunks_and_says_so() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let c = tempfile::tempdir().unwrap();
+    let roots = [a.path(), b.path(), c.path()];
+    let pool = populated_and_striped(&roots, 2, 1);
+    let striped = segment_ids_with_shards(a.path());
+    assert!(!striped.is_empty());
+    // Same bytes as f0: every chunk is a dedup hit against the stripes.
+    let ino = pool.create_file(1, "again", 0o644).unwrap();
+    pool.write(ino, 0, &payload(0)).unwrap();
+    pool.fsync(ino).unwrap();
+    // No checkpoint: replay is the only way this file comes back.
+    drop(pool);
+
+    // Lose a data shard of every stripe on whichever device holds it,
+    // so whichever stripe f0's chunks landed in has to reconstruct.
+    let mut victims = std::collections::BTreeSet::new();
+    for &id in &striped {
+        let holder = holder_of_shard0(&roots, id);
+        std::fs::remove_file(lchfs_store::stripe::shard_path(holder, id, 0)).unwrap();
+        victims.insert(roots.iter().position(|r| *r == holder).unwrap() as u16);
+    }
+
+    // By inode: the name is namespace state, which only a checkpoint
+    // carries, as in failover.rs's delta replay test.
+    let pool = Pool::open_replicated(&roots).unwrap();
+    // Before any read: this is what the mount itself did.
+    let stats = pool.repair_stats();
+    assert!(stats.failovers > 0, "reconstruction at mount is not counted: {stats:?}");
+    let events = pool.corruption_events();
+    assert!(!events.is_empty(), "reconstruction at mount is not recorded");
+    assert_eq!(pool.read(ino, 0, 30_000).unwrap().as_ref(), payload(0));
+    for e in &events {
+        assert!(victims.contains(&e.vdev_id), "{e:?} names a device that lost nothing");
+        assert!(striped.contains(&e.location.unwrap().segment_id), "{e:?}");
+        assert!(!e.healed, "{e:?}: a read never rebuilds a shard");
+    }
+    // Resilver puts every shard back; a remount then reconstructs nothing.
+    for v in &victims {
+        assert!(pool.resilver(*v).unwrap().shards_rebuilt > 0);
+    }
+    pool.checkpoint().unwrap();
+    drop(pool);
+    let pool = Pool::open_replicated(&roots).unwrap();
+    assert_eq!(pool.read(ino, 0, 30_000).unwrap().as_ref(), payload(0));
+    assert_eq!(pool.repair_stats().failovers, 0);
+    assert!(pool.corruption_events().is_empty());
+}
