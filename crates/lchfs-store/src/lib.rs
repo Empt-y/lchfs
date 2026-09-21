@@ -2078,16 +2078,33 @@ impl PoolShared {
     /// that does not read is that replica's problem for scrub, and a
     /// device that cannot take the seal is faulted.
     fn seal_orphaned_segments(&self) -> Result<(), PoolError> {
-        self.seal_orphaned_on(&self.vdevs.online())
+        let live_meta = Some(self.meta_writer.lock().segment_id());
+        for vdev_id in self.seal_orphaned_on(&self.vdevs.online(), live_meta)? {
+            self.vdevs.fault(vdev_id);
+        }
+        Ok(())
     }
 
     /// `seal_orphaned_segments` for the devices given -- all of them at
-    /// mount; the one device on a rejoin, whose replicas were cut short
-    /// when it faulted and have been Open since.
-    fn seal_orphaned_on(&self, devices: &[Vdev]) -> Result<(), PoolError> {
-        let live_meta = self.meta_writer.lock().segment_id();
+    /// mount, when the meta writer's own segment (`live_meta`) is the one
+    /// thing open and must be left alone; the one device on a rejoin,
+    /// before it is a member, when nothing is. Returns the devices with a
+    /// replica that could not be sealed or removed; what to do about them
+    /// is the caller's, since at mount that device is faulted and on a
+    /// join it is simply not taken.
+    ///
+    /// This must only ever run over devices no writer can reach: a footer
+    /// is written at the end of what the scan found, and a segment that
+    /// is still being appended to would go on past it, every record after
+    /// it invisible to that replica's scan. That is what a live attach
+    /// did when this ran *after* the device had joined -- a committer,
+    /// rolled by the join's barrier, opened its next segment on the new
+    /// set and had it sealed under it; fsck then found the records past
+    /// the footer on every device but the new one.
+    fn seal_orphaned_on(&self, devices: &[Vdev], live_meta: Option<u64>) -> Result<Vec<u16>, PoolError> {
         let mut sealed = 0u64;
         let mut removed = 0u64;
+        let mut failed: Vec<u16> = Vec::new();
         for kind in [StreamKind::Data, StreamKind::Meta] {
             let mut ids: Vec<u64> = devices
                 .iter()
@@ -2096,7 +2113,7 @@ impl PoolShared {
             ids.sort_unstable();
             ids.dedup();
             for id in ids {
-                if kind == StreamKind::Meta && id == live_meta {
+                if kind == StreamKind::Meta && Some(id) == live_meta {
                     continue;
                 }
                 for (writer, records) in SegmentWriter::reopen_open_replicas(devices, id, kind) {
@@ -2108,21 +2125,19 @@ impl PoolShared {
                         match std::fs::remove_file(path) {
                             Ok(()) => removed += 1,
                             Err(e) => {
-                                tracing::error!("vdev {vdev_id}: cannot remove empty segment {id} ({e}); faulting it");
-                                self.vdevs.fault(vdev_id);
+                                tracing::error!("vdev {vdev_id}: cannot remove empty segment {id} ({e})");
+                                failed.push(vdev_id);
                             }
                         }
                     } else {
                         match writer.seal() {
                             Ok(faults) => {
-                                for f in faults {
-                                    self.vdevs.fault(f);
-                                }
+                                failed.extend(faults);
                                 sealed += 1;
                             }
                             Err(e) => {
-                                tracing::error!("vdev {vdev_id}: cannot seal segment {id} ({e}); faulting it");
-                                self.vdevs.fault(vdev_id);
+                                tracing::error!("vdev {vdev_id}: cannot seal segment {id} ({e})");
+                                failed.push(vdev_id);
                             }
                         }
                     }
@@ -2132,7 +2147,9 @@ impl PoolShared {
         if sealed + removed > 0 {
             tracing::info!("sealed {sealed} orphaned open segment replica(s), removed {removed} empty one(s)");
         }
-        Ok(())
+        failed.sort_unstable();
+        failed.dedup();
+        Ok(failed)
     }
 
     /// Spawns background threads that need to call back into `self` --
@@ -3729,6 +3746,13 @@ impl PoolShared {
     /// The sequence both `attach_vdev_live` and `online_vdev` end with.
     /// The order is what makes it safe under load:
     ///
+    /// 0. Any replica left Open on the device -- cut short when it
+    ///    faulted, or by an unclean stop before an attach -- is sealed
+    ///    from its own scan, now, while the device is nobody's: a
+    ///    faulted replica is dropped from its writer's fan-out for good
+    ///    and nothing can open a segment on a device that is not a
+    ///    member, so every Open replica on it is dead and sealing it is
+    ///    safe. One step later it is not (see `seal_orphaned_on`).
     /// 1. The device joins the online set, marked as catching up, so
     ///    checkpoints leave its superblock alone until step 4.
     /// 2. Every fan-out writer -- each shard's data writer, the meta
@@ -3752,6 +3776,14 @@ impl PoolShared {
     /// stale and mounts degraded or resilvers, and a rerun finishes it.
     fn join_live(&self, member: vdevs::Member) -> Result<ResilverReport, PoolError> {
         let id = member.vdev.id;
+        // 0.
+        if !self.seal_orphaned_on(std::slice::from_ref(&member.vdev), None)?.is_empty() {
+            return Err(PoolError::Format(format!(
+                "vdev {id} at {} has an open segment replica that cannot be sealed; not joining",
+                member.vdev.root.display()
+            )));
+        }
+
         // 1.
         self.vdevs.attach(member);
 
@@ -3766,12 +3798,6 @@ impl PoolShared {
         }
         // The daemons read the live set at the start of each pass, so
         // there is nothing to tell them.
-        // A replica this device was writing when it faulted is still Open
-        // on it; every writer has just rolled, so nothing is appending to
-        // that segment any more and it is sealed from its own scan.
-        if let Some(vdev) = self.vdevs.online().into_iter().find(|v| v.id == id) {
-            self.seal_orphaned_on(&[vdev])?;
-        }
 
         // 3.
         let report = self.resilver(id)?;
