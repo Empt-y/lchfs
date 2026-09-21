@@ -222,3 +222,134 @@ fn checkpoint_running_concurrently_with_active_writers_no_deadlock() {
         assert_eq!(read_back.as_ref(), expected.as_slice(), "mismatch after reopen for ino {ino}");
     }
 }
+
+
+/// A read is not under the inode lock, and it must never see a file
+/// between states. Files are written the way FUSE's writeback cache
+/// delivers them -- a first write that takes the whole-file path, then
+/// sequential pieces through an incremental session -- while a pool of
+/// readers verifies whatever has been written so far, over and over, and
+/// a checkpoint loops as fast as it can. Two races used to show here: the
+/// checkpoint snapshotted `file_state` for every dirty inode before
+/// taking any inode lock, and could catch a fallback write between
+/// putting its bytes in and its chunk list in, publishing an empty chunk
+/// list for a file full of data; and it removed a session before
+/// publishing what the session held, so a read in that window fell
+/// through to the previous (empty, for a new file) ContentRef and came
+/// back zeros. On a live mount it was one 128 KiB piece of zeros in a
+/// 10 MB file's checksum, once, with the data on disk fine; the readers
+/// run continuously here so they land in that per-inode window reliably.
+#[test]
+fn reads_never_see_a_file_between_states_while_checkpoints_race() {
+    use parking_lot::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    let dir = tempfile::tempdir().unwrap();
+    // Default parameters: the pattern needs writes large enough that the
+    // first one is past the inline threshold and chunks are real.
+    let pool = Arc::new(Pool::create(dir.path(), PoolParams::default()).unwrap());
+    let done = Arc::new(AtomicBool::new(false));
+    let checkpoints = Arc::new(AtomicU64::new(0));
+    let bad = Arc::new(AtomicU64::new(0));
+    // (ino, seed) for every file whose last piece has been written -- what
+    // the readers are allowed to expect complete.
+    let ready: Arc<Mutex<Vec<(u64, u64)>>> = Arc::new(Mutex::new(Vec::new()));
+
+    // Small files, many of them: each new file has exactly one window --
+    // its first checkpoint, which finalizes the session and publishes the
+    // ContentRef -- so thousands of files means thousands of windows. Two
+    // chunks each (256 KiB, well past the 64-byte inline threshold), the
+    // first 64 KiB write taking the whole-file path and the rest an
+    // incremental session, exactly as the writeback cache delivers them.
+    let total = 256usize << 10;
+    let piece = 64usize << 10;
+    let step = 64 * 1024;
+    let files = 4000u64;
+
+    let ckpt = {
+        let pool = Arc::clone(&pool);
+        let done = Arc::clone(&done);
+        let checkpoints = Arc::clone(&checkpoints);
+        std::thread::spawn(move || {
+            while !done.load(Ordering::Relaxed) {
+                pool.checkpoint().unwrap();
+                checkpoints.fetch_add(1, Ordering::Relaxed);
+            }
+        })
+    };
+
+    // More reader threads than cores: the extra scheduling pressure widens
+    // the window a read has to land in.
+    let readers: Vec<_> = (0..16)
+        .map(|t| {
+            let pool = Arc::clone(&pool);
+            let done = Arc::clone(&done);
+            let bad = Arc::clone(&bad);
+            let ready = Arc::clone(&ready);
+            std::thread::spawn(move || {
+                let mut x = (t as u64) * 2654435761 + 1;
+                while !done.load(Ordering::Relaxed) {
+                    let pick = {
+                        let r = ready.lock();
+                        if r.is_empty() {
+                            None
+                        } else {
+                            x ^= x << 13;
+                            x ^= x >> 7;
+                            x ^= x << 17;
+                            Some(r[(x as usize) % r.len()])
+                        }
+                    };
+                    let Some((ino, seed)) = pick else {
+                        std::thread::yield_now();
+                        continue;
+                    };
+                    let data = deterministic_bytes(seed, total);
+                    let mut off = 0usize;
+                    while off < total {
+                        let part = pool.read(ino, off as u64, step as u32).unwrap();
+                        // A ready file is fully written, so a short or empty
+                        // read of an in-range offset is the bug showing (the
+                        // file seen mid-checkpoint), same as a byte mismatch.
+                        if part.is_empty() || part.as_ref() != &data[off..off + part.len()] {
+                            bad.fetch_add(1, Ordering::Relaxed);
+                            break;
+                        }
+                        off += part.len();
+                    }
+                }
+            })
+        })
+        .collect();
+
+    for f in 0..files {
+        let data = deterministic_bytes(f, total);
+        let ino = pool.create_file(1, &format!("f{f}"), 0o644).unwrap();
+        for p in 0..(total / piece) {
+            pool.write(ino, (p * piece) as u64, &data[p * piece..(p + 1) * piece]).unwrap();
+        }
+        ready.lock().push((ino, f));
+    }
+    // Let the readers keep racing the checkpoint for a moment after the
+    // last file, so the last few files' first checkpoints are covered too.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    done.store(true, Ordering::Relaxed);
+    ckpt.join().unwrap();
+    for r in readers {
+        r.join().unwrap();
+    }
+    assert!(checkpoints.load(Ordering::Relaxed) > 20, "the checkpoint loop did not race anything");
+    assert_eq!(bad.load(Ordering::Relaxed), 0, "reads saw a file mid-checkpoint");
+
+    // And what was persisted is right too.
+    pool.checkpoint().unwrap();
+    drop(pool);
+    let pool = Pool::open(dir.path()).unwrap();
+    for f in 0..files {
+        let ino = pool.lookup(1, &format!("f{f}")).unwrap().unwrap();
+        assert_eq!(
+            pool.read(ino, 0, total as u32).unwrap().as_ref(),
+            deterministic_bytes(f, total).as_slice(),
+            "file {f}"
+        );
+    }
+}

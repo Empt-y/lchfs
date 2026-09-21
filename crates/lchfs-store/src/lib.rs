@@ -2023,6 +2023,15 @@ impl Pool {
         self.0.debug_force_duplicate_chunk(raw_bytes)
     }
 
+    /// Tooling support: the chunk list a file's content resolves to as
+    /// it stands, from the working state if the file has been written
+    /// since the last checkpoint, else from its checkpointed object.
+    /// Empty for inline content. What a diagnostic needs to ask "which
+    /// chunks, at which offsets" without going through `read`.
+    pub fn debug_chunk_refs(&self, ino: u64) -> Result<Vec<ChunkRef>, PoolError> {
+        self.0.current_chunks_for_new_session(ino)
+    }
+
     /// Retains the current state as a named snapshot (ARCHITECTURE.md §6).
     /// `PoolError::AlreadyExists` if `name` is already taken.
     pub fn create_snapshot(&self, name: &str) -> Result<(), PoolError> {
@@ -4014,49 +4023,59 @@ impl PoolShared {
     /// concurrent `write()` could otherwise open (see `ino_locks`'s doc
     /// comment).
     fn finalize_incremental_session(&self, ino: u64) -> Result<Option<Vec<ChunkRef>>, PoolError> {
-        let mut state = match self.open_files.lock().remove(&ino) {
-            Some(s) => s,
-            None => return Ok(None),
+        // The session stays in `open_files`, untouched, until the caller
+        // has published what this returns and calls `close_session`. A
+        // read is not under the inode lock and takes whichever of the
+        // session, `file_state` and the inode's ContentRef it finds
+        // first; while the session is there it assembles the file from
+        // the session's chunks and pending tail, which are exactly the
+        // bytes -- so a read cannot fall through to a ContentRef that
+        // does not yet say what this session added. This used to remove
+        // the session first, and a read landing between that and the
+        // ContentRef write-back served the previous checkpoint's content
+        // for a file that had grown since: zeros past its old end.
+        //
+        // The tail is cut on a copy of the chunker so the session's own
+        // state is what a read still sees; the bytes committed are the
+        // pending ones, which stay pending in the session until it closes.
+        let snapshot = self
+            .open_files
+            .lock()
+            .get(&ino)
+            .map(|s| (s.chunker.clone(), s.base_offset, s.chunks.clone(), s.pending_bytes.clone()));
+        let Some((mut chunker, base_offset, mut chunks, pending)) = snapshot else {
+            return Ok(None);
         };
-        if let Some(b) = state.chunker.finish() {
-            let bytes: Vec<u8> = state.pending_bytes.drain(0..b.len as usize).collect();
-            let logical_offset = state.base_offset + b.offset;
-            match self.commit_chunk(ino, logical_offset, &bytes) {
-                Ok((hash, _loc)) => {
-                    state.chunks.push(ChunkRef {
-                        content_hash: hash,
-                        logical_offset,
-                        len: b.len,
-                    });
-                }
-                Err(e) => {
-                    // The whole session -- `state` was already removed
-                    // from `open_files` above -- is being discarded here,
-                    // including any dedup-hit pins already in
-                    // `state.chunks` from earlier `write_incremental` calls
-                    // in this same session (see `PendingDedupPins`'s doc
-                    // comment). No-op for any hash that was never pinned.
-                    for r in &state.chunks {
-                        self.dedup_pins.unpin(r.content_hash);
-                    }
-                    return Err(e);
-                }
-            }
+        if let Some(b) = chunker.finish() {
+            let bytes = &pending[..(b.len as usize).min(pending.len())];
+            let logical_offset = base_offset + b.offset;
+            // On failure the session is left as it was, pins and all: a
+            // later finalize commits the same tail again (a dedup hit if
+            // the first append did land), and a session that is never
+            // finalized is discarded with its pins by whatever ends it.
+            let (hash, _loc) = self.commit_chunk(ino, logical_offset, bytes)?;
+            chunks.push(ChunkRef {
+                content_hash: hash,
+                logical_offset,
+                len: b.len,
+            });
         }
         // `file_state[ino]`, if present, was populated by an *earlier*
         // fallback-path write and only covers content up to that point --
-        // stale relative to what this session just added. Deliberately
-        // NOT invalidated here (unlike an earlier version of this
-        // function): whether that's safe depends on whether the caller's
-        // encoded result ends up globally resolvable (checkpoint's
-        // put_meta_object, yes) or not (fsync's shard-local delta log, no
-        // -- `read_meta_object_bytes` would fail to resolve it via the
-        // global index). Each caller handles this explicitly: checkpoint
-        // invalidates (safe, its ContentRef hash is globally indexed);
-        // fsync repopulates `file_state` directly instead (its ContentRef
-        // hash is only resolvable through the shard's own delta log,
-        // which ordinary reads don't know how to consult).
-        Ok(Some(state.chunks))
+        // stale relative to what this session just added. Each caller
+        // handles it when it closes the session: checkpoint invalidates
+        // (safe, its ContentRef hash is globally indexed); fsync
+        // repopulates `file_state` directly instead (its ContentRef hash
+        // is only resolvable through the shard's own delta log, which
+        // ordinary reads don't know how to consult).
+        Ok(Some(chunks))
+    }
+
+    /// Ends `ino`'s session once its finalized content has been published
+    /// somewhere a read will find it -- the inode's ContentRef, or
+    /// `file_state`. Under the inode lock, after `finalize_incremental_session`.
+    fn close_session(&self, ino: u64) {
+        self.open_files.lock().remove(&ino);
     }
 
     /// Ends `ino`'s open incremental-append session (if any) and captures
@@ -4069,18 +4088,19 @@ impl PoolShared {
     /// content, not just a chunk list -- more expensive, but only run on
     /// the already-slow-path transition, never in the fast path itself.
     fn materialize_session_into_file_state(&self, ino: u64) -> Result<(), PoolError> {
-        let Some(state) = self.open_files.lock().remove(&ino) else {
+        let snapshot = self
+            .open_files
+            .lock()
+            .get(&ino)
+            .map(|s| (s.chunks.clone(), s.pending_bytes.clone()));
+        let Some((chunks, pending)) = snapshot else {
             return Ok(());
         };
-        let contents =
-            self.assemble_session_contents(ino, &state.chunks, &state.pending_bytes)?;
-        self.file_state.lock().insert(
-            ino,
-            FileWorkingState {
-                contents,
-                chunks: state.chunks,
-            },
-        );
+        let contents = self.assemble_session_contents(ino, &chunks, &pending)?;
+        // `file_state` first, the session last: a read finds one or the
+        // other, never neither (see `finalize_incremental_session`).
+        self.file_state.lock().insert(ino, FileWorkingState { contents, chunks });
+        self.close_session(ino);
         Ok(())
     }
 
@@ -5026,6 +5046,12 @@ impl PoolShared {
             .lock()
             .commit(ino, new_object_hash, &records)?;
 
+        // `file_state` holds the finalized content and the ContentRef
+        // names it; the session is the last thing a read could need, and
+        // the last to go.
+        if session_chunks.is_some() {
+            self.close_session(ino);
+        }
         Ok(())
     }
 
@@ -5094,14 +5120,6 @@ impl PoolShared {
                 .collect()
         };
 
-        let file_state_snapshot: HashMap<u64, FileWorkingState> = {
-            let file_state = self.file_state.lock();
-            work.iter()
-                .filter(|w| w.kind == InodeKind::File)
-                .filter_map(|w| file_state.get(&w.ino).cloned().map(|s| (w.ino, s)))
-                .collect()
-        };
-
         // Every chunk hash that ends up in a freshly-written IndirectHashList
         // this pass -- unpinned (see `PendingDedupPins`) once the root that
         // captures them is published, below. Unconditional: a hash that was
@@ -5133,6 +5151,19 @@ impl PoolShared {
                     let ino_lock = self.lock_for_ino(w.ino);
                     let _guard = ino_lock.lock();
                     let session_chunks = self.finalize_incremental_session(w.ino)?;
+                    // Read under the inode lock, not snapshotted for every
+                    // dirty inode before this loop: a fallback-path write
+                    // holds the lock while it puts bytes into `contents`
+                    // and then, after committing them, the chunk list into
+                    // `chunks`. A snapshot taken between the two had the
+                    // new contents and the old chunk list -- empty, for a
+                    // file's first write -- and this checkpoint published
+                    // an IndirectHashList with nothing in it for a file
+                    // full of data. Every read until the next checkpoint
+                    // then came back zeros, and a crash in between would
+                    // have kept them.
+                    let file_state_now: Option<FileWorkingState> =
+                        self.file_state.lock().get(&w.ino).cloned();
 
                     // dirty_inodes marking is "at least once", not exactly
                     // once: write_incremental/rechunk_and_touch mark an
@@ -5157,21 +5188,9 @@ impl PoolShared {
                     // the existing ContentRef untouched: there is nothing
                     // new to reflect, and the current one is already
                     // right.
-                    let has_fresh_data = session_chunks.is_some() || file_state_snapshot.contains_key(&w.ino);
+                    let has_fresh_data = session_chunks.is_some() || file_state_now.is_some();
                     if !has_fresh_data {
                         continue;
-                    }
-
-                    // A fast-path session was active (now finalized): any
-                    // `file_state[ino]` entry is either absent or stale
-                    // relative to it. Safe to invalidate here specifically
-                    // because checkpoint's `put_meta_object` below
-                    // globally registers the resulting ContentRef's hash
-                    // (unlike fsync's shard-local delta log), so the next
-                    // `hydrate_file_state` will correctly re-derive fresh
-                    // content from it.
-                    if session_chunks.is_some() {
-                        self.file_state.lock().remove(&w.ino);
                     }
 
                     // `w.size` was snapshotted before this per-file loop
@@ -5200,15 +5219,16 @@ impl PoolShared {
                             .is_some_and(|i| i.size > self.pool_params.inline_threshold as u64)
                     };
 
+                    let had_session = session_chunks.is_some();
                     let content_ref = if !is_chunked {
-                        let bytes = file_state_snapshot
-                            .get(&w.ino)
+                        let bytes = file_state_now
+                            .as_ref()
                             .map(|s| s.contents.clone())
                             .unwrap_or_default();
                         ContentRef::Inline(bytes)
                     } else {
                         let chunks = session_chunks
-                            .or_else(|| file_state_snapshot.get(&w.ino).map(|s| s.chunks.clone()))
+                            .or_else(|| file_state_now.as_ref().map(|s| s.chunks.clone()))
                             .unwrap_or_default();
                         checkpointed_chunk_hashes.extend(chunks.iter().map(|c| c.content_hash));
                         let ihl = IndirectHashList { chunks };
@@ -5218,6 +5238,18 @@ impl PoolShared {
                     };
                     if let Some(inode) = self.namespace.lock().inodes.get_mut(&w.ino) {
                         inode.content = content_ref;
+                    }
+                    // Only now that the ContentRef says what the session
+                    // held: any `file_state[ino]` entry is from an earlier
+                    // fallback-path write and stale relative to it, and
+                    // safe to drop because `put_meta_object` above
+                    // globally registered the ContentRef's hash (unlike
+                    // fsync's shard-local delta log), so the next
+                    // `hydrate_file_state` re-derives it; and the session
+                    // itself can go, its content being findable without it.
+                    if had_session {
+                        self.file_state.lock().remove(&w.ino);
+                        self.close_session(w.ino);
                     }
                 }
                 InodeKind::Symlink => {} // unchanged; content already correct

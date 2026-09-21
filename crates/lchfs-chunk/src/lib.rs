@@ -35,6 +35,7 @@ pub trait Chunker {
 /// any position never looks more than `max_size` bytes ahead, so once that
 /// many trailing bytes are buffered, every cut point below them is final
 /// and can never change no matter what arrives next.
+#[derive(Clone)]
 pub struct FastCdcChunker {
     avg_size: u32,
     min_size: u32,
