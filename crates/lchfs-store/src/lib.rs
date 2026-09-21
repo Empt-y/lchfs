@@ -159,6 +159,63 @@ impl<V> ShardedInoMap<V> {
     }
 }
 
+/// Cache of open segment readers, shared across threads. A `SegmentReader`
+/// reads via positional `pread` (`read_exact_at`, `&self`), so one is safe
+/// to read from concurrently; the cache hands out `Arc<SegmentReader>` and
+/// holds a lock only for the map lookup or insert -- never across the read
+/// itself. That is the whole point: a read is disk I/O, and holding a lock
+/// across it serializes every concurrent read (ARCHITECTURE.md §17.5).
+/// Sharded by segment id so even the lookup rarely contends. There is no
+/// invalidation, by construction: segment ids are monotonic and never
+/// reused, and an open fd keeps reading a segment that coalesce has since
+/// unlinked, so a cached reader can never point at the wrong bytes.
+type ReaderKey = (u16, u64, StreamKind);
+type ReaderShard = Mutex<HashMap<ReaderKey, Arc<SegmentReader>>>;
+
+struct ReaderCache {
+    shards: Box<[ReaderShard]>,
+}
+
+impl ReaderCache {
+    fn new() -> Self {
+        Self {
+            shards: (0..INO_SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
+        }
+    }
+
+    /// Seeds a cache from the map the mount path built while scanning, so
+    /// those handles are reused rather than reopened on first runtime read.
+    fn from_map(map: SegmentReaders) -> Self {
+        let cache = Self::new();
+        for (key, reader) in map {
+            cache.shards[(key.1 as usize) & (INO_SHARDS - 1)]
+                .lock()
+                .insert(key, Arc::new(reader));
+        }
+        cache
+    }
+
+    /// The reader for `(vdev_id, segment_id, kind)`, opened on a miss. The
+    /// lock is dropped before `open()` (itself I/O) and retaken only to
+    /// insert; a lost race just discards a redundant handle. The caller
+    /// then reads through the returned `Arc` with no lock held at all.
+    fn get_or_open(
+        &self,
+        vdev_id: u16,
+        segment_id: u64,
+        kind: StreamKind,
+        root: impl FnOnce() -> Result<PathBuf, PoolError>,
+    ) -> Result<Arc<SegmentReader>, PoolError> {
+        let key = (vdev_id, segment_id, kind);
+        let shard = &self.shards[(segment_id as usize) & (INO_SHARDS - 1)];
+        if let Some(reader) = shard.lock().get(&key) {
+            return Ok(Arc::clone(reader));
+        }
+        let opened = Arc::new(SegmentReader::open(&root()?, segment_id, kind)?);
+        Ok(Arc::clone(shard.lock().entry(key).or_insert(opened)))
+    }
+}
+
 pub use backend::{FileBackend, StorageBackend, Vdev};
 pub use vdevs::{VdevHealth, VdevStatus};
 
@@ -729,7 +786,7 @@ struct PoolShared {
     /// `get_chunk_location` only needs shared access while `put_*`/
     /// `checkpoint` need exclusive.
     persisted_index: Arc<RwLock<RedbIndex>>,
-    readers: Mutex<SegmentReaders>,
+    readers: ReaderCache,
     /// One open heal segment per `(vdev_id, stream)`, created on first use
     /// (ARCHITECTURE.md §15.4). A heal writes to *one* device, so it can
     /// never go through `meta_writer` or the committer pool: those fan the
@@ -915,7 +972,7 @@ impl Pool {
             dedup_index: Arc::clone(&dedup_index),
             dedup_pins: Arc::clone(&dedup_pins),
             persisted_index: Arc::clone(&persisted_index),
-            readers: Mutex::new(HashMap::new()),
+            readers: ReaderCache::new(),
             heal_writers: Mutex::new(HashMap::new()),
             repair_stats: RepairStats::default(),
             meta_writer: Mutex::new(None),
@@ -1648,7 +1705,7 @@ impl Pool {
             dedup_index: Arc::clone(&dedup_index),
             dedup_pins: Arc::clone(&dedup_pins),
             persisted_index: Arc::clone(&persisted_index),
-            readers: Mutex::new(readers),
+            readers: ReaderCache::from_map(readers),
             heal_writers: Mutex::new(HashMap::new()),
             repair_stats: RepairStats {
                 failovers: AtomicU64::new(mount_repairs.failovers),
@@ -2791,14 +2848,14 @@ impl PoolShared {
         // failover below finds another copy, and the record is not
         // charged to a device that cannot be asked.
         let preferred_err = if self.is_online(preferred_vdev) {
-            let mut readers = self.readers.lock();
-            let reader = get_reader_lazy(
-                &mut readers,
-                || self.vdev_root(preferred_vdev),
-                preferred_vdev,
-                preferred.segment_id,
-                kind,
-            );
+            // The reader is fetched under the shard lock, but the read
+            // itself runs on the returned Arc with no lock held, so
+            // concurrent reads do not serialize (ARCHITECTURE.md §17.5).
+            let reader = self
+                .readers
+                .get_or_open(preferred_vdev, preferred.segment_id, kind, || {
+                    self.vdev_root(preferred_vdev)
+                });
             match reader.and_then(|r| r.read_record(preferred).map_err(PoolError::from)) {
                 Ok((_header, bytes)) => return Ok(bytes),
                 Err(e) => Some(e),
@@ -2884,9 +2941,9 @@ impl PoolShared {
         if vdev_id == stripe::STRIPED {
             return Ok(self.stripe_reader(loc.segment_id)?.read_record_raw(loc)?);
         }
-        let root = self.vdev_root(vdev_id)?;
-        let mut readers = self.readers.lock();
-        let reader = get_reader(&mut readers, &root, vdev_id, loc.segment_id, kind)?;
+        let reader = self
+            .readers
+            .get_or_open(vdev_id, loc.segment_id, kind, || self.vdev_root(vdev_id))?;
         Ok(reader.read_record_raw(loc)?)
     }
 
