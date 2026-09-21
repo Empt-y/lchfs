@@ -70,6 +70,95 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
+/// Per-stage write-path timing, behind the `write-timing` feature and off
+/// by default (zero-cost when off). Attributes where a `write()` spends its
+/// time -- lock acquisition and cross-thread handoffs -- so the §17.0
+/// scaling limit can be ranked rather than guessed. Not part of any
+/// correctness path; `Pool::drop` dumps the totals.
+#[cfg(feature = "write-timing")]
+mod write_timing {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+    pub const N: usize = 5;
+    const NAMES: [&str; N] = ["ino_locks", "open_files", "namespace", "prep_install", "committer_recv"];
+    static NANOS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+    static CALLS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+    #[derive(Clone, Copy)]
+    pub enum S {
+        InoLocks = 0,
+        OpenFiles = 1,
+        Namespace = 2,
+        PrepInstall = 3,
+        CommitterRecv = 4,
+    }
+    pub fn record(s: S, d: Duration) {
+        NANOS[s as usize].fetch_add(d.as_nanos() as u64, Ordering::Relaxed);
+        CALLS[s as usize].fetch_add(1, Ordering::Relaxed);
+    }
+    /// Times `f`, records the elapsed against `s`, and returns its result.
+    pub fn timed<T>(s: S, f: impl FnOnce() -> T) -> T {
+        let start = Instant::now();
+        let out = f();
+        record(s, start.elapsed());
+        out
+    }
+    pub fn dump() {
+        eprintln!("write-timing  stage: total_ns / calls / avg_ns");
+        for i in 0..N {
+            let ns = NANOS[i].load(Ordering::Relaxed);
+            let calls = CALLS[i].load(Ordering::Relaxed);
+            let avg = ns / calls.max(1);
+            eprintln!("  {:>14}: {:>15} / {:>9} / {:>8}", NAMES[i], ns, calls, avg);
+        }
+    }
+}
+#[cfg(not(feature = "write-timing"))]
+mod write_timing {
+    #[derive(Clone, Copy)]
+    pub enum S {
+        InoLocks,
+        OpenFiles,
+        Namespace,
+        PrepInstall,
+        CommitterRecv,
+    }
+    #[inline(always)]
+    pub fn timed<T>(_s: S, f: impl FnOnce() -> T) -> T {
+        f()
+    }
+    #[inline(always)]
+    pub fn dump() {}
+}
+
+/// A map keyed by inode number, split across `INO_SHARDS` independent
+/// mutexes so the write path's per-inode state (`open_files`, `ino_locks`)
+/// is never one process-global lock every writer contends on. Inode
+/// numbers are handed out sequentially (`Namespace::next_ino`), so their
+/// low bits spread evenly across shards. This mirrors the bucketed shape
+/// of `lchfs_index::ChunkLocationCache`; a given inode's state still lives
+/// under exactly one lock, so the per-inode serialization every caller
+/// already relies on is unchanged -- only the map spine is de-globalized.
+const INO_SHARDS: usize = 64;
+
+struct ShardedInoMap<V> {
+    shards: Box<[Mutex<HashMap<u64, V>>]>,
+}
+
+impl<V> ShardedInoMap<V> {
+    fn new() -> Self {
+        Self {
+            shards: (0..INO_SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
+        }
+    }
+
+    /// The shard that owns `ino`, locked. `INO_SHARDS` is a power of two,
+    /// so this is a mask, not a modulo.
+    #[inline]
+    fn shard(&self, ino: u64) -> parking_lot::MutexGuard<'_, HashMap<u64, V>> {
+        self.shards[(ino as usize) & (INO_SHARDS - 1)].lock()
+    }
+}
+
 pub use backend::{FileBackend, StorageBackend, Vdev};
 pub use vdevs::{VdevHealth, VdevStatus};
 
@@ -614,7 +703,7 @@ struct PoolShared {
     corruption: Mutex<std::collections::VecDeque<CorruptionEvent>>,
     namespace: Mutex<Namespace>,
     file_state: Mutex<HashMap<u64, FileWorkingState>>,
-    open_files: Mutex<HashMap<u64, IncrementalWriteState>>,
+    open_files: ShardedInoMap<IncrementalWriteState>,
     /// Per-inode lock serializing `write()`/`set_size()`/checkpoint's
     /// dirty-file finalization for a *given* inode end-to-end (splice or
     /// incremental-commit through the Namespace update), matching
@@ -623,7 +712,7 @@ struct PoolShared {
     /// serialize. Lazily populated, never pruned (one tiny `Arc<Mutex<()>>`
     /// per ever-touched inode for the pool's lifetime -- an accepted,
     /// bounded-in-practice simplification, not addressed here).
-    ino_locks: Mutex<HashMap<u64, Arc<Mutex<()>>>>,
+    ino_locks: ShardedInoMap<Arc<Mutex<()>>>,
 
     /// Content-address -> location, for both RawChunk (data stream) and
     /// every meta object kind (meta stream) — same dual purpose Phase B's
@@ -821,8 +910,8 @@ impl Pool {
             corruption: Mutex::new(std::collections::VecDeque::new()),
             namespace: Mutex::new(namespace),
             file_state: Mutex::new(HashMap::new()),
-            open_files: Mutex::new(HashMap::new()),
-            ino_locks: Mutex::new(HashMap::new()),
+            open_files: ShardedInoMap::new(),
+            ino_locks: ShardedInoMap::new(),
             dedup_index: Arc::clone(&dedup_index),
             dedup_pins: Arc::clone(&dedup_pins),
             persisted_index: Arc::clone(&persisted_index),
@@ -1554,8 +1643,8 @@ impl Pool {
             corruption: Mutex::new(mount_repairs.events.into_iter().collect()),
             namespace: Mutex::new(namespace),
             file_state: Mutex::new(file_state_from_replay),
-            open_files: Mutex::new(HashMap::new()),
-            ino_locks: Mutex::new(HashMap::new()),
+            open_files: ShardedInoMap::new(),
+            ino_locks: ShardedInoMap::new(),
             dedup_index: Arc::clone(&dedup_index),
             dedup_pins: Arc::clone(&dedup_pins),
             persisted_index: Arc::clone(&persisted_index),
@@ -2064,6 +2153,7 @@ impl Drop for Pool {
         self.0.dedup_task.lock().take();
         self.0.scrub_task.lock().take();
         self.0.failover_task.lock().take();
+        write_timing::dump();
         // A clean shutdown leaves no meta segment open, as the committer
         // pool's leaves no data segment open: what stays Open on disk is
         // a crash's, and the next mount seals it. Nothing writes meta
@@ -2399,7 +2489,7 @@ impl PoolShared {
         // back + buffered tail) assembly is an acceptable cost here.
         let session_snapshot = self
             .open_files
-            .lock()
+            .shard(ino)
             .get(&ino)
             .map(|s| (s.chunks.clone(), s.pending_bytes.clone()));
         if let Some((chunks, pending)) = session_snapshot {
@@ -3494,10 +3584,12 @@ impl PoolShared {
         logical_offset: u64,
         raw_bytes: &[u8],
     ) -> Result<(Hash32, ExtentLocation), PoolError> {
-        let prepared = self.prep_pool.submit(PrepTask {
-            inode_id,
-            logical_offset,
-            raw_bytes: Bytes::copy_from_slice(raw_bytes),
+        let prepared = write_timing::timed(write_timing::S::PrepInstall, || {
+            self.prep_pool.submit(PrepTask {
+                inode_id,
+                logical_offset,
+                raw_bytes: Bytes::copy_from_slice(raw_bytes),
+            })
         });
         match prepared {
             PreparedChunk::Dedup {
@@ -3521,9 +3613,11 @@ impl PoolShared {
                     completion: tx,
                 });
                 // Indexed already, by the committer under its shard lock.
-                let ingress::Appended { location, .. } = rx
-                    .recv()
-                    .map_err(|_| PoolError::Format("committer pool completion channel closed".into()))??;
+                let ingress::Appended { location, .. } = write_timing::timed(
+                    write_timing::S::CommitterRecv,
+                    || rx.recv(),
+                )
+                .map_err(|_| PoolError::Format("committer pool completion channel closed".into()))??;
                 Ok((content_hash, location))
             }
         }
@@ -3885,12 +3979,14 @@ impl PoolShared {
     /// inode's write-path operations end-to-end (ARCHITECTURE.md §3's
     /// per-inode ordering guarantee -- see `ino_locks`'s doc comment).
     fn lock_for_ino(&self, ino: u64) -> Arc<Mutex<()>> {
-        Arc::clone(
-            self.ino_locks
-                .lock()
-                .entry(ino)
-                .or_insert_with(|| Arc::new(Mutex::new(()))),
-        )
+        write_timing::timed(write_timing::S::InoLocks, || {
+            Arc::clone(
+                self.ino_locks
+                    .shard(ino)
+                    .entry(ino)
+                    .or_insert_with(|| Arc::new(Mutex::new(()))),
+            )
+        })
     }
 
     /// ARCHITECTURE.md §3 (write path). Sequential-append writes onto an
@@ -3921,7 +4017,7 @@ impl PoolShared {
 
         let continuation = self
             .open_files
-            .lock()
+            .shard(ino)
             .get(&ino)
             .is_some_and(|s| s.next_expected_offset == offset);
         if continuation {
@@ -3944,7 +4040,7 @@ impl PoolShared {
         };
         if fresh_session_eligible {
             let existing_chunks = self.current_chunks_for_new_session(ino)?;
-            self.open_files.lock().insert(
+            self.open_files.shard(ino).insert(
                 ino,
                 IncrementalWriteState {
                     chunker: FastCdcChunker::new(
@@ -3991,7 +4087,7 @@ impl PoolShared {
         let base_offset;
         let mut prepared: Vec<(u64, Vec<u8>)> = Vec::new();
         {
-            let mut open_files = self.open_files.lock();
+            let mut open_files = write_timing::timed(write_timing::S::OpenFiles, || self.open_files.shard(ino));
             let state = open_files.get_mut(&ino).unwrap();
             base_offset = state.base_offset;
             state.pending_bytes.extend_from_slice(buf);
@@ -4028,7 +4124,7 @@ impl PoolShared {
         }
 
         let new_size = {
-            let mut open_files = self.open_files.lock();
+            let mut open_files = write_timing::timed(write_timing::S::OpenFiles, || self.open_files.shard(ino));
             let state = open_files.get_mut(&ino).unwrap();
             state.chunks.extend(new_refs);
             state.next_expected_offset += buf.len() as u64;
@@ -4036,7 +4132,7 @@ impl PoolShared {
         };
 
         let (now_secs, now_nanos) = now_unix();
-        let mut namespace = self.namespace.lock();
+        let mut namespace = write_timing::timed(write_timing::S::Namespace, || self.namespace.lock());
         // Not `.unwrap()`: `write()`'s own existence check happens before
         // `ino_lock` is acquired (see its doc comment), so a concurrent
         // `unlink`/`rmdir` that drops this ino to nlink 0 in that window
@@ -4082,7 +4178,7 @@ impl PoolShared {
         // pending ones, which stay pending in the session until it closes.
         let snapshot = self
             .open_files
-            .lock()
+            .shard(ino)
             .get(&ino)
             .map(|s| (s.chunker.clone(), s.base_offset, s.chunks.clone(), s.pending_bytes.clone()));
         let Some((mut chunker, base_offset, mut chunks, pending)) = snapshot else {
@@ -4117,7 +4213,7 @@ impl PoolShared {
     /// somewhere a read will find it -- the inode's ContentRef, or
     /// `file_state`. Under the inode lock, after `finalize_incremental_session`.
     fn close_session(&self, ino: u64) {
-        self.open_files.lock().remove(&ino);
+        self.open_files.shard(ino).remove(&ino);
     }
 
     /// Ends `ino`'s open incremental-append session (if any) and captures
@@ -4132,7 +4228,7 @@ impl PoolShared {
     fn materialize_session_into_file_state(&self, ino: u64) -> Result<(), PoolError> {
         let snapshot = self
             .open_files
-            .lock()
+            .shard(ino)
             .get(&ino)
             .map(|s| (s.chunks.clone(), s.pending_bytes.clone()));
         let Some((chunks, pending)) = snapshot else {
@@ -4263,7 +4359,7 @@ impl PoolShared {
         // a hole), and the asymmetry is what makes it the safe default:
         // calling a hole "data" costs only efficiency, whereas calling data
         // "a hole" would make `cp --sparse` replace real bytes with zeros.
-        let materialized = self.open_files.lock().contains_key(&ino)
+        let materialized = self.open_files.shard(ino).contains_key(&ino)
             || self.file_state.lock().contains_key(&ino);
         if materialized {
             return Ok(Some(match whence {

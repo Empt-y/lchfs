@@ -27,6 +27,10 @@ nix = { workspace = true, features = ["fs", "user"] }
 # Test-only: lets a test declare a device root dead so every replica
 # operation under it fails. See `segment::fault_injection`.
 fault-injection = []
+# Diagnostic-only: accumulate per-stage write-path timing (lock acquisition
+# and cross-thread handoffs) and dump it at `Pool::drop`. Zero-cost when off;
+# used to attribute the write-path scaling limit (ARCHITECTURE.md §17.0).
+write-timing = []
 
 [dev-dependencies]
 lchfs-store = { path = ".", features = ["fault-injection"] }
