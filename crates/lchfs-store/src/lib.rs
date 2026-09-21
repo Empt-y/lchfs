@@ -3690,6 +3690,9 @@ impl PoolShared {
         // device that is gone; see `attach_vdev`. Done before the slot is
         // online, so no live write can record into it in between.
         self.persisted_index.write().delete_vdev_locations(new_id)?;
+        // A blank device has nothing to seal, but join_live no longer
+        // seals -- the caller does, before the device is a member.
+        self.seal_before_join(new_id, new_root)?;
         let member = VdevSet::member(Vdev::new(new_id, new_root.to_path_buf()), backend, lock);
         let report = self.join_live(member)?;
         tracing::info!(
@@ -3750,17 +3753,27 @@ impl PoolShared {
         }
         drop(probe);
 
+        // A device brought back must come back at the same path it faulted
+        // at; check it while it is still in the faulted set, so a mismatch
+        // leaves it there rather than removing it.
+        if let Some(faulted_root) = self.vdevs.faulted_root(id)
+            && faulted_root != root
+        {
+            return Err(PoolError::InvalidArgument(format!(
+                "vdev {id} faulted at {} and is being brought back at {}; give the same path",
+                faulted_root.display(),
+                root.display()
+            )));
+        }
+
+        // Seal before taking the device out of the faulted set: if it
+        // cannot be sealed (or has vanished again mid-rejoin), the faulted
+        // set is untouched and the next failover pass retries, rather than
+        // the slot being lost to neither set.
+        self.seal_before_join(id, root)?;
+
         let member = match self.vdevs.take_faulted(id) {
-            Some(member) => {
-                if member.vdev.root != root {
-                    return Err(PoolError::InvalidArgument(format!(
-                        "vdev {id} faulted at {} and is being brought back at {}; give the same path",
-                        member.vdev.root.display(),
-                        root.display()
-                    )));
-                }
-                member
-            }
+            Some(member) => member,
             None => {
                 let lock = acquire_pool_lock(root)?;
                 let backend = FileBackend::open(root)?;
@@ -3810,33 +3823,62 @@ impl PoolShared {
     /// stale and mounts degraded or resilvers, and a rerun finishes it.
     fn join_live(&self, member: vdevs::Member) -> Result<ResilverReport, PoolError> {
         let id = member.vdev.id;
-        // 0.
-        if !self.seal_orphaned_on(std::slice::from_ref(&member.vdev), None)?.is_empty() {
-            return Err(PoolError::Format(format!(
-                "vdev {id} at {} has an open segment replica that cannot be sealed; not joining",
-                member.vdev.root.display()
-            )));
-        }
+        // Step 0 -- sealing any replica the device left Open -- has
+        // already run in the caller, while the device was still not a
+        // member and so unreachable by any writer. It must precede the
+        // attach below: once the device is in the online set a rolled
+        // committer can open a fresh segment on it, and a footer written
+        // over that from an orphan scan would hide every record appended
+        // after it (see `seal_orphaned_on`).
 
         // 1.
         self.vdevs.attach(member);
 
-        // 2.
-        self.committer_pool.roll_all_writers()?;
-        self.close_meta_writer(&mut self.meta_writer.lock())?;
-        for log in &self.shard_delta_logs {
-            log.lock().roll_over()?;
+        // Everything after the attach can fail on a device that is
+        // flapping -- a roll or a resilver write to a root that has
+        // vanished again. On any such failure the slot is re-faulted
+        // rather than left stuck catching up, so the failover task's next
+        // pass retries the rejoin instead of the device being stranded.
+        let result = (|| {
+            // 2.
+            self.committer_pool.roll_all_writers()?;
+            self.close_meta_writer(&mut self.meta_writer.lock())?;
+            for log in &self.shard_delta_logs {
+                log.lock().roll_over()?;
+            }
+            // The daemons read the live set at the start of each pass, so
+            // there is nothing to tell them.
+
+            // 3.
+            let report = self.resilver(id)?;
+
+            // 4.
+            self.vdevs.finish_catch_up(id);
+            self.run_checkpoint()?;
+            Ok(report)
+        })();
+        if result.is_err() {
+            self.vdevs.fault(id);
         }
-        // The daemons read the live set at the start of each pass, so
-        // there is nothing to tell them.
+        result
+    }
 
-        // 3.
-        let report = self.resilver(id)?;
-
-        // 4.
-        self.vdevs.finish_catch_up(id);
-        self.run_checkpoint()?;
-        Ok(report)
+    /// Seals any segment replica left Open on a device that is about to
+    /// join (`online_vdev`, `attach_vdev_live`), while it is still not a
+    /// member of the online set and so unreachable by every writer.
+    /// Returns an error if a replica cannot be sealed; on that error the
+    /// caller has not yet removed the device from the faulted set (or, for
+    /// a fresh device, added it), so nothing is lost and the rejoin is
+    /// retried on the next failover pass. See `join_live` step 0.
+    fn seal_before_join(&self, id: u16, root: &Path) -> Result<(), PoolError> {
+        let device = Vdev::new(id, root.to_path_buf());
+        if !self.seal_orphaned_on(std::slice::from_ref(&device), None)?.is_empty() {
+            return Err(PoolError::Format(format!(
+                "vdev {id} at {} has an open segment replica that cannot be sealed; not joining",
+                root.display()
+            )));
+        }
+        Ok(())
     }
 
     /// Gets (creating if absent) the per-inode lock serializing this

@@ -170,6 +170,18 @@ impl VdevSet {
             .map(|m| m.vdev.root.clone())
     }
 
+    /// The root a faulted device is remembered at, for sealing its
+    /// orphans before it rejoins (it is not among `members`, so `root_of`
+    /// does not see it).
+    pub fn faulted_root(&self, id: u16) -> Option<PathBuf> {
+        self.state
+            .read()
+            .faulted
+            .iter()
+            .find(|m| m.vdev.id == id)
+            .map(|m| m.vdev.root.clone())
+    }
+
     /// Slots whose device failed while online (a subset of `missing`).
     pub fn faulted(&self) -> Vec<u16> {
         self.state.read().faulted.iter().map(|m| m.vdev.id).collect()

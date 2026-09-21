@@ -268,3 +268,56 @@ fn probing_a_pulled_device_creates_nothing_at_its_path() {
     drop(pool);
     clean_replicas(a.path(), &b).unwrap();
 }
+
+/// A rejoin that fails part-way must leave the device faulted, not lost.
+/// `online_vdev` used to take the device out of the faulted set before it
+/// tried to bring it back; a failure after that -- the device answering a
+/// probe but a write to it still failing, e.g. mid-flap -- dropped the
+/// member on the floor, in neither the online nor the faulted set. The
+/// failover task's own error handler then called `fault(id)`, which found
+/// nothing to fault, so the slot went Absent and `faulted_unintended`
+/// never named it again: the device was stranded until a remount, exactly
+/// what was seen on a live mount when a pulled device was slow to settle.
+/// Here the device is dead for long enough that the failover task tries
+/// and fails at least one rejoin; once revived it must still come back on
+/// its own, which it cannot if the failed attempt stranded it.
+#[test]
+fn a_rejoin_that_fails_leaves_the_device_faulted_not_stranded() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let pool = Pool::create_replicated(&[a.path(), b.path()], small_params()).unwrap();
+    let ino = pool.create_file(1, "f", 0o644).unwrap();
+    pool.write(ino, 0, &payload(71)).unwrap();
+    pool.checkpoint().unwrap();
+
+    // Kill b and write past it, so it has a delta to catch up on and a
+    // rejoin has real work (a resilver write) that will fail while dead.
+    fault_injection::kill(b.path());
+    pool.write(ino, 0, &payload(72)).unwrap();
+    assert_eq!(health(&pool, 1), VdevHealth::Faulted);
+
+    // A direct rejoin attempt while b is still dead must fail and must
+    // leave b faulted -- never Absent.
+    let attempt = pool.online_vdev(b.path());
+    assert!(attempt.is_err(), "a write to a dead device cannot resilver: {attempt:?}");
+    assert_ne!(health(&pool, 1), VdevHealth::Absent, "a failed rejoin stranded the device");
+
+    // Let the background failover task have several goes at it too, all
+    // failing while b is dead. On the buggy code one of these strands b
+    // as Absent, after which nothing ever retries it.
+    std::thread::sleep(std::time::Duration::from_millis(3500));
+    assert_ne!(health(&pool, 1), VdevHealth::Absent, "the failover task stranded the device");
+
+    // Revive it: it must come back on its own. It cannot if it was
+    // stranded out of the faulted set.
+    fault_injection::revive(b.path());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(12);
+    while health(&pool, 1) != VdevHealth::Online && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert_eq!(health(&pool, 1), VdevHealth::Online, "b was never brought back after revival");
+
+    pool.checkpoint().unwrap();
+    drop(pool);
+    clean_replicas(a.path(), b.path()).unwrap();
+}
