@@ -261,7 +261,7 @@ fn gc_mark_succeeds_after_checkpoint_following_fsync_only_crash_recovery() {
 
     let index = lchfs_index::RedbIndex::open(&dir.path().join("INDEX.redb")).unwrap();
     let cache = lchfs_index::ChunkLocationCache::new();
-    cache.extend(index.iter_chunk_locations().unwrap());
+    cache.extend(index.iter_preferred_locations().unwrap());
     let mut gc = lchfs_store::gc::GcEngine::new(
         dir.path().to_path_buf(),
         std::sync::Arc::new(cache),

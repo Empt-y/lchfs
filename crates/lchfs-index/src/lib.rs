@@ -501,10 +501,16 @@ fn bucket_for(hash: Hash32) -> usize {
 pub const STRIPED_VDEV: u16 = u16::MAX;
 
 pub struct ChunkLocationCache {
-    /// The location, and whether it is in a striped segment rather than a
-    /// mirror copy on the primary -- a reader needs to know which before it
-    /// opens anything.
-    buckets: Vec<RwLock<HashMap<Hash32, (ExtentLocation, bool)>>>,
+    /// The preferred replica: its location and the device it is on --
+    /// `STRIPED_VDEV` for a record whose preferred copy is a stripe. A
+    /// reader needs both before it opens anything: a mirror location is
+    /// only good on the device that holds that copy. Fan-out writes put
+    /// the identical record at the identical offset on every device in a
+    /// segment's set, which is why this used to carry only "striped or
+    /// not" and assume the primary; a heal segment lives on one device,
+    /// and once the original mirror is striped away that single copy is
+    /// the preferred replica, on a device that is not the primary.
+    buckets: Vec<RwLock<HashMap<Hash32, (ExtentLocation, u16)>>>,
 }
 
 impl Default for ChunkLocationCache {
@@ -526,54 +532,39 @@ impl ChunkLocationCache {
         self.get_tagged(hash).map(|(loc, _)| loc)
     }
 
-    /// The location and whether it is striped (`true`) or a mirror copy on
-    /// the primary (`false`).
-    pub fn get_tagged(&self, hash: Hash32) -> Option<(ExtentLocation, bool)> {
+    /// The location and the device it is on, `STRIPED_VDEV` for a stripe.
+    pub fn get_tagged(&self, hash: Hash32) -> Option<(ExtentLocation, u16)> {
         let bucket = self.buckets[bucket_for(hash)]
             .read()
             .expect("ChunkLocationCache lock poisoned");
         bucket.get(&hash).copied()
     }
 
-    /// `put` for a record whose only copy is in a striped segment.
+    /// `put` for a record whose preferred copy is in a striped segment.
     pub fn put_striped(&self, hash: Hash32, loc: ExtentLocation) {
+        self.put(hash, loc, STRIPED_VDEV);
+    }
+
+    /// Insert or overwrite `hash`'s preferred replica: `loc` on
+    /// `vdev_id`. Used both by the inline dedup-on-write fast path (a miss
+    /// followed by a fresh write) and by the Coalescing/Dedup daemons
+    /// (E.11/E.12) repointing a hash at a new canonical location --
+    /// content-addressing means the newer value is always for the same
+    /// bytes, so a plain overwrite is always correct, no merge logic
+    /// needed.
+    pub fn put(&self, hash: Hash32, loc: ExtentLocation, vdev_id: u16) {
         let mut bucket = self.buckets[bucket_for(hash)]
             .write()
             .expect("ChunkLocationCache lock poisoned");
-        bucket.insert(hash, (loc, true));
+        bucket.insert(hash, (loc, vdev_id));
     }
 
     /// Bulk-load preferred replicas as `iter_preferred_locations` yields
-    /// them, tagging the striped ones.
-    pub fn extend_preferred(&self, entries: impl IntoIterator<Item = (Hash32, u16, ExtentLocation)>) {
+    /// them: on the mount-time fast path, on a promotion, or from a full
+    /// segment scan on the cold-rebuild path.
+    pub fn extend(&self, entries: impl IntoIterator<Item = (Hash32, u16, ExtentLocation)>) {
         for (hash, vdev_id, loc) in entries {
-            if vdev_id == STRIPED_VDEV {
-                self.put_striped(hash, loc);
-            } else {
-                self.put(hash, loc);
-            }
-        }
-    }
-
-    /// Insert or overwrite `hash`'s location. Used both by the inline
-    /// dedup-on-write fast path (a miss followed by a fresh write) and by
-    /// the Coalescing/Dedup daemons (E.11/E.12) repointing a hash at a new
-    /// canonical location — content-addressing means the newer value is
-    /// always for the same bytes, so a plain overwrite is always correct,
-    /// no merge logic needed.
-    pub fn put(&self, hash: Hash32, loc: ExtentLocation) {
-        let mut bucket = self.buckets[bucket_for(hash)]
-            .write()
-            .expect("ChunkLocationCache lock poisoned");
-        bucket.insert(hash, (loc, false));
-    }
-
-    /// Bulk-load every entry, e.g. from `RedbIndex::iter_chunk_locations`
-    /// on the mount-time fast path, or from a full segment scan on the
-    /// cold-rebuild path.
-    pub fn extend(&self, entries: impl IntoIterator<Item = (Hash32, ExtentLocation)>) {
-        for (hash, loc) in entries {
-            self.put(hash, loc);
+            self.put(hash, loc, vdev_id);
         }
     }
 

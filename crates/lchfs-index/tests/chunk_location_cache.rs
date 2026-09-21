@@ -25,7 +25,7 @@ fn get_on_empty_cache_is_none() {
 fn put_then_get_round_trips() {
     let cache = ChunkLocationCache::new();
     let hash = Hash32::of(b"some content");
-    cache.put(hash, loc(1, 4096));
+    cache.put(hash, loc(1, 4096), 0);
     assert_eq!(cache.get(hash), Some(loc(1, 4096)));
     assert_eq!(cache.len(), 1);
 }
@@ -34,8 +34,8 @@ fn put_then_get_round_trips() {
 fn put_overwrites_existing_entry() {
     let cache = ChunkLocationCache::new();
     let hash = Hash32::of(b"relocated content");
-    cache.put(hash, loc(1, 100));
-    cache.put(hash, loc(2, 200));
+    cache.put(hash, loc(1, 100), 0);
+    cache.put(hash, loc(2, 200), 0);
     assert_eq!(cache.get(hash), Some(loc(2, 200)));
     assert_eq!(cache.len(), 1);
 }
@@ -44,12 +44,12 @@ fn put_overwrites_existing_entry() {
 fn extend_bulk_loads_entries() {
     let cache = ChunkLocationCache::new();
     let entries: Vec<_> = (0..20u64)
-        .map(|i| (Hash32::of(format!("chunk-{i}").as_bytes()), loc(i, i as u32)))
+        .map(|i| (Hash32::of(format!("chunk-{i}").as_bytes()), (i % 3) as u16, loc(i, i as u32)))
         .collect();
     cache.extend(entries.clone());
     assert_eq!(cache.len(), 20);
-    for (hash, expected_loc) in entries {
-        assert_eq!(cache.get(hash), Some(expected_loc));
+    for (hash, vdev_id, expected_loc) in entries {
+        assert_eq!(cache.get_tagged(hash), Some((expected_loc, vdev_id)));
     }
 }
 
@@ -62,7 +62,7 @@ fn concurrent_put_and_get_from_many_threads() {
             std::thread::spawn(move || {
                 for i in 0..200u64 {
                     let hash = Hash32::of(format!("t{t}-{i}").as_bytes());
-                    cache.put(hash, loc(t, i as u32));
+                    cache.put(hash, loc(t, i as u32), 0);
                     assert_eq!(cache.get(hash), Some(loc(t, i as u32)));
                 }
             })

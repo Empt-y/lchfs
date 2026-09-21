@@ -95,7 +95,7 @@ fn unlinked_content_becomes_gc_reclaimable() {
     let baseline_live: u64 = {
         let index = lchfs_index::RedbIndex::open(&empty_dir.path().join("INDEX.redb")).unwrap();
         let cache = lchfs_index::ChunkLocationCache::new();
-        cache.extend(index.iter_chunk_locations().unwrap());
+        cache.extend(index.iter_preferred_locations().unwrap());
         let mut gc = lchfs_store::gc::GcEngine::new(
             empty_dir.path().to_path_buf(),
             std::sync::Arc::new(cache),
@@ -118,7 +118,7 @@ fn unlinked_content_becomes_gc_reclaimable() {
 
     let index = lchfs_index::RedbIndex::open(&dir.path().join("INDEX.redb")).unwrap();
     let cache = lchfs_index::ChunkLocationCache::new();
-    cache.extend(index.iter_chunk_locations().unwrap());
+    cache.extend(index.iter_preferred_locations().unwrap());
     let mut gc = lchfs_store::gc::GcEngine::new(
         dir.path().to_path_buf(),
         std::sync::Arc::new(cache),

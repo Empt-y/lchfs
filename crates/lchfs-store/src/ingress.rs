@@ -560,7 +560,7 @@ fn committer_loop(
                         )
                         .and_then(|appended| {
                             if let Some(index) = data.indexer.get() {
-                                index.cache.put(op.content_hash, appended.location);
+                                index.cache.put(op.content_hash, appended.location, appended.vdevs[0]);
                             }
                             data.pending_index.push((
                                 op.content_hash,

@@ -781,6 +781,23 @@ pub fn check_replicas(vdev_roots: &[&Path]) -> FsckReport {
         .collect();
     every_hash.sort_by_key(|h| h.0);
 
+    // Stripes are the replicas of cold data (§17.2): each one is checked
+    // across the devices its descriptor names, below. Here they matter
+    // because a device's share of a striped record is its shard, not a
+    // mirror copy: a record that one device still holds as a mirror -- a
+    // copy healed onto it while it was catching up, say -- and the others
+    // hold only in a stripe is not missing from the others.
+    let devices: Vec<(u16, &Path)> = members.iter().map(|(id, root, _)| (*id, *root)).collect();
+    let striped = stripes::scan_stripes(&devices);
+    let mut striped_on: HashMap<u16, HashSet<Hash32>> = HashMap::new();
+    for (hash, loc) in &striped.locations {
+        if let Some(stripe) = striped.stripes.get(&loc.segment_id) {
+            for &vdev_id in &stripe.desc.devices {
+                striped_on.entry(vdev_id).or_default().insert(*hash);
+            }
+        }
+    }
+
     let mut readers: HashMap<(u16, u64, StreamKind), SegmentReader> = HashMap::new();
     for hash in every_hash {
         report.objects_visited += 1;
@@ -790,7 +807,9 @@ pub fn check_replicas(vdev_roots: &[&Path]) -> FsckReport {
         let mut reference: Option<(u16, ExtentRecordHeader)> = None;
         for (id, root, locations) in &scans {
             let Some(&loc) = locations.get(&hash) else {
-                report.errors.push(FsckError::ReplicaMissing { hash, vdev_id: *id });
+                if !striped_on.get(id).is_some_and(|set| set.contains(&hash)) {
+                    report.errors.push(FsckError::ReplicaMissing { hash, vdev_id: *id });
+                }
                 continue;
             };
             let header = match read_verified_record(&mut readers, *id, root, loc) {
@@ -816,10 +835,6 @@ pub fn check_replicas(vdev_roots: &[&Path]) -> FsckReport {
         }
     }
 
-    // Stripes are the replicas of cold data (§17.2): each one is checked
-    // across the devices its descriptor names.
-    let devices: Vec<(u16, &Path)> = members.iter().map(|(id, root, _)| (*id, *root)).collect();
-    let striped = stripes::scan_stripes(&devices);
     report.objects_visited += striped.locations.len() as u64;
     report.errors.extend(striped.findings);
     report

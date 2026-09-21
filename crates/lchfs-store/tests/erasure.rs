@@ -638,3 +638,66 @@ fn replay_at_mount_reconstructs_striped_chunks_and_says_so() {
     assert_eq!(pool.repair_stats().failovers, 0);
     assert!(pool.corruption_events().is_empty());
 }
+
+/// A copy healed onto a device that was away lives in a heal segment on
+/// that device alone. Once the mirror it was healed from has been
+/// striped away, that single copy is the record's preferred replica --
+/// on a device that is not the primary. The reader used to take the
+/// preferred location and open it on the primary regardless, so every
+/// read of such a record missed, failed over, healed a copy the primary
+/// did not need, and logged corruption against a device with nothing
+/// wrong; fsck, from the other side, saw the mirror on one device and
+/// not the others and did not credit the stripe that names them.
+#[test]
+fn a_heal_copy_that_outlives_its_striped_mirror_is_read_where_it_is() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let c = tempfile::tempdir().unwrap();
+    let roots = [a.path(), b.path(), c.path()];
+    {
+        let pool = Pool::create_replicated(&roots, striped_params(2, 1)).unwrap();
+        pool.checkpoint().unwrap();
+    }
+    // c away: everything written now fans out to a and b only.
+    {
+        let pool = Pool::open_degraded(&[a.path(), b.path()]).unwrap();
+        for i in 0..14u32 {
+            let ino = pool.create_file(1, &format!("f{i}"), 0o644).unwrap();
+            pool.write(ino, 0, &payload(i)).unwrap();
+        }
+        pool.checkpoint().unwrap();
+    }
+    // c back: resilvered at mount into heal segments of its own. Then the
+    // segments a and b hold go cold and are striped across all three.
+    let pool = Pool::open_replicated(&roots).unwrap();
+    assert!(pool.mount_resilver().iter().any(|(id, r)| *id == 2 && r.healed > 0));
+    for _ in 0..8 {
+        pool.run_gc_and_coalesce_pass().unwrap();
+    }
+    pool.checkpoint().unwrap();
+    let striped = segment_ids_with_shards(a.path());
+    assert!(!striped.is_empty(), "no segment was converted");
+    for id in &striped {
+        assert!(!a.path().join(format!("segments/data/{id}.aseg")).exists());
+    }
+    drop(pool);
+
+    // Cold: the cache is warmed from the index, where the heal copy on c
+    // is the preferred replica of every record whose mirror was striped.
+    let pool = Pool::open_replicated(&roots).unwrap();
+    for i in 0..14u32 {
+        assert_eq!(read_file(&pool, &format!("f{i}"), 30_000), payload(i));
+    }
+    let stats = pool.repair_stats();
+    assert_eq!(stats.failovers, 0, "{stats:?}");
+    assert_eq!(stats.heals, 0, "{stats:?}");
+    assert!(pool.corruption_events().is_empty(), "{:?}", &pool.corruption_events()[..3]);
+    // No heal segment appeared on the primary for records it holds in stripes.
+    let heal_on_a: Vec<_> = aseg_files(a.path());
+    pool.checkpoint().unwrap();
+    drop(pool);
+    assert_eq!(aseg_files(a.path()), heal_on_a);
+
+    let fsck = lchfs_fsck::check_replicas(&roots);
+    assert!(fsck.is_clean(), "{:?}", &fsck.errors[..fsck.errors.len().min(3)]);
+}

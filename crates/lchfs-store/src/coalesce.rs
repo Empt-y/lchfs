@@ -403,8 +403,12 @@ impl CoalesceDaemon {
             .write()
             .unstripe_segment(segment_id, &records, &written)
             .map_err(to_io_err)?;
-        for (hash, loc) in &records {
-            self.gc_locations().put(*hash, *loc);
+        // The repack fanned out to `written`, lowest slot first: that is
+        // the preferred replica now.
+        if let Some(&first) = written.first() {
+            for (hash, loc) in &records {
+                self.gc_locations().put(*hash, *loc, first);
+            }
         }
         for vdev in &online {
             for i in stripe::shards_on(&vdev.root, segment_id) {
@@ -522,12 +526,12 @@ impl CoalesceDaemon {
             }
             index.flush().map_err(to_io_err)?;
         }
-        // The cache holds the primary's locations and nobody else's
-        // (§15.1); a relocation on another device is the index's business
-        // alone.
+        // The cache holds one preferred replica per hash, the primary's
+        // wherever the primary has one (§15.1); a relocation on another
+        // device is the index's business alone.
         if vdev.id == self.primary_id() {
             for (hash, loc) in &relocations {
-                self.gc_locations().put(*hash, *loc);
+                self.gc_locations().put(*hash, *loc, vdev.id);
             }
         }
 

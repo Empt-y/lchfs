@@ -200,7 +200,7 @@ impl DedupScanner {
             // deterministic.
             let canonical = existing.filter(|e| locs.contains(e)).unwrap_or(locs[0]);
             if vdev.id == self.primary_id() {
-                self.locations.put(hash, canonical);
+                self.locations.put(hash, canonical, vdev.id);
             }
             {
                 let mut index = persisted_index.write();

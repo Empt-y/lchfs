@@ -38,7 +38,7 @@ fn hit_short_circuits_to_existing_location() {
         offset: 4096,
         len: 64,
     };
-    cache.put(hash, existing);
+    cache.put(hash, existing, 0);
 
     let prepared = prepare_chunk(data, &cache, &no_pins());
     match prepared {
@@ -69,6 +69,7 @@ fn hit_pins_the_hash_until_unpinned() {
             offset: 0,
             len: 64,
         },
+        0,
     );
 
     let pins = PendingDedupPins::new();

@@ -98,11 +98,11 @@ fn resolve_and_read(
     readers: &mut SegmentReaders,
     live: &mut LiveSet,
 ) -> Result<(ExtentKind, Vec<u8>), PoolError> {
-    let (loc, striped) = locations
+    let (loc, vdev_id) = locations
         .get_tagged(hash)
         .ok_or_else(|| PoolError::Format(format!("GC mark: {hash:?} not found in index")))?;
     live.mark(hash, loc);
-    if striped {
+    if vdev_id == crate::stripe::STRIPED {
         // A cold record with no mirror copy: read through its stripe.
         // Its bytes live in shard files that `sweep_candidates` never
         // lists, so the primary bitmap entry `mark` just made is inert;

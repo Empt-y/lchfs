@@ -54,7 +54,7 @@ fn deterministic_bytes(seed: u64, len: usize) -> Vec<u8> {
 fn gc_marks_cleanly(pool_root: &std::path::Path, root: lchfs_format::Hash32) -> bool {
     let index = RedbIndex::open(&pool_root.join("INDEX.redb")).unwrap();
     let cache = ChunkLocationCache::new();
-    cache.extend(index.iter_chunk_locations().unwrap());
+    cache.extend(index.iter_preferred_locations().unwrap());
     let mut gc = GcEngine::new(
         pool_root.to_path_buf(),
         Arc::new(cache),

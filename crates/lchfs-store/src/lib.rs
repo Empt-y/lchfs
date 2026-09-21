@@ -1499,7 +1499,7 @@ impl Pool {
         let dedup_index = Arc::new(ChunkLocationCache::new());
         // Warmed from the index rather than the mount's own map, because
         // the index knows which entries are striped.
-        dedup_index.extend_preferred(persisted_index.iter_preferred_locations()?);
+        dedup_index.extend(persisted_index.iter_preferred_locations()?);
         drop(locations);
         let dedup_pins = Arc::new(PendingDedupPins::new());
         let prep_pool = IngestPreparationPool::new(
@@ -2648,12 +2648,12 @@ impl PoolShared {
             StreamKind::Data => "chunk",
             _ => "object",
         };
-        let (preferred, striped) = self
+        let (preferred, preferred_vdev) = self
             .dedup_index
             .get_tagged(hash)
             .ok_or_else(|| PoolError::Format(format!("{what} {hash:?} not found")))?;
 
-        if striped {
+        if preferred_vdev == stripe::STRIPED {
             // Cold data: no mirror copy exists to try first. Served from
             // the one shard that holds it, reconstructed if that shard is
             // gone; never healed as a mirror -- a missing shard is
@@ -2683,20 +2683,29 @@ impl PoolShared {
             };
         }
 
-        let primary = self.primary();
-        let primary_err = {
+        // The preferred replica is read from the device that holds it --
+        // the primary for anything fanned out while it was online, which
+        // is nearly everything, but a copy healed onto a device that was
+        // away lives on that device alone, and once its original mirror
+        // has been striped away it is the preferred replica. A preferred
+        // device that is not online is a miss, not corruption: the
+        // failover below finds another copy, and the record is not
+        // charged to a device that cannot be asked.
+        let preferred_err = if self.is_online(preferred_vdev) {
             let mut readers = self.readers.lock();
             let reader = get_reader_lazy(
                 &mut readers,
-                || self.vdev_root(primary),
-                primary,
+                || self.vdev_root(preferred_vdev),
+                preferred_vdev,
                 preferred.segment_id,
                 kind,
             );
             match reader.and_then(|r| r.read_record(preferred).map_err(PoolError::from)) {
                 Ok((_header, bytes)) => return Ok(bytes),
-                Err(e) => e,
+                Err(e) => Some(e),
             }
+        } else {
+            None
         };
         // From here on something is wrong, and every step is recorded:
         // which device, which record, what was seen, whether it was put
@@ -2712,23 +2721,24 @@ impl PoolShared {
             detail,
             healed,
         };
-        if self.vdevs.len() == 1 {
-            self.record_corruption(event(self.primary(), Some(preferred), primary_err.to_string(), false));
-            return Err(primary_err);
+        let mut failed: Vec<(u16, Option<ExtentLocation>, String)> = Vec::new();
+        if let Some(e) = &preferred_err {
+            if self.vdevs.len() == 1 {
+                self.record_corruption(event(preferred_vdev, Some(preferred), e.to_string(), false));
+                return Err(preferred_err.expect("just matched"));
+            }
+            tracing::warn!("{what} {hash:?} unreadable on vdev {preferred_vdev} ({e}); trying other replicas");
+            failed.push((preferred_vdev, Some(preferred), e.to_string()));
+        } else {
+            tracing::warn!("{what} {hash:?} has its preferred copy on vdev {preferred_vdev}, which is not online; trying other replicas");
         }
-        tracing::warn!(
-            "{what} {hash:?} unreadable on vdev {} ({primary_err}); trying other replicas",
-            self.primary()
-        );
 
         // A record younger than its shard's index batch has no replica
         // entries yet; drain the batches before asking. Failure path only.
         self.committer_pool.flush_index()?;
         let replicas = self.persisted_index.read().chunk_locations(hash)?;
-        let mut failed: Vec<(u16, Option<ExtentLocation>, String)> =
-            vec![(self.primary(), Some(preferred), primary_err.to_string())];
         for (vdev_id, loc) in replicas {
-            if vdev_id == self.primary() || (vdev_id != stripe::STRIPED && !self.is_online(vdev_id)) {
+            if vdev_id == preferred_vdev || (vdev_id != stripe::STRIPED && !self.is_online(vdev_id)) {
                 continue;
             }
             match self.read_raw_from_vdev(vdev_id, loc, kind) {
@@ -2894,7 +2904,7 @@ impl PoolShared {
         }
         for &(vdev_id, _, hash, loc) in healed {
             if vdev_id == self.primary() {
-                self.dedup_index.put(hash, loc);
+                self.dedup_index.put(hash, loc, vdev_id);
             }
         }
         self.repair_stats
@@ -3031,7 +3041,7 @@ impl PoolShared {
             let mut index = self.persisted_index.write();
             let rebuilt = rebuild_index(&index_path(&new_primary.root), &online, generation)?;
             self.dedup_index.clear();
-            self.dedup_index.extend_preferred(rebuilt.iter_preferred_locations()?);
+            self.dedup_index.extend(rebuilt.iter_preferred_locations()?);
             *index = rebuilt;
         }
         self.vdevs.promote(new_primary.id);
@@ -3590,7 +3600,7 @@ impl PoolShared {
         // the committer records under its shard lock: rolling this writer
         // under its lock then guarantees everything on the old segment is
         // indexed (see `attach_vdev_live`).
-        self.dedup_index.put(hash, loc);
+        self.dedup_index.put(hash, loc, vdev_ids[0]);
         self.record_replicated_location(hash, loc, &vdev_ids)?;
         drop(slot);
         Ok((hash, loc))
@@ -5426,6 +5436,11 @@ fn mount_read(
         Err(e) => e,
     };
     let replicas = index.chunk_locations(hash).unwrap_or_default();
+    // A copy the primary never held -- healed onto another device while
+    // the primary had its own, then the primary's striped away -- is not
+    // the primary's to have lost. Served from wherever it is, and nothing
+    // is charged to the primary for it.
+    let primary_had_it = replicas.iter().any(|(v, _)| *v == primary.id);
     if let Some(&(_, sloc)) = replicas.iter().find(|(v, _)| *v == stripe::STRIPED) {
         // A cold record whose mirrors are gone: only its stripe has it,
         // and the primary attempt above was bound to fail -- that is not
@@ -5479,12 +5494,14 @@ fn mount_read(
             let read = get_reader(readers, &vdev.root, vdev.id, candidate.segment_id, kind)
                 .and_then(|r| r.read_record(candidate).map_err(PoolError::from));
             if let Ok((_, bytes)) = read {
-                tracing::warn!(
-                    "mount: {kind:?} record {hash:?} unreadable on vdev {} ({primary_err}); served from vdev {}",
-                    primary.id,
-                    vdev.id
-                );
-                repairs.failed_over(primary.id, kind, hash, loc, format!("{primary_err}; served from vdev {} at mount", vdev.id));
+                if primary_had_it {
+                    tracing::warn!(
+                        "mount: {kind:?} record {hash:?} unreadable on vdev {} ({primary_err}); served from vdev {}",
+                        primary.id,
+                        vdev.id
+                    );
+                    repairs.failed_over(primary.id, kind, hash, loc, format!("{primary_err}; served from vdev {} at mount", vdev.id));
+                }
                 return Ok(bytes);
             }
         }

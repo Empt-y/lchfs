@@ -215,7 +215,7 @@ fn generation_change_mid_pass_blocks_deletion_even_without_a_pin() {
 
     let index = RedbIndex::open(&dir.path().join("INDEX.redb")).unwrap();
     let cache = ChunkLocationCache::new();
-    cache.extend(index.iter_chunk_locations().unwrap());
+    cache.extend(index.iter_preferred_locations().unwrap());
     let locations = Arc::new(cache);
     let persisted_index = RwLock::new(index);
     // Comfortably past every segment id `setup_low_liveness_pool` could
