@@ -40,13 +40,22 @@ fn read_file(pool: &Pool, name: &str, len: usize) -> Vec<u8> {
 
 /// `(segment id, state, file size)` for every data segment on a device.
 fn data_segments(root: &Path) -> Vec<(u64, SegmentState, u64)> {
-    let mut out: Vec<_> = std::fs::read_dir(root.join("segments/data"))
+    segments(root, StreamKind::Data)
+}
+
+fn segments(root: &Path, kind: StreamKind) -> Vec<(u64, SegmentState, u64)> {
+    let (sub, ext) = match kind {
+        StreamKind::Data => ("data", "aseg"),
+        StreamKind::Meta => ("meta", "mseg"),
+        StreamKind::Delta => unreachable!(),
+    };
+    let mut out: Vec<_> = std::fs::read_dir(root.join("segments").join(sub))
         .map(|rd| {
             rd.flatten()
-                .filter(|e| e.path().extension().is_some_and(|x| x == "aseg"))
+                .filter(|e| e.path().extension().is_some_and(|x| x == ext))
                 .map(|e| {
                     let id: u64 = e.path().file_stem().unwrap().to_str().unwrap().parse().unwrap();
-                    let state = SegmentReader::open(root, id, StreamKind::Data)
+                    let state = SegmentReader::open(root, id, kind)
                         .unwrap()
                         .read_header()
                         .unwrap()
@@ -97,6 +106,51 @@ fn a_clean_shutdown_seals_every_data_segment_and_leaves_no_empty_files() {
     for i in 0..8u32 {
         assert_eq!(read_file(&pool, &format!("f{i}"), 30_000), payload(i));
     }
+}
+
+/// The meta stream has the same lifecycle as the data stream: its
+/// segment is created by the first object written, sealed at a clean
+/// shutdown, and a mount that writes no meta object leaves no meta
+/// segment behind. A mount used to open one eagerly and leave the empty
+/// header page for the next mount to remove, and never sealed the one
+/// it had written at shutdown; a pool mounted and unmounted daily grew
+/// an Open segment a day for the next mount to clean up.
+#[test]
+fn a_clean_shutdown_seals_the_meta_segment_and_an_idle_mount_leaves_none() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    {
+        let pool = Pool::create_replicated(&[a.path(), b.path()], params(false)).unwrap();
+        write_files(&pool, 4);
+    }
+    let after_first = segments(a.path(), StreamKind::Meta);
+    assert!(!after_first.is_empty());
+    for root in [a.path(), b.path()] {
+        for (id, state, len) in segments(root, StreamKind::Meta) {
+            assert_eq!(state, SegmentState::Sealed, "meta segment {id} on {}", root.display());
+            assert!(len > 4096, "meta segment {id} holds records, not just a header page");
+        }
+    }
+    // Mount, read, checkpoint (nothing changed, so every object dedups),
+    // unmount: not one new meta segment.
+    {
+        let pool = Pool::open_replicated(&[a.path(), b.path()]).unwrap();
+        for i in 0..4u32 {
+            assert_eq!(read_file(&pool, &format!("f{i}"), 30_000), payload(i));
+        }
+        pool.checkpoint().unwrap();
+    }
+    assert_eq!(segments(a.path(), StreamKind::Meta), after_first);
+    assert_eq!(segments(b.path(), StreamKind::Meta), after_first);
+    // And a mount that does write meta seals what it wrote when it goes.
+    {
+        let pool = Pool::open_replicated(&[a.path(), b.path()]).unwrap();
+        write_files_from(&pool, 4, 2);
+    }
+    let after_third = segments(a.path(), StreamKind::Meta);
+    assert!(after_third.len() > after_first.len());
+    assert!(after_third.iter().all(|(_, s, len)| *s == SegmentState::Sealed && *len > 4096), "{after_third:?}");
+    assert_eq!(segments(b.path(), StreamKind::Meta), after_third);
 }
 
 #[test]

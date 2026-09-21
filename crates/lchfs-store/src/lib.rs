@@ -650,7 +650,13 @@ struct PoolShared {
     heal_writers: Mutex<HashMap<(u16, StreamKind), SegmentWriter>>,
     repair_stats: RepairStats,
 
-    meta_writer: Mutex<SegmentWriter>,
+    /// The meta stream's fan-out writer, created on the online set by the
+    /// first object that needs it and sealed by a roll or a clean
+    /// shutdown -- the same lazy shape as each shard's data writer, and
+    /// for the same reason: a segment opened at mount and never written
+    /// is a header page left Open for the next mount to clean up, and a
+    /// segment nobody seals at shutdown is one the next mount has to.
+    meta_writer: Mutex<Option<SegmentWriter>>,
     next_segment_id: Arc<AtomicU64>,
     /// Mirrors `Namespace::generation`, updated at the same point
     /// `run_checkpoint` publishes a new root. A plain shared counter (not
@@ -718,7 +724,6 @@ impl Pool {
             members.push(VdevSet::member(Vdev::new(id as u16, root.to_path_buf()), backend, lock));
         }
         let vdev_set = Arc::new(VdevSet::new(members, vdev_roots.len() as u16));
-        let vdevs = vdev_set.online();
 
         let mut inodes = HashMap::new();
         let (now_secs, now_nanos) = now_unix();
@@ -756,11 +761,6 @@ impl Pool {
             params.data_segment_cap_bytes as u64,
             Arc::clone(&next_segment_id),
         )?;
-        let meta_id = next_segment_id.fetch_add(1, Ordering::Relaxed);
-        let mut meta_writer = SegmentWriter::create_on(&vdevs, meta_id, StreamKind::Meta, 0)?;
-        for id in meta_writer.take_faults() {
-            vdev_set.fault(id);
-        }
 
         let shard_delta_logs = (0..shard_count)
             .map(|id| ShardDeltaLog::open_on(Arc::clone(&vdev_set), id).map(Mutex::new))
@@ -829,7 +829,7 @@ impl Pool {
             readers: Mutex::new(HashMap::new()),
             heal_writers: Mutex::new(HashMap::new()),
             repair_stats: RepairStats::default(),
-            meta_writer: Mutex::new(meta_writer),
+            meta_writer: Mutex::new(None),
             next_segment_id,
             published_generation,
             committer_pool,
@@ -1361,11 +1361,6 @@ impl Pool {
             root.pool_params.data_segment_cap_bytes as u64,
             Arc::clone(&next_segment_id),
         )?;
-        let meta_id = next_segment_id.fetch_add(1, Ordering::Relaxed);
-        let mut meta_writer = SegmentWriter::create_on(&vdevs, meta_id, StreamKind::Meta, 0)?;
-        for id in meta_writer.take_faults() {
-            vdev_set.fault(id);
-        }
 
         // Two-tier crash recovery (ARCHITECTURE.md §7): the InoMap walk
         // above is tier one (the last full checkpoint's base state). Tier
@@ -1570,7 +1565,7 @@ impl Pool {
                 failovers: AtomicU64::new(mount_repairs.failovers),
                 ..RepairStats::default()
             },
-            meta_writer: Mutex::new(meta_writer),
+            meta_writer: Mutex::new(None),
             next_segment_id,
             published_generation,
             committer_pool,
@@ -2060,14 +2055,21 @@ impl Drop for Pool {
         self.0.dedup_task.lock().take();
         self.0.scrub_task.lock().take();
         self.0.failover_task.lock().take();
+        // A clean shutdown leaves no meta segment open, as the committer
+        // pool's leaves no data segment open: what stays Open on disk is
+        // a crash's, and the next mount seals it. Nothing writes meta
+        // once the timers are gone and the last handle is going.
+        if let Err(e) = self.0.close_meta_writer(&mut self.0.meta_writer.lock()) {
+            tracing::error!("sealing the meta segment at shutdown failed ({e})");
+        }
     }
 }
 
 impl PoolShared {
     /// Seals every data and meta segment replica left `Open` on disk.
-    /// Nothing this process owns is open yet but the meta writer's own
-    /// segment (its data writers create segments on first use), so an
-    /// Open segment at mount is a crash's, or an old unmount's -- and a
+    /// Nothing this process owns is open yet (every writer creates its
+    /// segment on first use), so an Open segment at mount is a crash's,
+    /// or an old unmount's that could not seal at shutdown -- and a
     /// segment nobody will ever seal is one the sweep, the coalescer and
     /// the conversion pass never look at (§6, §17.2). Each replica is
     /// sealed from its own scan, since a device that faulted mid-segment
@@ -2078,7 +2080,7 @@ impl PoolShared {
     /// that does not read is that replica's problem for scrub, and a
     /// device that cannot take the seal is faulted.
     fn seal_orphaned_segments(&self) -> Result<(), PoolError> {
-        let live_meta = Some(self.meta_writer.lock().segment_id());
+        let live_meta = self.meta_writer.lock().as_ref().map(SegmentWriter::segment_id);
         for vdev_id in self.seal_orphaned_on(&self.vdevs.online(), live_meta)? {
             self.vdevs.fault(vdev_id);
         }
@@ -2086,9 +2088,9 @@ impl PoolShared {
     }
 
     /// `seal_orphaned_segments` for the devices given -- all of them at
-    /// mount, when the meta writer's own segment (`live_meta`) is the one
-    /// thing open and must be left alone; the one device on a rejoin,
-    /// before it is a member, when nothing is. Returns the devices with a
+    /// mount; the one device on a rejoin, before it is a member. A meta
+    /// segment this process has open (`live_meta`) is left alone; there
+    /// is none at mount, but the guard costs nothing. Returns the devices with a
     /// replica that could not be sealed or removed; what to do about them
     /// is the caller's, since at mount that device is faulted and on a
     /// join it is simply not taken.
@@ -2974,10 +2976,7 @@ impl PoolShared {
 
         let member = self.vdevs.detach_last();
         self.committer_pool.roll_all_writers()?;
-        {
-            let mut meta_writer = self.meta_writer.lock();
-            self.roll_meta_writer(&mut meta_writer)?;
-        }
+        self.close_meta_writer(&mut self.meta_writer.lock())?;
         for log in &self.shard_delta_logs {
             log.lock().roll_over()?;
         }
@@ -3566,8 +3565,15 @@ impl PoolShared {
         if let Some(loc) = self.dedup_index.get(hash) {
             return Ok((hash, loc));
         }
-        let mut meta_writer = self.meta_writer.lock();
-        self.ensure_meta_room(&mut meta_writer, encoded.len() as u64)?;
+        let mut slot = self.meta_writer.lock();
+        let full = slot.as_ref().is_some_and(|w| {
+            w.current_size() + encoded.len() as u64 + RECORD_OVERHEAD_ESTIMATE
+                > self.pool_params.meta_segment_cap_bytes as u64
+        });
+        if full {
+            self.close_meta_writer(&mut slot)?;
+        }
+        let meta_writer = self.open_meta_writer(&mut slot)?;
         let appended = meta_writer.append(
             kind,
             hash,
@@ -3576,44 +3582,53 @@ impl PoolShared {
             &encoded,
             Vec::new(),
         );
-        self.report_faults(meta_writer.take_faults());
+        let faults = meta_writer.take_faults();
+        let vdev_ids: Vec<u16> = meta_writer.vdev_ids().to_vec();
+        self.report_faults(faults);
         let loc = appended?;
         // Recorded before the meta lock is released, for the same reason
         // the committer records under its shard lock: rolling this writer
         // under its lock then guarantees everything on the old segment is
         // indexed (see `attach_vdev_live`).
         self.dedup_index.put(hash, loc);
-        self.record_replicated_location(hash, loc, meta_writer.vdev_ids())?;
-        drop(meta_writer);
+        self.record_replicated_location(hash, loc, &vdev_ids)?;
+        drop(slot);
         Ok((hash, loc))
     }
 
-    fn ensure_meta_room(
-        &self,
-        meta_writer: &mut SegmentWriter,
-        additional: u64,
-    ) -> Result<(), PoolError> {
-        if meta_writer.current_size() + additional + RECORD_OVERHEAD_ESTIMATE
-            > self.pool_params.meta_segment_cap_bytes as u64
-        {
-            self.roll_meta_writer(meta_writer)?;
+    /// The meta writer, created on the online set as it stands if there
+    /// is none. Called under the meta lock, which the slot is.
+    fn open_meta_writer<'a>(&self, slot: &'a mut Option<SegmentWriter>) -> Result<&'a mut SegmentWriter, PoolError> {
+        if slot.is_none() {
+            let id = self.next_segment_id.fetch_add(1, Ordering::Relaxed);
+            let mut writer = SegmentWriter::create_on(&self.vdevs.online(), id, StreamKind::Meta, 0)?;
+            self.report_faults(writer.take_faults());
+            *slot = Some(writer);
         }
-        Ok(())
+        Ok(slot.as_mut().expect("just created"))
     }
 
-    /// Starts a fresh meta segment on the device set as it stands now.
-    fn roll_meta_writer(&self, meta_writer: &mut SegmentWriter) -> Result<(), PoolError> {
-        let id = self.next_segment_id.fetch_add(1, Ordering::Relaxed);
-        let mut new_writer = SegmentWriter::create_on(&self.vdevs.online(), id, StreamKind::Meta, 0)?;
-        self.report_faults(new_writer.take_faults());
-        let old = std::mem::replace(meta_writer, new_writer);
-        self.report_faults(old.seal()?);
+    /// Seals the meta segment, if one is open; the next object opens a
+    /// fresh one on the device set as it stands then. What every barrier
+    /// that needs "no meta segment in flight includes device X" calls,
+    /// and what a clean shutdown ends with.
+    fn close_meta_writer(&self, slot: &mut Option<SegmentWriter>) -> Result<(), PoolError> {
+        if let Some(old) = slot.take() {
+            self.report_faults(old.seal()?);
+        }
         Ok(())
     }
 
     /// The live counterpart of `Pool::attach_vdev` (ARCHITECTURE.md
     /// §15.10). The sequence is what makes it safe under load:
     ///
+    /// 0. Any replica left Open on the device -- cut short when it
+    ///    faulted, or by an unclean stop before an attach -- is sealed
+    ///    from its own scan, now, while the device is nobody's: a
+    ///    faulted replica is dropped from its writer's fan-out for good
+    ///    and nothing can open a segment on a device that is not a
+    ///    member, so every Open replica on it is dead and sealing it is
+    ///    safe. One step later it is not (see `seal_orphaned_on`).
     /// 1. The device joins the online set, marked as catching up, so
     ///    checkpoints leave its superblock alone until step 4.
     /// 2. Every fan-out writer -- each shard's data writer, the meta
@@ -3789,10 +3804,7 @@ impl PoolShared {
 
         // 2.
         self.committer_pool.roll_all_writers()?;
-        {
-            let mut meta_writer = self.meta_writer.lock();
-            self.roll_meta_writer(&mut meta_writer)?;
-        }
+        self.close_meta_writer(&mut self.meta_writer.lock())?;
         for log in &self.shard_delta_logs {
             log.lock().roll_over()?;
         }
@@ -5258,8 +5270,7 @@ impl PoolShared {
         // Barrier #2: everything the new superblock slot will point to
         // (InodeObjects, DirectoryObjects, IndirectHashLists, InoMap,
         // SnapshotTable, RootObject) went to meta_writer above.
-        {
-            let mut meta_writer = self.meta_writer.lock();
+        if let Some(meta_writer) = self.meta_writer.lock().as_mut() {
             let synced = meta_writer.fsync();
             self.report_faults(meta_writer.take_faults());
             synced?;
