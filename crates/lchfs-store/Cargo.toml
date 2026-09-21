@@ -42,3 +42,7 @@ nix = { workspace = true, features = ["user"] }
 [[bench]]
 name = "concurrent_writes"
 harness = false
+
+[[bench]]
+name = "concurrent_reads"
+harness = false
