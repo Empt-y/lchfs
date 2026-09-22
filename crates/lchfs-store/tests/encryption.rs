@@ -336,3 +336,120 @@ fn every_metadata_kind_ends_up_sealed_not_only_raw_chunks() {
     // scan without the key.
     assert_eq!(kinds.keys().collect::<Vec<_>>(), vec!["Sealed"], "found unsealed record kinds: {kinds:?}");
 }
+
+fn mirror_setup() -> (tempfile::TempDir, tempfile::TempDir) {
+    (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap())
+}
+
+/// Review finding: a device detached from an encrypted pool used to keep
+/// that pool's keyring, and the next pool built on it -- even a plaintext
+/// one -- then demanded a key it never had. Detach now takes the keyring
+/// with the superblock.
+#[test]
+fn a_detached_device_takes_no_keyring_with_it() {
+    let (a, b) = mirror_setup();
+    let pool = Pool::create_replicated_encrypted(&[a.path(), b.path()], small_params(), setup()).unwrap();
+    assert!(lchfs_crypto::keyring::exists_on(b.path()));
+    pool.detach_vdev_live().unwrap();
+    drop(pool);
+    assert!(!lchfs_crypto::keyring::exists_on(b.path()), "the detached device still holds the keyring");
+
+    std::fs::remove_dir_all(b.path().join("segments")).unwrap();
+    let reused = Pool::create(b.path(), small_params()).unwrap();
+    drop(reused);
+    if !lchfs_crypto::testing::TEST_ENCRYPT_ALL {
+        assert!(Pool::open(b.path()).is_ok(), "the reused device opens as the plaintext pool it now is");
+    }
+}
+
+/// A stray keyring makes a device not blank: better refused at create than
+/// silently claimed by whatever pool is built there next.
+#[test]
+fn a_stray_keyring_makes_a_device_not_blank() {
+    let donor = tempfile::tempdir().unwrap();
+    drop(Pool::create_encrypted(donor.path(), small_params(), setup()).unwrap());
+    let target = tempfile::tempdir().unwrap();
+    std::fs::copy(
+        lchfs_crypto::keyring::path_on(donor.path()),
+        lchfs_crypto::keyring::path_on(target.path()),
+    )
+    .unwrap();
+    let err = Pool::create(target.path(), small_params()).unwrap_err();
+    assert!(matches!(err, lchfs_store::PoolError::AlreadyExists(_)), "{err}");
+}
+
+/// A keyring belonging to another pool, found on a member of this one, says
+/// nothing about this pool: a plaintext pool still opens without a key.
+#[test]
+fn a_foreign_keyring_on_a_plaintext_pool_is_ignored() {
+    if lchfs_crypto::testing::TEST_ENCRYPT_ALL {
+        return; // every Pool::create is encrypted in that build
+    }
+    let donor = tempfile::tempdir().unwrap();
+    drop(Pool::create_encrypted(donor.path(), small_params(), setup()).unwrap());
+    let plain = tempfile::tempdir().unwrap();
+    let pool = Pool::create(plain.path(), small_params()).unwrap();
+    let ino = pool.create_file(1, "f", 0o644).unwrap();
+    pool.write(ino, 0, b"plaintext pool content").unwrap();
+    pool.checkpoint().unwrap();
+    drop(pool);
+    std::fs::copy(
+        lchfs_crypto::keyring::path_on(donor.path()),
+        lchfs_crypto::keyring::path_on(plain.path()),
+    )
+    .unwrap();
+    let pool = Pool::open(plain.path()).unwrap();
+    assert!(!pool.is_encrypted());
+    let ino = pool.lookup(1, "f").unwrap().unwrap();
+    assert_eq!(pool.read(ino, 0, 64).unwrap().as_ref(), b"plaintext pool content");
+}
+
+/// Review finding: offline detach mounted the pool with no key, so it could
+/// never work on an encrypted pool. And offline attach never gave the new
+/// device a keyring, so a pool left with only that device could not unlock.
+#[test]
+fn offline_attach_and_detach_work_on_an_encrypted_pool() {
+    let (a, b) = mirror_setup();
+    let pool = Pool::create_encrypted(a.path(), small_params(), setup()).unwrap();
+    let ino = pool.create_file(1, "f", 0o644).unwrap();
+    pool.write(ino, 0, &vec![3u8; 9000]).unwrap();
+    pool.checkpoint().unwrap();
+    drop(pool);
+
+    Pool::attach_vdev(&[a.path()], b.path()).unwrap();
+    assert!(lchfs_crypto::keyring::exists_on(b.path()), "offline attach must give the new device the keyring");
+    let unlock = Unlock::Passphrase(PASSPHRASE);
+    drop(Pool::open_replicated_with(&[a.path(), b.path()], &unlock).unwrap());
+
+    // The new device alone -- the original lost -- still unlocks and reads.
+    let alone = Pool::open_degraded_with(&[b.path()], &unlock).unwrap();
+    let ino = alone.lookup(1, "f").unwrap().unwrap();
+    assert_eq!(alone.read(ino, 0, 9000).unwrap().as_ref(), vec![3u8; 9000].as_slice());
+    drop(alone);
+
+    Pool::detach_vdev_with(&[a.path(), b.path()], Some(&unlock)).unwrap();
+    assert!(!lchfs_crypto::keyring::exists_on(b.path()));
+    let pool = Pool::open_with(a.path(), &unlock).unwrap();
+    let ino = pool.lookup(1, "f").unwrap().unwrap();
+    assert_eq!(pool.read(ino, 0, 9000).unwrap().as_ref(), vec![3u8; 9000].as_slice());
+}
+
+/// Review finding: fsck given no key reported every record of an encrypted
+/// pool as corrupt. It now says, once, that it needs a key.
+#[test]
+fn fsck_without_a_key_says_so_instead_of_reporting_corruption() {
+    // Not the test-encrypt-all passphrase, so fsck cannot unlock it in
+    // either build.
+    let dir = tempfile::tempdir().unwrap();
+    let pool = Pool::create_encrypted(dir.path(), small_params(), setup()).unwrap();
+    let ino = pool.create_file(1, "f", 0o644).unwrap();
+    pool.write(ino, 0, &vec![1u8; 5000]).unwrap();
+    pool.checkpoint().unwrap();
+    drop(pool);
+    assert!(matches!(lchfs_fsck::collect_live_roots(dir.path()), Err(lchfs_fsck::FsckError::KeyRequired)));
+    let report = lchfs_fsck::check(dir.path(), &[]);
+    assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+    assert!(matches!(report.errors[0], lchfs_fsck::FsckError::KeyRequired));
+    let replicas = lchfs_fsck::check_replicas(&[dir.path()]);
+    assert!(replicas.errors.iter().all(|e| matches!(e, lchfs_fsck::FsckError::KeyRequired)), "{:?}", replicas.errors);
+}

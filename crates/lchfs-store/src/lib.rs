@@ -1283,6 +1283,17 @@ impl Pool {
             }
         }
 
+        // An encrypted pool's keyring goes to the new device before its
+        // superblock does, so there is never a member without one. Copying
+        // the newest file byte for byte needs no key -- it is all wrapped.
+        let member_roots: Vec<&Path> = membership.members.iter().map(|(_, r)| *r).collect();
+        if let Some((_, newest)) = keyring::read_all(&member_roots)?
+            .into_iter()
+            .find(|(_, k)| k.body().pool_uuid == membership.members[0].0.pool_uuid)
+        {
+            keyring::write_on(new_root, newest.file_bytes())?;
+        }
+
         let mut fresh = membership.members[0].0;
         fresh.vdev_id = new_id;
         fresh.vdev_count = new_count;
@@ -1311,6 +1322,12 @@ impl Pool {
     /// Only the last slot can leave, because slots are `0..count` and a
     /// hole in the middle is a degraded pool, not a smaller one.
     pub fn detach_vdev(vdev_roots: &[&Path]) -> Result<u16, PoolError> {
+        Self::detach_vdev_with(vdev_roots, None)
+    }
+
+    /// `detach_vdev` for a pool that may be encrypted: the proof mounts the
+    /// pool, and an encrypted one needs `unlock` to be mounted at all.
+    pub fn detach_vdev_with(vdev_roots: &[&Path], unlock: Option<&Unlock<'_>>) -> Result<u16, PoolError> {
         let membership = check_membership(vdev_roots, true)?;
         if membership.vdev_count < 2 {
             return Err(PoolError::InvalidArgument(
@@ -1339,7 +1356,7 @@ impl Pool {
         // Prove the survivors can stand alone, with the leaving device
         // still a member (if present) and so still a source to heal from.
         {
-            let pool = Self::open_degraded(vdev_roots)?;
+            let pool = Self::open_set(vdev_roots, true, unlock)?;
             // Held for the whole proof: a conversion pass in this window
             // would place shards on the leaving device.
             let mut coalesce = pool.0.coalesce.lock();
@@ -1378,6 +1395,10 @@ impl Pool {
         }
         if let Some(root) = &leaving_root {
             std::fs::remove_file(backend::superblock_path(root))?;
+            let keys = keyring::path_on(root);
+            if keys.exists() {
+                std::fs::remove_file(keys)?;
+            }
         }
         for (slot, root) in &membership.members {
             if slot.vdev_id == leaving {
@@ -1530,7 +1551,7 @@ impl Pool {
         // Before a single record is read: an encrypted pool's root object
         // is sealed, and so is everything the mount walks.
         let member_roots: Vec<&Path> = members.iter().map(|(_, r)| *r).collect();
-        let (crypto_state, keyring_state) = unlock_pool(&member_roots, unlock)?;
+        let (crypto_state, keyring_state) = unlock_pool(&member_roots, members[0].0.pool_uuid, unlock)?;
 
         let pool_root = members[0].1;
         let mut set_members = Vec::with_capacity(members.len());
@@ -3426,9 +3447,15 @@ impl PoolShared {
         self.persisted_index.write().delete_vdev_locations(leaving)?;
         if let Some(member) = member {
             let ring = backend::superblock_path(&member.vdev.root);
+            let keys = keyring::path_on(&member.vdev.root);
             drop(member);
             if ring.exists() {
                 std::fs::remove_file(ring)?;
+            }
+            // The keyring goes with the superblock: a detached device must
+            // not carry this pool's keys into whatever it is used for next.
+            if keys.exists() {
+                std::fs::remove_file(keys)?;
             }
         }
         self.run_checkpoint()?;
@@ -6123,6 +6150,23 @@ fn mount_read(
             return Ok(bytes);
         }
     }
+    // The primary's own copy at another location: a heal or resilver wrote
+    // it into a heal segment, at an offset of its own, while `loc` -- from
+    // the superblock, or a scan of a different device -- says where the
+    // copy sits on the device that wrote the fan-out. A device attached
+    // offline and resilvered holds *everything* this way, so without this
+    // it could not be mounted on its own at all: its root object is right
+    // there, just not at the offset the superblock names.
+    for &(v, other) in &replicas {
+        if v != primary.id || other == loc {
+            continue;
+        }
+        let read = get_reader(readers, &primary.root, primary.id, other.segment_id, kind)
+            .and_then(|r| r.read_record_with(other, crypto).map_err(PoolError::from));
+        if let Ok((_, bytes)) = read {
+            return Ok(bytes);
+        }
+    }
     for vdev in &vdevs[1..] {
         let mut candidates = vec![loc];
         candidates.extend(
@@ -6191,13 +6235,46 @@ fn mount_read_delta(
     Err(first_err.expect("at least one vdev"))
 }
 
-/// How a pool being opened reads its records: plaintext if no device has a
-/// keyring, else whatever the newest genuine keyring `unlock` opens says.
-/// Devices whose keyring is missing, older, or a forgery are given the
-/// genuine one on the way (best-effort: a device that cannot take it is
-/// only a redundancy loss, and the next mount tries again).
-fn unlock_pool(roots: &[&Path], unlock: Option<&Unlock<'_>>) -> Result<(RecordCrypto, Option<KeyringState>), PoolError> {
-    if !roots.iter().any(|r| keyring::exists_on(r)) {
+/// How a pool being opened reads its records: plaintext if no device holds
+/// a keyring *for this pool*, else whatever the newest genuine keyring
+/// `unlock` opens says.
+///
+/// Only keyrings whose `pool_uuid` is this pool's count. One left behind by
+/// another pool -- on a device detached from it, or by a `create_encrypted`
+/// that failed part-way -- says nothing about this one, and trusting it
+/// made a plaintext pool demand a key it never had. Ignoring a foreign
+/// keyring cannot downgrade an encrypted pool: its records stay sealed, and
+/// without the right keyring it simply cannot be read.
+///
+/// Member devices whose keyring is missing, older, forged or foreign are
+/// given the genuine one on the way (best-effort: a device that cannot take
+/// it is only a redundancy loss, and the next mount tries again). A device
+/// holding a *newer* genuine keyring is never touched -- see
+/// `keyring::unlock_newest`.
+fn unlock_pool(
+    roots: &[&Path],
+    pool_uuid: [u8; 16],
+    unlock: Option<&Unlock<'_>>,
+) -> Result<(RecordCrypto, Option<KeyringState>), PoolError> {
+    let mut ours: Vec<&Path> = Vec::new();
+    let mut foreign: Vec<&Path> = Vec::new();
+    for &root in roots {
+        let Ok(bytes) = std::fs::read(keyring::path_on(root)) else { continue };
+        match keyring::parse(&bytes) {
+            Ok(k) if k.body().pool_uuid == pool_uuid => ours.push(root),
+            Ok(_) => {
+                tracing::warn!(
+                    "{} holds a keyring for a different pool; ignoring it, and replacing it if this pool is encrypted",
+                    root.display()
+                );
+                foreign.push(root);
+            }
+            // Damaged: `unlock_newest` passes it over, and the repair below
+            // gives the device a good copy.
+            Err(_) => ours.push(root),
+        }
+    }
+    if ours.is_empty() {
         return Ok((RecordCrypto::plaintext(), None));
     }
     let test_unlock = Unlock::Passphrase(lchfs_crypto::testing::TEST_PASSPHRASE);
@@ -6206,9 +6283,17 @@ fn unlock_pool(roots: &[&Path], unlock: Option<&Unlock<'_>>) -> Result<(RecordCr
         None if lchfs_crypto::testing::TEST_ENCRYPT_ALL => &test_unlock,
         None => return Err(PoolError::KeyRequired),
     };
-    let found = keyring::unlock_newest(roots, how)?;
-    for root in &found.stale {
-        if let Err(e) = keyring::write_on(root, &found.file) {
+    let found = keyring::unlock_newest(&ours, how)?;
+    let missing = roots.iter().filter(|r| !keyring::exists_on(r)).map(|r| r.to_path_buf());
+    let repair: Vec<PathBuf> = found
+        .stale
+        .iter()
+        .cloned()
+        .chain(foreign.iter().map(|r| r.to_path_buf()))
+        .chain(missing)
+        .collect();
+    for root in repair {
+        if let Err(e) = keyring::write_on(&root, &found.file) {
             tracing::warn!("keyring on {} is stale and could not be rewritten: {e}", root.display());
         }
     }
@@ -6572,6 +6657,15 @@ fn require_blank_device(root: &Path) -> Result<(), PoolError> {
         if read_superblock(&backend)?.is_some() {
             return Err(PoolError::AlreadyExists(root.display().to_string()));
         }
+    }
+    // A keyring left behind -- by a detached device, or a create that
+    // failed part-way -- would claim whatever pool is built here next.
+    if keyring::exists_on(root) {
+        return Err(PoolError::AlreadyExists(format!(
+            "{} holds a keyring from another pool; a device joining a pool must be blank (remove {} if that pool is gone)",
+            root.display(),
+            keyring::path_on(root).display()
+        )));
     }
     let segments = root.join("segments");
     if segments.is_dir() && std::fs::read_dir(&segments)?.next().is_some() {

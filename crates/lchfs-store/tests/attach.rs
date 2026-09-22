@@ -407,3 +407,31 @@ fn an_attach_interrupted_between_members_is_recoverable() {
     assert_eq!(pool.mount_resilver().len(), 1);
     assert_eq!(read_file(&pool, "f", data.len()), data);
 }
+
+/// A device attached offline is filled by resilver into heal segments, at
+/// offsets of its own -- not the offsets the superblock (copied from the
+/// original) names for the root object. Mounted on its own, with the
+/// original gone, the mount must still find its root: it used to try the
+/// superblock's location on that device, then only *other* devices, and
+/// fail with ENOENT on a device holding every record. Found in the review
+/// of the encryption work, but a plain mirror bug.
+#[test]
+fn a_device_attached_offline_mounts_alone_after_its_resilver() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let data = payload(11);
+    let pool = Pool::create(a.path(), small_params()).unwrap();
+    let ino = pool.create_file(1, "f", 0o644).unwrap();
+    pool.write(ino, 0, &data).unwrap();
+    pool.checkpoint().unwrap();
+    drop(pool);
+
+    Pool::attach_vdev(&[a.path()], b.path()).unwrap();
+    let pool = Pool::open_replicated(&[a.path(), b.path()]).unwrap();
+    assert!(pool.mount_resilver().iter().any(|(v, r)| *v == 1 && r.healed > 0), "setup: b must be resilvered");
+    drop(pool);
+
+    let alone = Pool::open_degraded(&[b.path()]).unwrap();
+    let ino = alone.lookup(1, "f").unwrap().unwrap();
+    assert_eq!(alone.read(ino, 0, data.len() as u32).unwrap().as_ref(), data.as_slice());
+}

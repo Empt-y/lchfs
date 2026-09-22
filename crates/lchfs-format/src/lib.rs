@@ -58,3 +58,9 @@ pub const FORMAT_VERSION: u32 = 5;
 
 /// The oldest format this build still opens (see v5 above).
 pub const MIN_READABLE_FORMAT_VERSION: u32 = 4;
+
+/// The largest logical record this build writes or reads, 512 MiB: an
+/// allocation bound on everything a record header claims. Defined here,
+/// not in the store, so the sealed-record reader bounds itself by the very
+/// same ceiling the writer is held to.
+pub const MAX_RECORD_LEN: u32 = 512 * 1024 * 1024;

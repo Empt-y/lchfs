@@ -84,6 +84,9 @@ pub enum FsckError {
     ReplicaDivergent { hash: Hash32, vdev_id: u16, reference: u16, detail: String },
     #[error("I/O error: {0}")]
     Io(String),
+    /// The pool is encrypted and this check was given no key for it.
+    #[error("this pool is encrypted and no key was given; its records cannot be checked without one")]
+    KeyRequired,
     #[error("{stream} segment {segment_id}: bytes {from}..{to} are unparseable and were skipped over")]
     DamagedRegion { segment_id: u64, stream: &'static str, from: u32, to: u32 },
     #[error("striped segment {segment_id}: shard {shard_index} is missing from vdev {vdev_id}")]
@@ -276,34 +279,32 @@ pub fn read_superblock(pool_root: &Path) -> Result<SuperblockSlot, FsckError> {
     best.ok_or_else(|| FsckError::NoValidSuperblock(pool_root.display().to_string()))
 }
 
-/// How this run reads sealed records. fsck has no way to prompt for a
-/// passphrase or touch a TPM (that is the CLI's job, `lchfs-cli fsck
-/// --unlock ...`, still to be built) -- what it *can* do on its own is
-/// recognise the one key every `test-encrypt-all` pool shares, so the
-/// whole test suite gets a real, working fsck against encrypted pools
-/// with no test code changed. On any other encrypted pool, or when the
-/// keyring can't be read yet (still being written by a live mount), this
-/// falls back to `RecordCrypto::plaintext()` -- every sealed record then
-/// reports `KeyRequired` as a normal, safe fsck finding rather than a
-/// crash; it never guesses at a passphrase.
-fn pool_crypto(vdev_roots: &[&Path]) -> lchfs_format::RecordCrypto {
+/// How this run reads sealed records: plaintext for a pool with no
+/// keyring. An encrypted pool needs its key, and fsck cannot yet be given
+/// one (that is the CLI's `--unlock`, still to come) -- except in a
+/// `test-encrypt-all` build, whose pools all share one known passphrase,
+/// so the whole test suite gets a real fsck against encrypted pools. On any
+/// other encrypted pool this is `KeyRequired`, reported up front: reading
+/// it as plaintext would report every sealed record as corrupt, which looks
+/// like a destroyed pool rather than a missing key.
+fn pool_crypto(vdev_roots: &[&Path]) -> Result<lchfs_format::RecordCrypto, FsckError> {
     if !vdev_roots.iter().any(|r| lchfs_crypto::keyring::exists_on(r)) {
-        return lchfs_format::RecordCrypto::plaintext();
+        return Ok(lchfs_format::RecordCrypto::plaintext());
     }
     if lchfs_crypto::testing::TEST_ENCRYPT_ALL {
         let how = lchfs_crypto::keyring::Unlock::Passphrase(lchfs_crypto::testing::TEST_PASSPHRASE);
         if let Ok(found) = lchfs_crypto::keyring::unlock_newest(vdev_roots, &how) {
             let config = found.ring.config();
-            return lchfs_format::RecordCrypto::new(
+            return Ok(lchfs_format::RecordCrypto::new(
                 found.ring.pool_uuid(),
                 config.current_epoch,
                 config.min_epoch,
                 config.padding,
                 found.ring.epoch_keys(),
-            );
+            ));
         }
     }
-    lchfs_format::RecordCrypto::plaintext()
+    Err(FsckError::KeyRequired)
 }
 
 /// Every currently-live root: the current superblock's root, plus every
@@ -314,7 +315,7 @@ fn pool_crypto(vdev_roots: &[&Path]) -> lchfs_format::RecordCrypto {
 pub fn collect_live_roots(pool_root: &Path) -> Result<Vec<Hash32>, FsckError> {
     let slot = read_superblock(pool_root)?;
     let mut roots = vec![slot.root_hash];
-    let crypto = pool_crypto(&[pool_root]);
+    let crypto = pool_crypto(&[pool_root])?;
 
     let reader = SegmentReader::open(pool_root, slot.root_location.segment_id, StreamKind::Meta)
         .map_err(|e| FsckError::Io(format!("opening root object segment: {e}")))?;
@@ -607,7 +608,14 @@ pub fn check_devices(vdev_roots: &[&Path], live_roots: &[Hash32]) -> FsckReport 
             return report;
         }
     };
-    let crypto = pool_crypto(vdev_roots);
+    let crypto = match pool_crypto(vdev_roots) {
+        Ok(c) => c,
+        Err(e) => {
+            let mut report = FsckReport::default();
+            report.errors.push(e);
+            return report;
+        }
+    };
     let mut walker = Walker::new(vdev_roots[0].to_path_buf(), scanned, crypto);
     for &root in live_roots {
         walker.walk_root(root);
@@ -644,7 +652,14 @@ pub fn verify_index_devices(vdev_roots: &[&Path], live_roots: &[Hash32]) -> Fsck
         }
     };
 
-    let crypto = pool_crypto(vdev_roots);
+    let crypto = match pool_crypto(vdev_roots) {
+        Ok(c) => c,
+        Err(e) => {
+            let mut report = FsckReport::default();
+            report.errors.push(e);
+            return report;
+        }
+    };
     let mut walker = Walker::new(pool_root.to_path_buf(), scanned, crypto);
     for &root in live_roots {
         walker.walk_root(root);
@@ -744,7 +759,6 @@ pub fn check_replicas(vdev_roots: &[&Path]) -> FsckReport {
     if vdev_roots.is_empty() {
         return report;
     }
-    let crypto = pool_crypto(vdev_roots);
 
     // Superblocks: membership, then currency.
     let mut members: Vec<(u16, &Path, SuperblockSlot)> = Vec::with_capacity(vdev_roots.len());
@@ -804,6 +818,16 @@ pub fn check_replicas(vdev_roots: &[&Path]) -> FsckReport {
             });
         }
     }
+
+    // Only once the devices are known to be one pool: a foreign device's
+    // keyring would otherwise turn "wrong pool" into "key required".
+    let crypto = match pool_crypto(vdev_roots) {
+        Ok(c) => c,
+        Err(e) => {
+            report.errors.push(e);
+            return report;
+        }
+    };
 
     // Records: scan each device independently, then compare.
     let mut scans: Vec<(u16, &Path, HashMap<Hash32, ExtentLocation>)> = Vec::with_capacity(members.len());

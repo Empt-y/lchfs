@@ -169,6 +169,14 @@ pub enum KeyringError {
     Io(#[from] io::Error),
     #[error("keyrings on this pool's devices disagree: {0}")]
     Diverged(String),
+    /// The newest keyring refuses this key while an older generation is
+    /// also present. The older one is never used instead -- it may hold a
+    /// key since changed or revoked.
+    #[error(
+        "the newest keyring (generation {generation}) does not accept this key ({detail}); an older keyring is \
+         present but is never used in its place, since it may hold a key that has since been changed or revoked"
+    )]
+    NewestRefuses { generation: u64, detail: String },
 }
 
 /// How to open a slot.
@@ -798,7 +806,9 @@ pub fn read_all(roots: &[&Path]) -> Result<Vec<(PathBuf, LockedKeyring)>, Keyrin
     Ok(found)
 }
 
-/// What `unlock_newest` found.
+/// What `unlock_newest` found. (`Debug` shows no key material: the
+/// keyring key and epoch keys are `Key32`s, which print redacted.)
+#[derive(Debug)]
 pub struct Unlocked {
     pub ring: UnlockedKeyring,
     /// The winning keyring file, byte for byte -- what the stale roots
@@ -808,26 +818,45 @@ pub struct Unlocked {
     pub stale: Vec<PathBuf>,
 }
 
-/// Unlocks the newest keyring across `roots` that `how` opens and whose
-/// MAC holds. A newer copy that fails its MAC -- planted, or damaged in a
-/// way the checksum missed -- is passed over for the next genuine one,
-/// and reported, so the caller can rewrite it.
+/// Unlocks the newest genuine keyring across `roots`.
+///
+/// Only the newest generation is ever unlocked. An older one is used in its
+/// place for exactly one reason: the newer one is *proven* forged -- a slot
+/// opens it but its MAC or an epoch check fails, which nothing holding the
+/// real keyring key would produce. If the newest merely refuses this key,
+/// that is an error, never a cue to fall back: an older generation may hold
+/// a passphrase since changed or a slot since revoked, and unlocking it
+/// would bring that key back -- and "repairing" the newer devices down to it
+/// would spread the rollback, and destroy any epoch key only the newer
+/// generation held. (Found in review: that is what this function used to
+/// do.)
+///
+/// `stale` names only roots whose keyring is missing, older, or forged --
+/// never one holding a newer genuine generation.
 pub fn unlock_newest(roots: &[&Path], how: &Unlock<'_>) -> Result<Unlocked, KeyringError> {
     let all = read_all(roots)?;
     if all.is_empty() {
         return Err(KeyringError::Malformed("no keyring on any device"));
     }
-    let mut rejected = Vec::new();
-    let mut last = KeyringError::NoMatchingSlot;
-    for (root, locked) in &all {
+    let mut generations: Vec<u64> = all.iter().map(|(_, k)| k.body.generation).collect();
+    generations.sort_unstable_by(|a, b| b.cmp(a));
+    generations.dedup();
+    let mut forged: Vec<PathBuf> = Vec::new();
+    for (i, &generation) in generations.iter().enumerate() {
+        // `read_all` guarantees every copy of one generation is identical.
+        let (_, locked) = all
+            .iter()
+            .find(|(_, k)| k.body.generation == generation)
+            .expect("generation came from this list");
         match locked.unlock(how) {
             Ok(ring) => {
-                let generation = ring.body.generation;
                 let stale: Vec<PathBuf> = roots
                     .iter()
-                    .filter(|r| !all.iter().any(|(p, k)| p == *r && k.body.generation == generation))
+                    .filter(|r| {
+                        !all.iter().any(|(p, k)| p == *r && k.body.generation >= generation)
+                    })
                     .map(|r| r.to_path_buf())
-                    .chain(rejected)
+                    .chain(forged)
                     .collect();
                 return Ok(Unlocked {
                     ring,
@@ -835,14 +864,23 @@ pub fn unlock_newest(roots: &[&Path], how: &Unlock<'_>) -> Result<Unlocked, Keyr
                     stale,
                 });
             }
-            Err(e @ (KeyringError::Tampered | KeyringError::EpochCheck(_))) => {
-                rejected.push(root.clone());
-                last = e;
+            Err(KeyringError::Tampered | KeyringError::EpochCheck(_)) => {
+                forged.extend(
+                    all.iter()
+                        .filter(|(_, k)| k.body.generation == generation)
+                        .map(|(p, _)| p.clone()),
+                );
             }
-            Err(e) => last = e,
+            Err(e) if i + 1 < generations.len() => {
+                return Err(KeyringError::NewestRefuses {
+                    generation,
+                    detail: e.to_string(),
+                });
+            }
+            Err(e) => return Err(e),
         }
     }
-    Err(last)
+    Err(KeyringError::Tampered)
 }
 
 #[cfg(test)]
@@ -1073,6 +1111,33 @@ mod tests {
         seed.extend_from_slice(b"aad!");
         seed.extend_from_slice(&envelope::seal(&Key32::from_bytes([7; 32]), b"aad!", b"payload"));
         std::fs::write(env_dir.join("valid-envelope"), seed).unwrap();
+    }
+
+    /// Review finding: a passphrase changed while one mirror was away must
+    /// not come back when the old passphrase is tried, and the device that
+    /// has the newer keyring must never be "repaired" down to the older one.
+    #[test]
+    fn an_older_keyring_is_never_unlocked_in_place_of_a_newer_one() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let roots: Vec<&Path> = vec![a.path(), b.path()];
+        let mut ring = UnlockedKeyring::create(UUID, Padding::Padme, pass_slot(b"old")).unwrap();
+        let g1 = ring.to_file();
+        assert!(write_all(&roots, &g1).is_empty());
+        // Passphrase changed with b offline: only a gets generation 2.
+        let new_id = ring.add_slot(pass_slot(b"new")).unwrap();
+        ring.remove_slot(0).unwrap();
+        assert_ne!(new_id, 0);
+        let g2 = ring.to_file();
+        write_on(roots[0], &g2).unwrap();
+
+        let err = unlock_newest(&roots, &Unlock::Passphrase(b"old")).unwrap_err();
+        assert!(matches!(err, KeyringError::NewestRefuses { generation: 2, .. }), "{err}");
+        assert_eq!(std::fs::read(path_on(roots[0])).unwrap(), g2, "the newer keyring was left alone");
+
+        let got = unlock_newest(&roots, &Unlock::Passphrase(b"new")).unwrap();
+        assert_eq!(got.ring.body.generation, 2);
+        assert_eq!(got.stale, vec![roots[1].to_path_buf()], "only the older device is stale");
     }
 
     #[test]

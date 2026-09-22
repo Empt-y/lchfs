@@ -39,9 +39,15 @@ use std::collections::BTreeMap;
 /// `flags` bit marking a sealed record; the low 15 bits are its epoch.
 pub const SEALED_FLAG: u16 = 0x8000;
 const AAD_PREFIX: &[u8] = b"lchfs-record-v1";
-/// Largest inner plaintext a sealed record may claim (matches the
-/// store's record ceiling with room for the inner header and padding).
-const MAX_INNER_LEN: usize = 64 * 1024 * 1024;
+/// Largest inner plaintext a sealed record may claim: anything the store
+/// can legitimately seal -- a payload up to `MAX_RECORD_LEN`, plus its inner
+/// header, Padmé-rounded. This bounds what `open` will allocate for; it must
+/// never be *smaller* than what `seal` produces, or a record is written that
+/// can never be read back (an earlier 64 MiB bound did exactly that to large
+/// InoMaps and chunk lists).
+fn max_inner_len() -> usize {
+    padme::padded_len(crate::MAX_RECORD_LEN as u64 + 1024 * 1024) as usize
+}
 
 /// The epoch a record was written under; 0 for a plaintext record.
 pub fn record_epoch(header: &ExtentRecordHeader) -> u16 {
@@ -295,7 +301,7 @@ impl RecordCrypto {
         };
         let inner = envelope::open(keys.record_key(), &aad(&self.pool_uuid, header), &payload)
             .map_err(|_| SealError::Authentication)?;
-        if inner.len() > MAX_INNER_LEN {
+        if inner.len() > max_inner_len() {
             return Err(SealError::Malformed("inner plaintext too large"));
         }
         let mut cursor = std::io::Cursor::new(inner.as_slice());
@@ -304,7 +310,7 @@ impl RecordCrypto {
             bincode::DefaultOptions::new()
                 .with_fixint_encoding()
                 .allow_trailing_bytes()
-                .with_limit(MAX_INNER_LEN as u64)
+                .with_limit(max_inner_len() as u64)
                 .deserialize_from(&mut cursor)
                 .map_err(|_| SealError::Malformed("inner header does not decode"))?
         };
@@ -406,6 +412,20 @@ mod tests {
             Err(SealError::BelowMinimum { epoch: 0, min: 1 })
         );
         assert!(RecordCrypto::plaintext().open(&plain_header, b"x".to_vec()).is_ok());
+    }
+
+    /// A sealed record larger than the old 64 MiB open bound -- a big
+    /// InoMap or chunk list -- must read back. Anything seal can produce for
+    /// a payload within the record ceiling, open must accept.
+    #[test]
+    fn a_large_sealed_record_reads_back() {
+        let c = crypto(Padding::Padme);
+        let payload = vec![0x5au8; 70 * 1024 * 1024];
+        let (epoch, hash) = c.address(&payload);
+        let (header, env) = c.seal(epoch, ExtentKind::IndirectHashList, hash, CodecId::None, payload.len() as u32, &payload, vec![]);
+        let opened = c.open(&header, env).unwrap();
+        assert_eq!(opened.payload.len(), payload.len());
+        assert!(max_inner_len() as u64 >= crate::MAX_RECORD_LEN as u64);
     }
 
     #[test]

@@ -36,7 +36,7 @@ pub const SEGMENT_HEADER_PAGE_SIZE: u64 = 4096;
 const MAX_HEADER_LEN: usize = 16 * 1024 * 1024;
 /// The largest record any stream can hold; a header claiming more is
 /// corrupt, whatever its checksum says.
-pub const MAX_RECORD_LEN: u32 = 512 * 1024 * 1024;
+pub use lchfs_format::MAX_RECORD_LEN;
 /// `header_len` a resync will consider. A real header is a few dozen
 /// bytes plus 32 per backpointer, and nothing writes more than a handful;
 /// `MAX_HEADER_LEN` is the read path's generous ceiling, but a resync
