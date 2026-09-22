@@ -19,7 +19,7 @@ use crate::segment::{SegmentReader, SegmentWriter, delta_segment_dir};
 use crate::vdevs::VdevSet;
 use std::sync::Arc;
 use lchfs_format::{
-    DeltaLogEntry, ExtentKind, ExtentLocation, Hash32, SHARD_SUPERBLOCK_MAGIC, ShardSuperblockSlot,
+    DeltaLogEntry, ExtentKind, ExtentLocation, Hash32, RecordCrypto, SHARD_SUPERBLOCK_MAGIC, ShardSuperblockSlot,
     compute_shard_superblock_slot_checksum, finalize_shard_superblock_slot_checksum,
 };
 use std::fs::OpenOptions;
@@ -193,20 +193,28 @@ impl ShardDeltaLog {
     /// shard's own tiny superblock slot. Cost is O(this shard's dirty data
     /// since its own last local checkpoint) -- unrelated shards are
     /// unaffected.
+    ///
+    /// Each record's `content_hash` must be its address in `crypto`'s
+    /// current epoch -- the caller computed them from this same snapshot --
+    /// and every record, the entry included, is sealed in that epoch.
     pub fn commit(
         &mut self,
         ino: u64,
         new_object_hash: Hash32,
         records: &[ShardCommitRecord],
+        crypto: &RecordCrypto,
     ) -> io::Result<()> {
+        let record_epoch = crypto.current_epoch();
         for record in records {
-            let appended = self.writer.append(
+            let appended = crate::crypto::append_fresh(
+                &mut self.writer,
+                crypto,
+                record_epoch,
                 record.kind,
                 record.content_hash,
                 lchfs_format::CodecId::None,
                 record.encoded.len() as u32,
                 &record.encoded,
-                Vec::new(),
             );
             self.report_faults();
             appended?;
@@ -219,14 +227,16 @@ impl ShardDeltaLog {
             epoch,
         };
         let encoded = lchfs_format::encode(&entry).map_err(decode_error)?;
-        let entry_hash = Hash32::of(&encoded);
-        let appended = self.writer.append(
+        let entry_hash = crypto.address_in(record_epoch, &encoded);
+        let appended = crate::crypto::append_fresh(
+            &mut self.writer,
+            crypto,
+            record_epoch,
             ExtentKind::DeltaLogEntry,
             entry_hash,
             lchfs_format::CodecId::None,
             encoded.len() as u32,
             &encoded,
-            Vec::new(),
         );
         self.report_faults();
         let loc = appended?;
@@ -329,7 +339,12 @@ impl ShardDeltaLog {
     /// record counts once -- from the first device where it reads back and
     /// verifies -- so a torn or rotted copy on one device neither ends the
     /// scan early nor replays twice.
-    pub fn replay_since(&self, watermark: u64) -> io::Result<ReplayResult> {
+    ///
+    /// A sealed record's outer kind says nothing (it is always `Sealed`),
+    /// so sealed records are opened with `crypto` to learn whether they are
+    /// entries; one that opens on no device is reported like an unreadable
+    /// entry, since it may have been one.
+    pub fn replay_since(&self, watermark: u64, crypto: &RecordCrypto) -> io::Result<ReplayResult> {
         let mut segment_ids: Vec<u64> = Vec::new();
         for root in &self.vdev_roots {
             segment_ids.extend(delta_segment_ids(root, self.shard_id)?);
@@ -357,8 +372,28 @@ impl ShardDeltaLog {
                         len: header.record_len,
                     };
                     if !seen.contains(&offset) {
-                        if header.kind == ExtentKind::DeltaLogEntry {
-                            if let Ok((_h, bytes)) = reader.read_record(loc)
+                        if lchfs_format::is_sealed(&header) {
+                            match reader.read_record_with(loc, crypto) {
+                                Ok((effective, bytes)) if effective.kind == ExtentKind::DeltaLogEntry => {
+                                    if let Ok(entry) = lchfs_format::decode::<DeltaLogEntry>(&bytes) {
+                                        entries.push(entry);
+                                        seen.insert(offset);
+                                        unreadable.remove(&offset);
+                                    } else {
+                                        unreadable.insert(offset);
+                                    }
+                                }
+                                Ok(_) => {
+                                    locations.push((header.content_hash, loc));
+                                    seen.insert(offset);
+                                    unreadable.remove(&offset);
+                                }
+                                Err(_) => {
+                                    unreadable.insert(offset);
+                                }
+                            }
+                        } else if header.kind == ExtentKind::DeltaLogEntry {
+                            if let Ok((_h, bytes)) = reader.read_record_with(loc, crypto)
                                 && let Ok(entry) = lchfs_format::decode::<DeltaLogEntry>(&bytes)
                             {
                                 entries.push(entry);

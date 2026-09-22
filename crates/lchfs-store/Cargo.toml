@@ -22,6 +22,7 @@ thiserror = { workspace = true }
 blake3 = { workspace = true }
 serde = { workspace = true }
 nix = { workspace = true, features = ["fs", "user"] }
+arc-swap = { workspace = true }
 
 [features]
 # Test-only: lets a test declare a device root dead so every replica

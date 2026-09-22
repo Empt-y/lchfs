@@ -14,7 +14,7 @@ use crate::segment::SegmentWriter;
 use crate::vdevs::VdevSet;
 use crossbeam::deque::{Injector, Steal};
 use crossbeam::queue::ArrayQueue;
-use lchfs_format::{CodecId, ExtentKind, ExtentLocation, Hash32, StreamKind};
+use lchfs_format::{CodecId, ExtentKind, ExtentLocation, ExtentRecordHeader, Hash32, StreamKind};
 use parking_lot::{Condvar, Mutex};
 use std::io;
 use std::path::PathBuf;
@@ -36,6 +36,9 @@ pub struct IngressOp {
     /// zero-copy shared via `Bytes` (ARCHITECTURE.md §5a: this buffer
     /// choice is deliberately kernel-migration-friendly).
     pub payload: bytes::Bytes,
+    /// Set when the prep pool sealed the chunk (an encrypted pool): the
+    /// record's final header, with `payload` its envelope.
+    pub sealed: Option<ExtentRecordHeader>,
     pub logical_offset: u64,
     /// Signaled once this op lands (or fails). `Pool::write` (E.6) blocks
     /// on this per chunk before returning — see the plan's design decision
@@ -89,6 +92,7 @@ struct ShardDataWriter {
 }
 
 impl ShardDataWriter {
+    #[allow(clippy::too_many_arguments)]
     fn append(
         &mut self,
         kind: ExtentKind,
@@ -96,6 +100,7 @@ impl ShardDataWriter {
         codec_id: CodecId,
         uncompressed_len: u32,
         payload: &[u8],
+        sealed: Option<&ExtentRecordHeader>,
     ) -> io::Result<Appended> {
         if self
             .writer
@@ -105,7 +110,10 @@ impl ShardDataWriter {
             self.close_segment()?;
         }
         let writer = self.open_segment()?;
-        let result = writer.append(kind, content_hash, codec_id, uncompressed_len, payload, Vec::new());
+        let result = match sealed {
+            Some(header) => writer.append_prebuilt(header, payload),
+            None => writer.append(kind, content_hash, codec_id, uncompressed_len, payload, Vec::new()),
+        };
         self.last_append = std::time::Instant::now();
         self.report_faults();
         Ok(Appended {
@@ -574,6 +582,7 @@ fn committer_loop(
                             op.codec_id,
                             op.uncompressed_len,
                             &op.payload,
+                            op.sealed.as_ref(),
                         )
                         .and_then(|appended| {
                             if let Some(index) = data.indexer.get() {

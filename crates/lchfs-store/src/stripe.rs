@@ -13,10 +13,10 @@
 
 use crate::backend::Vdev;
 use crate::segment::{
-    SEGMENT_HEADER_PAGE_SIZE, SegmentError, decode_record_bytes, segment_dir, verify_record,
+    SEGMENT_HEADER_PAGE_SIZE, SegmentError, decode_record_bytes, segment_dir, verify_record_with,
 };
 use lchfs_format::{
-    ExtentLocation, ExtentRecordHeader, Hash32, SEGMENT_HEADER_MAGIC, STRIPE_DESCRIPTOR_OFFSET,
+    ExtentLocation, ExtentRecordHeader, Hash32, RecordCrypto, SEGMENT_HEADER_MAGIC, STRIPE_DESCRIPTOR_OFFSET,
     SegmentHeader, SegmentState, StreamKind, StripeDescriptor, finalize_segment_header_checksum,
 };
 use reed_solomon_erasure::galois_8::ReedSolomon;
@@ -537,18 +537,38 @@ impl StripeReader {
     /// `SegmentReader::read_record` for a striped segment: the same framing
     /// and content-hash checks, on bytes assembled from shards.
     pub fn read_record(&self, loc: ExtentLocation) -> Result<(ExtentRecordHeader, Vec<u8>), SegmentError> {
+        self.read_record_with(loc, crate::segment::plaintext())
+    }
+
+    /// `read_record` for a record of any epoch (see
+    /// `SegmentReader::read_record_with`). An envelope that fails to
+    /// authenticate counts as a bad read, so a damaged shard is
+    /// reconstructed around exactly as a failed content hash would be.
+    pub fn read_record_with(
+        &self,
+        loc: ExtentLocation,
+        crypto: &RecordCrypto,
+    ) -> Result<(ExtentRecordHeader, Vec<u8>), SegmentError> {
         self.record_bytes(loc, |bytes| {
             let (header, payload) = decode_record_bytes(bytes)?;
-            let decompressed = verify_record(&header, payload, self.segment_id, loc.offset)?;
-            Ok((header, decompressed))
+            verify_record_with(&header, payload, self.segment_id, loc.offset, crypto)
         })
     }
 
     /// `SegmentReader::read_record_raw` for a striped segment.
     pub fn read_record_raw(&self, loc: ExtentLocation) -> Result<(ExtentRecordHeader, Vec<u8>), SegmentError> {
+        self.read_record_raw_with(loc, crate::segment::plaintext())
+    }
+
+    /// `SegmentReader::read_record_raw_with` for a striped segment.
+    pub fn read_record_raw_with(
+        &self,
+        loc: ExtentLocation,
+        crypto: &RecordCrypto,
+    ) -> Result<(ExtentRecordHeader, Vec<u8>), SegmentError> {
         self.record_bytes(loc, |bytes| {
             let (header, payload) = decode_record_bytes(bytes)?;
-            verify_record(&header, payload.clone(), self.segment_id, loc.offset)?;
+            verify_record_with(&header, payload.clone(), self.segment_id, loc.offset, crypto)?;
             Ok((header, payload))
         })
     }

@@ -6,6 +6,7 @@
 pub mod codec;
 pub mod extent;
 pub mod objects;
+pub mod sealed;
 pub mod segment;
 pub mod superblock;
 
@@ -15,6 +16,7 @@ pub use extent::{
     ExtentValidationError, compute_header_checksum, finalize_header_checksum, validate_header,
 };
 pub use lchfs_crypto::Hash32;
+pub use sealed::{Opened, RecordCrypto, SealError, is_sealed, record_epoch};
 pub use objects::{
     ChunkRef, ContentRef, DeltaLogEntry, DirEntry, DirectoryObject, InoMap, InoMapEntry,
     InodeKind, InodeObject, IndirectHashList, PoolParams, RootObject, SnapshotEntry,
@@ -47,4 +49,12 @@ pub use superblock::{
 ///   bump, so such a reader refuses the pool instead. A v2 reader handles v1
 ///   pools correctly with no migration, since a v1 chunk list simply has no
 ///   gaps.
-pub const FORMAT_VERSION: u32 = 4;
+///
+/// - v5: native encryption (`sealed`). A v5 pool can hold sealed records
+///   and a keyring, which a v4 reader would take for corruption; so v5 is
+///   written, and v4 is still *read* -- a v4 pool is a valid plaintext v5
+///   pool, because a plaintext record's layout did not change.
+pub const FORMAT_VERSION: u32 = 5;
+
+/// The oldest format this build still opens (see v5 above).
+pub const MIN_READABLE_FORMAT_VERSION: u32 = 4;

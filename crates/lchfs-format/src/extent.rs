@@ -23,6 +23,10 @@ pub enum ExtentKind {
     SnapshotTable = 4,
     RootObject = 5,
     DeltaLogEntry = 6,
+    /// An encrypted record: its real kind is inside the envelope (see
+    /// `sealed`). Appended last, so every earlier kind's encoding is
+    /// unchanged.
+    Sealed = 7,
 }
 
 /// Codec used to store an Extent Record's payload. See lchfs-compress for

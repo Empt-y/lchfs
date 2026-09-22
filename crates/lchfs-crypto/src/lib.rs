@@ -14,6 +14,7 @@ pub mod epoch;
 pub mod padme;
 pub mod secret;
 pub mod slots;
+pub mod testing;
 
 pub use secret::Key32;
 

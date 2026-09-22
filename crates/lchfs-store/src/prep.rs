@@ -16,8 +16,10 @@
 //! out of this crate-internal module so `prepare_chunk` stays a pure,
 //! independently testable function with no knowledge of the ingress ring.
 
+use crate::crypto::{self, CryptoHandle, Framed};
 use lchfs_compress::{Codec, CompressionDecision, ZstdCodec};
-use lchfs_format::{CodecId, ExtentLocation, Hash32};
+use lchfs_format::{CodecId, ExtentKind, ExtentLocation, ExtentRecordHeader, RecordCrypto};
+use lchfs_format::Hash32;
 use lchfs_index::{ChunkLocationCache, PendingDedupPins};
 use std::sync::Arc;
 
@@ -48,6 +50,11 @@ pub enum PreparedChunk {
         codec_id: CodecId,
         uncompressed_len: u32,
         payload: bytes::Bytes,
+        /// For an encrypted pool, the chunk already sealed: this is its
+        /// final record header, and `payload` is the envelope. Sealing
+        /// here, on the prep pool's workers, keeps encryption parallel
+        /// and out of the committer's per-shard lock.
+        sealed: Option<ExtentRecordHeader>,
     },
 }
 
@@ -64,7 +71,19 @@ pub enum PreparedChunk {
 /// and a concurrent GC/Coalesce pass must not reclaim it out from under
 /// that in-flight write.
 pub fn prepare_chunk(raw_bytes: &[u8], dedup_index: &ChunkLocationCache, pins: &PendingDedupPins) -> PreparedChunk {
-    let content_hash = Hash32::of(raw_bytes);
+    prepare_chunk_with(raw_bytes, dedup_index, pins, crate::segment::plaintext())
+}
+
+/// `prepare_chunk` for a pool of any epoch: the chunk is addressed in
+/// `crypto`'s current epoch and, if that is not the plaintext epoch,
+/// sealed in the same one.
+pub fn prepare_chunk_with(
+    raw_bytes: &[u8],
+    dedup_index: &ChunkLocationCache,
+    pins: &PendingDedupPins,
+    crypto: &RecordCrypto,
+) -> PreparedChunk {
+    let (epoch, content_hash) = crypto.address(raw_bytes);
     // Pin first, look up second -- the other order races coalesce's
     // reclaim (see `PendingDedupPins`'s doc comment).
     pins.pin(content_hash);
@@ -84,11 +103,25 @@ pub fn prepare_chunk(raw_bytes: &[u8], dedup_index: &ChunkLocationCache, pins: &
         }
     };
 
+    let uncompressed_len = raw_bytes.len() as u32;
+    let (framed, payload) = crypto::frame(
+        crypto,
+        epoch,
+        ExtentKind::RawChunk,
+        content_hash,
+        codec_id,
+        uncompressed_len,
+        bytes::Bytes::from(payload),
+    );
     PreparedChunk::New {
         content_hash,
         codec_id,
-        uncompressed_len: raw_bytes.len() as u32,
-        payload: bytes::Bytes::from(payload),
+        uncompressed_len,
+        payload,
+        sealed: match framed {
+            Framed::Plain => None,
+            Framed::Sealed(header) => Some(header),
+        },
     }
 }
 
@@ -98,10 +131,21 @@ pub struct IngestPreparationPool {
     pool: rayon::ThreadPool,
     dedup_index: Arc<ChunkLocationCache>,
     dedup_pins: Arc<PendingDedupPins>,
+    crypto: CryptoHandle,
 }
 
 impl IngestPreparationPool {
+    /// A pool for a plaintext pool.
     pub fn new(worker_count: usize, dedup_index: Arc<ChunkLocationCache>, dedup_pins: Arc<PendingDedupPins>) -> Self {
+        Self::with_crypto(worker_count, dedup_index, dedup_pins, crypto::plaintext_handle())
+    }
+
+    pub fn with_crypto(
+        worker_count: usize,
+        dedup_index: Arc<ChunkLocationCache>,
+        dedup_pins: Arc<PendingDedupPins>,
+        crypto: CryptoHandle,
+    ) -> Self {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(worker_count.max(1))
             .thread_name(|i| format!("lchfs-prep-{i}"))
@@ -111,6 +155,7 @@ impl IngestPreparationPool {
             pool,
             dedup_index,
             dedup_pins,
+            crypto,
         }
     }
 
@@ -125,7 +170,8 @@ impl IngestPreparationPool {
     pub fn submit(&self, task: PrepTask) -> PreparedChunk {
         let dedup_index = &self.dedup_index;
         let dedup_pins = &self.dedup_pins;
+        let crypto = self.crypto.load();
         self.pool
-            .install(|| prepare_chunk(&task.raw_bytes, dedup_index, dedup_pins))
+            .install(|| prepare_chunk_with(&task.raw_bytes, dedup_index, dedup_pins, &crypto))
     }
 }

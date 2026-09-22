@@ -13,7 +13,7 @@ use lchfs_format::{
     CodecId, EXTENT_RECORD_MAGIC, ExtentKind, ExtentLocation, ExtentRecordHeader,
     ExtentValidationError, Hash32, SEGMENT_HEADER_MAGIC, SegmentFooter, SegmentHeader,
     SegmentState, StreamKind, finalize_header_checksum, finalize_segment_footer_checksum,
-    finalize_segment_header_checksum, validate_header,
+    finalize_segment_header_checksum, validate_header, RecordCrypto, SealError,
 };
 use crate::backend::Vdev;
 use std::fs::{File, OpenOptions};
@@ -92,6 +92,8 @@ pub enum SegmentError {
     Io(#[from] io::Error),
     #[error("header validation failed: {0}")]
     Validation(#[from] ExtentValidationError),
+    #[error("{0}")]
+    Sealed(#[from] SealError),
     #[error("content hash mismatch for record at segment {segment_id} offset {offset}: expected {expected:?}, got {actual:?}")]
     ContentHash {
         segment_id: u64,
@@ -541,8 +543,28 @@ impl SegmentWriter {
             .len() as u32;
         header.record_len = 4 + header_len + payload.len() as u32;
         finalize_header_checksum(&mut header);
-        let encoded = lchfs_format::encode(&header).expect("ExtentRecordHeader encoding is infallible");
-        debug_assert_eq!(encoded.len() as u32, header_len);
+        self.append_prebuilt(&header, payload)
+    }
+
+    /// Appends a record whose header is already final -- a sealed record
+    /// (`RecordCrypto::seal` built its header, and bound it into the
+    /// envelope's authentication, so it must be written exactly as it is),
+    /// or a record being copied forward byte for byte by coalesce, heal or
+    /// resilver. Refuses a header whose `record_len` does not match.
+    pub fn append_prebuilt(&mut self, header: &ExtentRecordHeader, payload: &[u8]) -> io::Result<ExtentLocation> {
+        let encoded = lchfs_format::encode(header).expect("ExtentRecordHeader encoding is infallible");
+        let header_len = encoded.len() as u32;
+        if header.record_len != 4 + header_len + payload.len() as u32 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "record_len {} does not match a {header_len}-byte header and {}-byte payload",
+                    header.record_len,
+                    payload.len()
+                ),
+            ));
+        }
+        let content_hash = header.content_hash;
 
         let record_offset = self.cursor;
         // Every replica gets the identical record at the identical offset.
@@ -774,25 +796,28 @@ pub fn decode_payload(
     header: &ExtentRecordHeader,
     payload: Vec<u8>,
 ) -> Result<Vec<u8>, SegmentError> {
-    if header.codec_id == CodecId::None {
+    decompress(header.codec_id, header.uncompressed_len, payload)
+}
+
+/// `decode_payload` on the fields themselves -- for a sealed record they
+/// come from inside the envelope, not from its outer header.
+pub fn decompress(codec_id: CodecId, uncompressed_len: u32, payload: Vec<u8>) -> Result<Vec<u8>, SegmentError> {
+    if codec_id == CodecId::None {
         return Ok(payload);
     }
     // The decompressor allocates `uncompressed_len` up front, and that
     // field is a u32 off the disk. A checksum catches a bit flip; it does
     // not stop a deliberately written 4 GiB, and one such header must not
     // be able to take the whole process down on a read.
-    if header.uncompressed_len > MAX_RECORD_LEN {
+    if uncompressed_len > MAX_RECORD_LEN {
         return Err(SegmentError::Io(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "corrupted record: uncompressed_len {} exceeds the {MAX_RECORD_LEN}-byte record limit",
-                header.uncompressed_len
-            ),
+            format!("corrupted record: uncompressed_len {uncompressed_len} exceeds the {MAX_RECORD_LEN}-byte record limit"),
         )));
     }
     use lchfs_compress::{Codec, ZstdCodec};
     ZstdCodec
-        .decompress(&payload, header.uncompressed_len as usize)
+        .decompress(&payload, uncompressed_len as usize)
         .map_err(|e| {
             SegmentError::Io(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -944,9 +969,34 @@ pub fn verify_record(
     segment_id: u64,
     offset: u32,
 ) -> Result<Vec<u8>, SegmentError> {
-    let decompressed = decode_payload(header, payload)?;
-    if let Err(_verify_err) = lchfs_crypto::verify(&decompressed, header.content_hash) {
-        let actual = Hash32::of(&decompressed);
+    verify_record_with(header, payload, segment_id, offset, plaintext()).map(|(_, bytes)| bytes)
+}
+
+/// The crypto every plaintext-only entry point (`read_record`,
+/// `verify_record`, ...) reads with: epoch 0 and no keys, so a sealed
+/// record is refused with `KeyRequired` rather than misread.
+pub fn plaintext() -> &'static RecordCrypto {
+    static PLAINTEXT: std::sync::LazyLock<RecordCrypto> = std::sync::LazyLock::new(RecordCrypto::plaintext);
+    &PLAINTEXT
+}
+
+/// The whole content half of the mandatory check sequence, for a record of
+/// any epoch: open the envelope if it is sealed (authenticating it),
+/// decompress, and check the content hash in the record's own epoch.
+/// Returns the record's *effective* header -- the outer one, with the
+/// kind, codec, lengths and backpointers a sealed record keeps inside --
+/// and the logical bytes.
+pub fn verify_record_with(
+    header: &ExtentRecordHeader,
+    payload: Vec<u8>,
+    segment_id: u64,
+    offset: u32,
+    crypto: &RecordCrypto,
+) -> Result<(ExtentRecordHeader, Vec<u8>), SegmentError> {
+    let opened = crypto.open(header, payload)?;
+    let compressed_len = opened.payload.len() as u32;
+    let decompressed = decompress(opened.codec_id, opened.uncompressed_len, opened.payload)?;
+    if let Err(actual) = crypto.verify(opened.epoch, &decompressed, header.content_hash) {
         return Err(SegmentError::ContentHash {
             segment_id,
             offset,
@@ -954,7 +1004,13 @@ pub fn verify_record(
             actual,
         });
     }
-    Ok(decompressed)
+    let mut effective = header.clone();
+    effective.kind = opened.kind;
+    effective.codec_id = opened.codec_id;
+    effective.uncompressed_len = opened.uncompressed_len;
+    effective.compressed_len = compressed_len;
+    effective.backpointers = opened.backpointers;
+    Ok((effective, decompressed))
 }
 
 impl SegmentReader {
@@ -965,20 +1021,18 @@ impl SegmentReader {
         &self,
         loc: ExtentLocation,
     ) -> Result<(ExtentRecordHeader, Vec<u8>), SegmentError> {
+        self.read_record_with(loc, plaintext())
+    }
+
+    /// `read_record` for a record of any epoch `crypto` holds keys for.
+    /// The header returned is the effective one (see `verify_record_with`).
+    pub fn read_record_with(
+        &self,
+        loc: ExtentLocation,
+        crypto: &RecordCrypto,
+    ) -> Result<(ExtentRecordHeader, Vec<u8>), SegmentError> {
         let (header, payload) = self.read_raw(loc)?;
-        let decompressed = decode_payload(&header, payload)?;
-
-        if let Err(_verify_err) = lchfs_crypto::verify(&decompressed, header.content_hash) {
-            let actual = Hash32::of(&decompressed);
-            return Err(SegmentError::ContentHash {
-                segment_id: self.segment_id,
-                offset: loc.offset,
-                expected: header.content_hash,
-                actual,
-            });
-        }
-
-        Ok((header, decompressed))
+        verify_record_with(&header, payload, self.segment_id, loc.offset, crypto)
     }
 
     /// Like `read_record`, but returns the *raw* (still-compressed, if
@@ -996,19 +1050,21 @@ impl SegmentReader {
         &self,
         loc: ExtentLocation,
     ) -> Result<(ExtentRecordHeader, Vec<u8>), SegmentError> {
+        self.read_record_raw_with(loc, plaintext())
+    }
+
+    /// `read_record_raw` for a record of any epoch: fully verified (a
+    /// sealed record is opened and its content hash checked), but what
+    /// comes back is the *outer* header and the payload exactly as stored
+    /// -- the envelope, for a sealed record -- ready for `append_prebuilt`
+    /// to copy forward byte for byte, without re-encrypting.
+    pub fn read_record_raw_with(
+        &self,
+        loc: ExtentLocation,
+        crypto: &RecordCrypto,
+    ) -> Result<(ExtentRecordHeader, Vec<u8>), SegmentError> {
         let (header, payload) = self.read_raw(loc)?;
-        let decompressed = decode_payload(&header, payload.clone())?;
-
-        if let Err(_verify_err) = lchfs_crypto::verify(&decompressed, header.content_hash) {
-            let actual = Hash32::of(&decompressed);
-            return Err(SegmentError::ContentHash {
-                segment_id: self.segment_id,
-                offset: loc.offset,
-                expected: header.content_hash,
-                actual,
-            });
-        }
-
+        verify_record_with(&header, payload.clone(), self.segment_id, loc.offset, crypto)?;
         Ok((header, payload))
     }
 

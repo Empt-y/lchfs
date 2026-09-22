@@ -202,6 +202,7 @@ pub struct LockedKeyring {
     body: KeyringBody,
     mac: [u8; 32],
     body_bytes: Vec<u8>,
+    file: Vec<u8>,
 }
 
 /// An unlocked keyring: KK in hand, every epoch key unwrapped and checked.
@@ -300,7 +301,12 @@ pub fn parse(bytes: &[u8]) -> Result<LockedKeyring, KeyringError> {
         .deserialize(&body_bytes)
         .map_err(|_| KeyringError::Malformed("body does not decode"))?;
     let mac: [u8; 32] = bytes[FIXED + body_len..checksum_at].try_into().unwrap();
-    Ok(LockedKeyring { body, mac, body_bytes })
+    Ok(LockedKeyring {
+        body,
+        mac,
+        body_bytes,
+        file: bytes.to_vec(),
+    })
 }
 
 fn encode_file(body: &KeyringBody, kk: &Key32) -> Vec<u8> {
@@ -320,6 +326,11 @@ fn encode_file(body: &KeyringBody, kk: &Key32) -> Vec<u8> {
 impl LockedKeyring {
     pub fn body(&self) -> &KeyringBody {
         &self.body
+    }
+
+    /// The file this was parsed from, byte for byte.
+    pub fn file_bytes(&self) -> &[u8] {
+        &self.file
     }
 
     /// Tries every slot `how` could open, then checks the MAC and every
@@ -787,11 +798,21 @@ pub fn read_all(roots: &[&Path]) -> Result<Vec<(PathBuf, LockedKeyring)>, Keyrin
     Ok(found)
 }
 
+/// What `unlock_newest` found.
+pub struct Unlocked {
+    pub ring: UnlockedKeyring,
+    /// The winning keyring file, byte for byte -- what the stale roots
+    /// should be brought up to.
+    pub file: Vec<u8>,
+    /// Roots whose keyring is missing, older, or was passed over.
+    pub stale: Vec<PathBuf>,
+}
+
 /// Unlocks the newest keyring across `roots` that `how` opens and whose
 /// MAC holds. A newer copy that fails its MAC -- planted, or damaged in a
 /// way the checksum missed -- is passed over for the next genuine one,
 /// and reported, so the caller can rewrite it.
-pub fn unlock_newest(roots: &[&Path], how: &Unlock<'_>) -> Result<(UnlockedKeyring, Vec<PathBuf>), KeyringError> {
+pub fn unlock_newest(roots: &[&Path], how: &Unlock<'_>) -> Result<Unlocked, KeyringError> {
     let all = read_all(roots)?;
     if all.is_empty() {
         return Err(KeyringError::Malformed("no keyring on any device"));
@@ -808,7 +829,11 @@ pub fn unlock_newest(roots: &[&Path], how: &Unlock<'_>) -> Result<(UnlockedKeyri
                     .map(|r| r.to_path_buf())
                     .chain(rejected)
                     .collect();
-                return Ok((ring, stale));
+                return Ok(Unlocked {
+                    ring,
+                    file: locked.file.clone(),
+                    stale,
+                });
             }
             Err(e @ (KeyringError::Tampered | KeyringError::EpochCheck(_))) => {
                 rejected.push(root.clone());
@@ -983,9 +1008,10 @@ mod tests {
         let g2 = ring.to_file();
         write_on(roots[0], &g2).unwrap();
 
-        let (opened, stale) = unlock_newest(&roots, &Unlock::Passphrase(b"second")).unwrap();
-        assert_eq!(opened.body.generation, 2);
-        assert_eq!(stale.len(), 2, "the two devices still on generation 1");
+        let got = unlock_newest(&roots, &Unlock::Passphrase(b"second")).unwrap();
+        assert_eq!(got.ring.body.generation, 2);
+        assert_eq!(got.file, g2);
+        assert_eq!(got.stale.len(), 2, "the two devices still on generation 1");
 
         // A planted generation-9 keyring with the real slots but no valid MAC.
         let mut planted = parse(&g2).unwrap();
@@ -1000,9 +1026,9 @@ mod tests {
         let sum = blake3::hash(&forged);
         forged.extend_from_slice(sum.as_bytes());
         write_on(roots[2], &forged).unwrap();
-        let (opened, stale) = unlock_newest(&roots, &Unlock::Passphrase(b"pw")).unwrap();
-        assert_eq!(opened.body.generation, 2, "the forgery is passed over");
-        assert!(stale.contains(&roots[2].to_path_buf()));
+        let got = unlock_newest(&roots, &Unlock::Passphrase(b"pw")).unwrap();
+        assert_eq!(got.ring.body.generation, 2, "the forgery is passed over");
+        assert!(got.stale.contains(&roots[2].to_path_buf()));
     }
 
     #[test]

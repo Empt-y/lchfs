@@ -9,6 +9,11 @@ license.workspace = true
 # TPM2 key slots. Links the system tpm2-tss library, so it is opt-in for
 # the crate and turned on by the CLI.
 tpm = ["dep:tss-esapi"]
+# Test-suite switch: every pool the engine creates or opens without an
+# explicit key is encrypted with, and unlocked by, a fixed test passphrase,
+# so the whole existing suite runs against encrypted pools. Never enable
+# it in a build anyone stores data with -- the "key" is in this source.
+test-encrypt-all = []
 
 [dependencies]
 blake3 = { workspace = true }

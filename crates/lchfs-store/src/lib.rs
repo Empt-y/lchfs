@@ -34,6 +34,7 @@ pub(crate) mod background;
 pub mod backend;
 pub mod checkpoint;
 pub mod coalesce;
+pub mod crypto;
 pub(crate) mod dag_walk;
 pub mod dedup;
 pub mod delta_log;
@@ -49,16 +50,17 @@ use delta_log::{ShardCommitRecord, ShardDeltaLog};
 use ingress::{CommitterPool, IngressOp};
 use lchfs_chunk::{ChunkBoundary, Chunker, FastCdcChunker};
 use lchfs_format::{
-    ChunkRef, CodecId, ContentRef, DirEntry, DirectoryObject, ExtentKind, ExtentLocation,
+    RecordCrypto, ChunkRef, CodecId, ContentRef, DirEntry, DirectoryObject, ExtentKind, ExtentLocation,
     ExtentRecordHeader, Hash32,
     InoMap, InoMapEntry, InodeKind, InodeObject, IndirectHashList, PoolParams, RootObject,
     SnapshotEntry, SnapshotTable, StreamKind, SuperblockSlot, SUPERBLOCK_MAGIC, SUPERBLOCK_SLOT_COUNT,
     SUPERBLOCK_SLOT_SIZE, XattrBlob, compute_superblock_slot_checksum,
     finalize_superblock_slot_checksum,
 };
+use lchfs_crypto::keyring::{self, NewSlot, Padding, Unlock, UnlockedKeyring};
 use lchfs_index::{ChunkLocationCache, IndexError, IndexStore, PendingDedupPins, RedbIndex};
 use parking_lot::{Mutex, RwLock};
-use prep::{IngestPreparationPool, PrepTask, PreparedChunk, prepare_chunk};
+use prep::{IngestPreparationPool, PrepTask, PreparedChunk, prepare_chunk_with};
 use segment::{SegmentError, SegmentReader, SegmentWriter};
 use vdevs::VdevSet;
 use std::collections::{HashMap, HashSet};
@@ -272,6 +274,15 @@ pub enum PoolError {
     NotASymlink(u64),
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+    /// The pool is encrypted and was opened without a key.
+    #[error("this pool is encrypted: a key is required to open it")]
+    KeyRequired,
+    #[error("keyring: {0}")]
+    Keyring(#[from] lchfs_crypto::keyring::KeyringError),
+    /// A sealed record that could not be opened: wrong key, a modified
+    /// record, an epoch this pool no longer holds, or a downgrade.
+    #[error("{0}")]
+    Sealed(lchfs_format::SealError),
     #[error(
         "pool was written with on-disk format version {found}, but this build only supports up to {supported} -- upgrade lchfs to open it"
     )]
@@ -368,6 +379,8 @@ impl From<SegmentError> for PoolError {
             SegmentError::Io(io) => PoolError::Io(io),
             SegmentError::Validation(v) => PoolError::Format(v.to_string()),
             SegmentError::ContentHash { expected, .. } => PoolError::IntegrityFailure(expected),
+            SegmentError::Sealed(lchfs_format::SealError::KeyRequired) => PoolError::KeyRequired,
+            SegmentError::Sealed(e) => PoolError::Sealed(e),
         }
     }
 }
@@ -756,6 +769,36 @@ impl std::fmt::Debug for Pool {
     }
 }
 
+/// An encrypted pool's keyring, unlocked, with the exact bytes it was
+/// last written as -- what a device that joins, or was found stale at
+/// mount, is given.
+struct KeyringState {
+    ring: UnlockedKeyring,
+    file: Vec<u8>,
+}
+
+/// How to encrypt a pool at creation: padding, and the slots it starts
+/// with (at least one, and at least one that is not a TPM -- see
+/// `UnlockedKeyring::create`).
+pub struct EncryptionSetup<'a> {
+    pub padding: Padding,
+    pub slots: Vec<NewSlot<'a>>,
+}
+
+impl EncryptionSetup<'static> {
+    /// What `test-encrypt-all` creates every pool with.
+    fn for_tests() -> Self {
+        Self {
+            padding: Padding::Padme,
+            slots: vec![NewSlot::Passphrase {
+                passphrase: lchfs_crypto::testing::TEST_PASSPHRASE,
+                cost: lchfs_crypto::testing::TEST_KDF,
+                label: "test-encrypt-all".into(),
+            }],
+        }
+    }
+}
+
 struct PoolShared {
     pool_root: PathBuf,
     pool_params: PoolParams,
@@ -770,6 +813,12 @@ struct PoolShared {
     /// the pool would stop matching its own vdevs.
     pool_uuid: [u8; 16],
     vdev_id: u16,
+    /// How records are addressed, sealed and opened (see `crypto`). A
+    /// plaintext pool holds `RecordCrypto::plaintext()` for its lifetime.
+    crypto: crypto::CryptoHandle,
+    /// An encrypted pool's unlocked keyring and the file it was last
+    /// written as; `None` for a plaintext pool.
+    keyring: Mutex<Option<KeyringState>>,
     /// The online device set (ARCHITECTURE.md §15.10), shared with every
     /// fan-out writer so a device attached live reaches them. Also holds
     /// each member's superblock ring and root lock, and knows the pool's
@@ -880,6 +929,21 @@ impl Pool {
         Self::create_replicated(&[pool_root], params)
     }
 
+    /// `create`, encrypted (ARCHITECTURE.md §18): every record sealed,
+    /// every address keyed, a keyring on every device.
+    pub fn create_encrypted(pool_root: &Path, params: PoolParams, setup: EncryptionSetup<'_>) -> Result<Self, PoolError> {
+        Self::create_replicated_encrypted(&[pool_root], params, setup)
+    }
+
+    /// `create_replicated`, encrypted.
+    pub fn create_replicated_encrypted(
+        vdev_roots: &[&Path],
+        params: PoolParams,
+        setup: EncryptionSetup<'_>,
+    ) -> Result<Self, PoolError> {
+        Self::create_set(vdev_roots, params, Some(setup))
+    }
+
     /// Creates a pool spanning `vdev_roots`, replicating every write across
     /// all of them (ARCHITECTURE.md §15.3). `vdev_roots[0]` is vdev 0 and
     /// holds the pool's `INDEX.redb` (§15.10 -- the index is a rebuildable
@@ -890,6 +954,13 @@ impl Pool {
     /// is what lets `open_replicated` tell "these devices belong together"
     /// from "someone passed a foreign device".
     pub fn create_replicated(vdev_roots: &[&Path], params: PoolParams) -> Result<Self, PoolError> {
+        if lchfs_crypto::testing::TEST_ENCRYPT_ALL {
+            return Self::create_set(vdev_roots, params, Some(EncryptionSetup::for_tests()));
+        }
+        Self::create_set(vdev_roots, params, None)
+    }
+
+    fn create_set(vdev_roots: &[&Path], params: PoolParams, encryption: Option<EncryptionSetup<'_>>) -> Result<Self, PoolError> {
         if vdev_roots.is_empty() {
             return Err(PoolError::InvalidArgument(
                 "a pool needs at least one vdev".into(),
@@ -913,6 +984,35 @@ impl Pool {
             members.push(VdevSet::member(Vdev::new(id as u16, root.to_path_buf()), backend, lock));
         }
         let vdev_set = Arc::new(VdevSet::new(members, vdev_roots.len() as u16));
+
+        // A fresh pool mints its identity once, here -- before anything
+        // else, because an encrypted pool's keyring is bound to it.
+        let pool_uuid = lchfs_format::generate_pool_uuid()?;
+        let (crypto_state, keyring_state) = match encryption {
+            None => (lchfs_format::RecordCrypto::plaintext(), None),
+            Some(setup) => {
+                let mut slots = setup.slots.into_iter();
+                let first = slots
+                    .next()
+                    .ok_or_else(|| PoolError::InvalidArgument("an encrypted pool needs at least one key slot".into()))?;
+                let mut ring = UnlockedKeyring::create(pool_uuid, setup.padding, first)?;
+                for slot in slots {
+                    ring.add_slot(slot)?;
+                }
+                let file = ring.to_file();
+                // Every device gets the keyring before the pool writes a
+                // single record: a device without one is only recoverable
+                // from its peers.
+                if let Some((root, e)) = keyring::write_all(vdev_roots, &file).into_iter().next() {
+                    return Err(PoolError::Io(std::io::Error::other(format!(
+                        "writing the keyring to {}: {e}",
+                        root.display()
+                    ))));
+                }
+                (crypto::from_keyring(&ring), Some(KeyringState { ring, file }))
+            }
+        };
+        let crypto = crypto::handle(crypto_state);
 
         let mut inodes = HashMap::new();
         let (now_secs, now_nanos) = now_unix();
@@ -980,10 +1080,11 @@ impl Pool {
                 }),
             });
         }
-        let prep_pool = IngestPreparationPool::new(
+        let prep_pool = IngestPreparationPool::with_crypto(
             committer_thread_count(),
             Arc::clone(&dedup_index),
             Arc::clone(&dedup_pins),
+            Arc::clone(&crypto),
         );
 
         let namespace = Namespace {
@@ -1001,11 +1102,10 @@ impl Pool {
             pool_root: pool_root.to_path_buf(),
             pool_params: params,
             stripe_policy: Mutex::new(StripePolicyParams::from(&params)),
-            // A fresh pool mints its identity once, here. Phase 1 pools are
-            // single-vdev; `vdev_count` becomes meaningful when a pool is
-            // created across several devices (ARCHITECTURE.md §15.6).
-            pool_uuid: lchfs_format::generate_pool_uuid()?,
+            pool_uuid,
             vdev_id: 0,
+            crypto: Arc::clone(&crypto),
+            keyring: Mutex::new(keyring_state),
             vdevs: Arc::clone(&vdev_set),
             mount_resilver: Vec::new(),
             attach_lock: Mutex::new(()),
@@ -1064,6 +1164,23 @@ impl Pool {
         Self::open_replicated(&[pool_root])
     }
 
+    /// `open` for a pool that may be encrypted: `unlock` opens its keyring
+    /// (it is ignored for a plaintext pool -- `is_encrypted` says which it
+    /// was). Plain `open` on an encrypted pool is `PoolError::KeyRequired`.
+    pub fn open_with(pool_root: &Path, unlock: &Unlock<'_>) -> Result<Self, PoolError> {
+        Self::open_set(&[pool_root], false, Some(unlock))
+    }
+
+    /// `open_replicated`, unlocking as `open_with` does.
+    pub fn open_replicated_with(vdev_roots: &[&Path], unlock: &Unlock<'_>) -> Result<Self, PoolError> {
+        Self::open_set(vdev_roots, false, Some(unlock))
+    }
+
+    /// `open_degraded`, unlocking as `open_with` does.
+    pub fn open_degraded_with(vdev_roots: &[&Path], unlock: &Unlock<'_>) -> Result<Self, PoolError> {
+        Self::open_set(vdev_roots, true, Some(unlock))
+    }
+
     /// Opens a pool spanning `vdev_roots`, which must be given in `vdev_id`
     /// order with vdev 0 first, and must be the complete set.
     ///
@@ -1080,7 +1197,7 @@ impl Pool {
     /// missing is `open_degraded`'s job, and it should never happen because
     /// someone left a path off the command line (§15.8).
     pub fn open_replicated(vdev_roots: &[&Path]) -> Result<Self, PoolError> {
-        Self::open_set(vdev_roots, false)
+        Self::open_set(vdev_roots, false, None)
     }
 
     /// Opens a pool with some of its devices absent (ARCHITECTURE.md §15.8).
@@ -1096,7 +1213,7 @@ impl Pool {
     /// it is stale, and the next full mount rebuilds its index and
     /// resilvers it like any other member that missed writes.
     pub fn open_degraded(vdev_roots: &[&Path]) -> Result<Self, PoolError> {
-        Self::open_set(vdev_roots, true)
+        Self::open_set(vdev_roots, true, None)
     }
 
     /// Adds a blank device to an existing pool, offline (ARCHITECTURE.md
@@ -1362,6 +1479,16 @@ impl Pool {
         uuid: Option<[u8; 16]>,
         allow_degraded: bool,
     ) -> Result<Self, PoolError> {
+        Self::open_discovered_with(candidates, uuid, allow_degraded, None)
+    }
+
+    /// `open_discovered` for a pool that may be encrypted.
+    pub fn open_discovered_with(
+        candidates: &[&Path],
+        uuid: Option<[u8; 16]>,
+        allow_degraded: bool,
+        unlock: Option<&Unlock<'_>>,
+    ) -> Result<Self, PoolError> {
         let discovered = Self::discover(candidates, uuid)?;
         let pool = match discovered.pools.as_slice() {
             [] => {
@@ -1379,9 +1506,9 @@ impl Pool {
         };
         let roots: Vec<&Path> = pool.members.iter().map(|(_, _, p)| p.as_path()).collect();
         if pool.missing.is_empty() {
-            Self::open_replicated(&roots)
+            Self::open_set(&roots, false, unlock)
         } else if allow_degraded {
-            Self::open_degraded(&roots)
+            Self::open_set(&roots, true, unlock)
         } else {
             Err(PoolError::Format(format!(
                 "pool {} is missing vdevs {:?}; mount degraded to proceed without them",
@@ -1391,13 +1518,18 @@ impl Pool {
         }
     }
 
-    fn open_set(given_roots: &[&Path], allow_missing: bool) -> Result<Self, PoolError> {
+    fn open_set(given_roots: &[&Path], allow_missing: bool, unlock: Option<&Unlock<'_>>) -> Result<Self, PoolError> {
         let Membership {
             members,
             vdev_count,
             stale_vdevs,
             ..
         } = check_membership(given_roots, allow_missing)?;
+
+        // Before a single record is read: an encrypted pool's root object
+        // is sealed, and so is everything the mount walks.
+        let member_roots: Vec<&Path> = members.iter().map(|(_, r)| *r).collect();
+        let (crypto_state, keyring_state) = unlock_pool(&member_roots, unlock)?;
 
         let pool_root = members[0].1;
         let mut set_members = Vec::with_capacity(members.len());
@@ -1470,6 +1602,7 @@ impl Pool {
             &vdevs,
             &persisted_index,
             &mut mount_repairs,
+            &crypto_state,
             StreamKind::Meta,
             slot.root_hash,
             slot.root_location,
@@ -1485,6 +1618,7 @@ impl Pool {
             &vdevs,
             &persisted_index,
             &mut mount_repairs,
+            &crypto_state,
             StreamKind::Meta,
             root.inomap_hash,
             inomap_loc,
@@ -1504,6 +1638,7 @@ impl Pool {
                 &vdevs,
                 &persisted_index,
                 &mut mount_repairs,
+                &crypto_state,
                 StreamKind::Meta,
                 entry.current_object_hash,
                 loc,
@@ -1521,6 +1656,7 @@ impl Pool {
                     &vdevs,
                     &persisted_index,
                     &mut mount_repairs,
+                    &crypto_state,
                     StreamKind::Meta,
                     *dir_hash,
                     dir_loc,
@@ -1595,7 +1731,7 @@ impl Pool {
                 .get(shard_id as usize)
                 .copied()
                 .unwrap_or(0);
-            let replay = shard_log.replay_since(watermark)?;
+            let replay = shard_log.replay_since(watermark, &crypto_state)?;
 
             if !replay.entries.is_empty() {
                 // The InodeObject/IndirectHashList records this shard's
@@ -1622,7 +1758,7 @@ impl Pool {
                             entry.ino
                         ))
                     })?;
-                    let bytes = mount_read_delta(&vdevs, &mut mount_repairs, shard_id, *loc)?;
+                    let bytes = mount_read_delta(&vdevs, &mut mount_repairs, &crypto_state, shard_id, *loc)?;
                     let inode: InodeObject = lchfs_format::decode(&bytes)
                         .map_err(|e| PoolError::Format(e.to_string()))?;
 
@@ -1641,7 +1777,7 @@ impl Pool {
                                 entry.ino
                             ))
                         })?;
-                        let ihl_bytes = mount_read_delta(&vdevs, &mut mount_repairs, shard_id, *ihl_loc)?;
+                        let ihl_bytes = mount_read_delta(&vdevs, &mut mount_repairs, &crypto_state, shard_id, *ihl_loc)?;
                         let ihl: IndirectHashList = lchfs_format::decode(&ihl_bytes)
                             .map_err(|e| PoolError::Format(e.to_string()))?;
                         // Place each chunk at its own `logical_offset`, for
@@ -1669,6 +1805,7 @@ impl Pool {
                                 &vdevs,
                                 &persisted_index,
                                 &mut mount_repairs,
+                                &crypto_state,
                                 StreamKind::Data,
                                 chunk.content_hash,
                                 *chunk_loc,
@@ -1702,10 +1839,12 @@ impl Pool {
         dedup_index.extend(persisted_index.iter_preferred_locations()?);
         drop(locations);
         let dedup_pins = Arc::new(PendingDedupPins::new());
-        let prep_pool = IngestPreparationPool::new(
+        let crypto = crypto::handle(crypto_state);
+        let prep_pool = IngestPreparationPool::with_crypto(
             committer_thread_count(),
             Arc::clone(&dedup_index),
             Arc::clone(&dedup_pins),
+            Arc::clone(&crypto),
         );
 
         let namespace = Namespace {
@@ -1747,6 +1886,8 @@ impl Pool {
             // would make the pool stop matching its own vdevs.
             pool_uuid: slot.pool_uuid,
             vdev_id: slot.vdev_id,
+            crypto: Arc::clone(&crypto),
+            keyring: Mutex::new(keyring_state),
             vdevs: Arc::clone(&vdev_set),
             mount_resilver: Vec::new(),
             attach_lock: Mutex::new(()),
@@ -2912,7 +3053,7 @@ impl PoolShared {
             // gone; never healed as a mirror -- a missing shard is
             // rebuilt by resilver, not by a read.
             let outcome = self.stripe_reader(preferred.segment_id).and_then(|r| {
-                let bytes = r.read_record(preferred)?.1;
+                let bytes = r.read_record_with(preferred, &self.crypto.load())?.1;
                 if r.reconstructs(preferred) {
                     self.note_missing_shards(&r.desc.devices, &r.missing(), hash, preferred, ino);
                 }
@@ -2954,7 +3095,7 @@ impl PoolShared {
                 .get_or_open(preferred_vdev, preferred.segment_id, kind, || {
                     self.vdev_root(preferred_vdev)
                 });
-            match reader.and_then(|r| r.read_record(preferred).map_err(PoolError::from)) {
+            match reader.and_then(|r| r.read_record_with(preferred, &self.crypto.load()).map_err(PoolError::from)) {
                 Ok((_header, bytes)) => return Ok(bytes),
                 Err(_) if moved() => return self.read_verified_from(hash, kind, ino, retries - 1),
                 Err(e) => Some(e),
@@ -2999,9 +3140,11 @@ impl PoolShared {
             match self.read_raw_from_vdev(vdev_id, loc, kind) {
                 Ok((header, raw)) => {
                     self.repair_stats.failovers.fetch_add(1, Ordering::Relaxed);
-                    // Already verified by `read_record_raw`, so this cannot
-                    // fail on the codec path it just took.
-                    let bytes = segment::decode_payload(&header, raw.clone())?;
+                    // Already verified by `read_raw_from_vdev`; opening it
+                    // again yields the logical bytes (for a sealed record
+                    // `raw` is the envelope, which is what heal copies).
+                    let bytes =
+                        segment::verify_record_with(&header, raw.clone(), loc.segment_id, loc.offset, &self.crypto.load())?.1;
                     for (bad, location, detail) in failed {
                         let healed = match self.heal_one(bad, kind, &header, &raw) {
                             Ok(_) => true,
@@ -3038,12 +3181,12 @@ impl PoolShared {
         kind: StreamKind,
     ) -> Result<(ExtentRecordHeader, Vec<u8>), PoolError> {
         if vdev_id == stripe::STRIPED {
-            return Ok(self.stripe_reader(loc.segment_id)?.read_record_raw(loc)?);
+            return Ok(self.stripe_reader(loc.segment_id)?.read_record_raw_with(loc, &self.crypto.load())?);
         }
         let reader = self
             .readers
             .get_or_open(vdev_id, loc.segment_id, kind, || self.vdev_root(vdev_id))?;
-        Ok(reader.read_record_raw(loc)?)
+        Ok(reader.read_record_raw_with(loc, &self.crypto.load())?)
     }
 
     fn is_online(&self, vdev_id: u16) -> bool {
@@ -3122,14 +3265,9 @@ impl PoolShared {
                 e.insert(SegmentWriter::create(&[root.as_path()], id, kind, 0)?)
             }
         };
-        Ok(writer.append(
-            header.kind,
-            header.content_hash,
-            header.codec_id,
-            header.uncompressed_len,
-            raw_payload,
-            header.backpointers.clone(),
-        )?)
+        // Byte for byte: a sealed record's header is bound into its
+        // envelope and must not be rebuilt.
+        Ok(writer.append_prebuilt(header, raw_payload)?)
     }
 
     /// Makes a batch of heal appends durable, then records their
@@ -3778,6 +3916,7 @@ impl PoolShared {
                 codec_id,
                 uncompressed_len,
                 payload,
+                sealed,
             } => {
                 let (tx, rx) = crossbeam::channel::bounded(1);
                 self.committer_pool.push(IngressOp {
@@ -3786,6 +3925,7 @@ impl PoolShared {
                     codec_id,
                     uncompressed_len,
                     payload,
+                    sealed,
                     logical_offset,
                     completion: tx,
                 });
@@ -3813,12 +3953,13 @@ impl PoolShared {
     pub fn debug_force_duplicate_chunk(&self, raw_bytes: &[u8]) -> Result<ExtentLocation, PoolError> {
         let throwaway = ChunkLocationCache::new();
         let throwaway_pins = PendingDedupPins::new();
-        let prepared = prepare_chunk(raw_bytes, &throwaway, &throwaway_pins);
+        let prepared = prepare_chunk_with(raw_bytes, &throwaway, &throwaway_pins, &self.crypto.load());
         let PreparedChunk::New {
             content_hash,
             codec_id,
             uncompressed_len,
             payload,
+            sealed,
         } = prepared
         else {
             unreachable!("a fresh, empty ChunkLocationCache never produces a Dedup hit");
@@ -3831,6 +3972,7 @@ impl PoolShared {
             codec_id,
             uncompressed_len,
             payload,
+            sealed,
             logical_offset: 0,
             completion: tx,
         });
@@ -3851,7 +3993,9 @@ impl PoolShared {
         value: &T,
     ) -> Result<(Hash32, ExtentLocation), PoolError> {
         let encoded = lchfs_format::encode(value).map_err(|e| PoolError::Format(e.to_string()))?;
-        let hash = Hash32::of(&encoded);
+        // One snapshot for the address and the seal (see `crypto`).
+        let crypto = self.crypto.load();
+        let (epoch, hash) = crypto.address(&encoded);
         if let Some((loc, vdev_id)) = self.dedup_index.get_tagged(hash)
             && self.is_meta_record(loc, vdev_id)
         {
@@ -3866,13 +4010,15 @@ impl PoolShared {
             self.close_meta_writer(&mut slot)?;
         }
         let meta_writer = self.open_meta_writer(&mut slot)?;
-        let appended = meta_writer.append(
+        let appended = crypto::append_fresh(
+            meta_writer,
+            &crypto,
+            epoch,
             kind,
             hash,
             CodecId::None,
             encoded.len() as u32,
             &encoded,
-            Vec::new(),
         );
         let faults = meta_writer.take_faults();
         let vdev_ids: Vec<u16> = meta_writer.vdev_ids().to_vec();
@@ -5332,6 +5478,9 @@ impl PoolShared {
             self.hydrate_file_state(ino)?;
         }
 
+        // One snapshot for every address below and the delta-log commit
+        // that seals them (see `crypto`).
+        let crypto = self.crypto.load();
         let mut records = Vec::new();
         let content_ref = if !is_chunked {
             let bytes = self
@@ -5349,7 +5498,7 @@ impl PoolShared {
             let ihl = IndirectHashList { chunks };
             let encoded =
                 lchfs_format::encode(&ihl).map_err(|e| PoolError::Format(e.to_string()))?;
-            let hash = Hash32::of(&encoded);
+            let hash = crypto.address(&encoded).1;
             records.push(ShardCommitRecord {
                 kind: ExtentKind::IndirectHashList,
                 content_hash: hash,
@@ -5389,7 +5538,7 @@ impl PoolShared {
             let inode = namespace.inodes.get_mut(&ino).ok_or(PoolError::NoSuchInode(ino))?;
             inode.content = content_ref;
             let encoded = lchfs_format::encode(inode).map_err(|e| PoolError::Format(e.to_string()))?;
-            let hash = Hash32::of(&encoded);
+            let hash = crypto.address(&encoded).1;
             records.push(ShardCommitRecord {
                 kind: ExtentKind::InodeObject,
                 content_hash: hash,
@@ -5400,7 +5549,7 @@ impl PoolShared {
 
         self.shard_delta_logs[shard_id as usize]
             .lock()
-            .commit(ino, new_object_hash, &records)?;
+            .commit(ino, new_object_hash, &records, &crypto)?;
 
         // `file_state` holds the finalized content and the ContentRef
         // names it; the session is the last thing a read could need, and
@@ -5872,18 +6021,20 @@ pub(crate) fn get_reader_lazy(
 /// the pool is not up yet, and scrub will find the bad copy on its own
 /// schedule. What matters is that a mirror with one rotten meta segment
 /// on vdev 0 still mounts.
+#[allow(clippy::too_many_arguments)]
 fn mount_read(
     readers: &mut SegmentReaders,
     vdevs: &[Vdev],
     index: &RedbIndex,
     repairs: &mut MountRepairs,
+    crypto: &RecordCrypto,
     kind: StreamKind,
     hash: Hash32,
     loc: ExtentLocation,
 ) -> Result<Vec<u8>, PoolError> {
     let primary = &vdevs[0];
     let primary_err = match get_reader(readers, &primary.root, primary.id, loc.segment_id, kind)
-        .and_then(|r| r.read_record(loc).map_err(PoolError::from))
+        .and_then(|r| r.read_record_with(loc, crypto).map_err(PoolError::from))
     {
         Ok((_, bytes)) => return Ok(bytes),
         Err(e) => e,
@@ -5903,7 +6054,7 @@ fn mount_read(
         // is just absent. Nothing is rebuilt here; resilver does that.
         let root_of = |id: u16| vdevs.iter().find(|v| v.id == id).map(|v| v.root.clone());
         if let Ok(reader) = stripe::StripeReader::open(sloc.segment_id, root_of, vdevs)
-            && let Ok((_, bytes)) = reader.read_record(sloc)
+            && let Ok((_, bytes)) = reader.read_record_with(sloc, crypto)
         {
             let missing = reader.missing();
             if reader.reconstructs(sloc) {
@@ -5945,7 +6096,7 @@ fn mount_read(
         );
         for candidate in candidates {
             let read = get_reader(readers, &vdev.root, vdev.id, candidate.segment_id, kind)
-                .and_then(|r| r.read_record(candidate).map_err(PoolError::from));
+                .and_then(|r| r.read_record_with(candidate, crypto).map_err(PoolError::from));
             if let Ok((_, bytes)) = read {
                 if primary_had_it {
                     tracing::warn!(
@@ -5968,6 +6119,7 @@ fn mount_read(
 fn mount_read_delta(
     vdevs: &[Vdev],
     repairs: &mut MountRepairs,
+    crypto: &RecordCrypto,
     shard_id: u32,
     loc: ExtentLocation,
 ) -> Result<Vec<u8>, PoolError> {
@@ -5975,7 +6127,7 @@ fn mount_read_delta(
     for vdev in vdevs {
         match SegmentReader::open_delta(&vdev.root, shard_id, loc.segment_id)
             .map_err(PoolError::from)
-            .and_then(|r| r.read_record(loc).map_err(PoolError::from))
+            .and_then(|r| r.read_record_with(loc, crypto).map_err(PoolError::from))
         {
             Ok((header, bytes)) => {
                 if let Some(e) = first_err {
@@ -6000,6 +6152,36 @@ fn mount_read_delta(
         }
     }
     Err(first_err.expect("at least one vdev"))
+}
+
+/// How a pool being opened reads its records: plaintext if no device has a
+/// keyring, else whatever the newest genuine keyring `unlock` opens says.
+/// Devices whose keyring is missing, older, or a forgery are given the
+/// genuine one on the way (best-effort: a device that cannot take it is
+/// only a redundancy loss, and the next mount tries again).
+fn unlock_pool(roots: &[&Path], unlock: Option<&Unlock<'_>>) -> Result<(RecordCrypto, Option<KeyringState>), PoolError> {
+    if !roots.iter().any(|r| keyring::exists_on(r)) {
+        return Ok((RecordCrypto::plaintext(), None));
+    }
+    let test_unlock = Unlock::Passphrase(lchfs_crypto::testing::TEST_PASSPHRASE);
+    let how = match unlock {
+        Some(u) => u,
+        None if lchfs_crypto::testing::TEST_ENCRYPT_ALL => &test_unlock,
+        None => return Err(PoolError::KeyRequired),
+    };
+    let found = keyring::unlock_newest(roots, how)?;
+    for root in &found.stale {
+        if let Err(e) = keyring::write_on(root, &found.file) {
+            tracing::warn!("keyring on {} is stale and could not be rewritten: {e}", root.display());
+        }
+    }
+    Ok((
+        crypto::from_keyring(&found.ring),
+        Some(KeyringState {
+            ring: found.ring,
+            file: found.file,
+        }),
+    ))
 }
 
 /// The highest Data/Meta segment id present under `vdev_root`, without

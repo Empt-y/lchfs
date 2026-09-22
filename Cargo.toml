@@ -49,6 +49,7 @@ zeroize = { version = "1.9.0", features = ["derive"] }
 getrandom = "0.3.4"
 tss-esapi = "7.7.0"
 hex = "0.4"
+arc-swap = "1.9"
 
 [package]
 name = "lchfs"
