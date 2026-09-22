@@ -1136,6 +1136,7 @@ impl Pool {
                     Arc::clone(&dedup_pins),
                 );
                 daemon.set_seal_generations(Arc::clone(&seal_generations));
+                daemon.set_crypto(Arc::clone(&crypto));
                 daemon
             }),
             dedup: Mutex::new(dedup::DedupScanner::new_on(
@@ -1921,6 +1922,7 @@ impl Pool {
                     Arc::clone(&dedup_pins),
                 );
                 daemon.set_seal_generations(Arc::clone(&seal_generations));
+                daemon.set_crypto(Arc::clone(&crypto));
                 daemon
             }),
             dedup: Mutex::new(dedup::DedupScanner::new_on(
@@ -1980,6 +1982,19 @@ impl Pool {
     /// pass synchronously.
     pub fn scrub(&self) -> Result<Vec<ScrubReport>, PoolError> {
         self.0.scrub()
+    }
+
+    /// True when this pool's content is sealed (a keyring is unlocked).
+    pub fn is_encrypted(&self) -> bool {
+        self.0.crypto.load().is_encrypted()
+    }
+
+    /// The unlocked keyring's own view of its configuration -- padding,
+    /// the current and minimum epoch, and any conversion in progress.
+    /// `None` for a plaintext pool. What `pool encryption-status` (still
+    /// to be built) reports from.
+    pub fn keyring_config(&self) -> Option<lchfs_crypto::keyring::KeyringConfig> {
+        self.0.keyring.lock().as_ref().map(|state| *state.ring.config())
     }
 
     /// True when this mount is running without some of the pool's devices
@@ -2367,6 +2382,16 @@ impl Pool {
     /// Test/tooling support -- see `PoolShared::debug_force_duplicate_chunk`.
     pub fn debug_force_duplicate_chunk(&self, raw_bytes: &[u8]) -> Result<ExtentLocation, PoolError> {
         self.0.debug_force_duplicate_chunk(raw_bytes)
+    }
+
+    /// The content address `raw_bytes` would be written under right now:
+    /// `Hash32::of(raw_bytes)` for a plaintext pool, the keyed address of
+    /// the current epoch for an encrypted one. Test/tooling support -- a
+    /// test working out which physical record corresponds to bytes it
+    /// already knows must use this, never recompute the hash itself,
+    /// since only the pool knows whether (and how) it is keyed.
+    pub fn debug_content_hash(&self, raw_bytes: &[u8]) -> Hash32 {
+        self.0.crypto.load().address(raw_bytes).1
     }
 
     /// Tooling support: the chunk list a file's content resolves to as
@@ -4129,6 +4154,18 @@ impl PoolShared {
         // A blank device has nothing to seal, but join_live no longer
         // seals -- the caller does, before the device is a member.
         self.seal_before_join(new_id, new_root)?;
+        // An encrypted pool's new device needs the keyring before it is a
+        // member too: without it, a mount that later has to fall back to
+        // this device alone (every other one lost) could not unlock the
+        // pool at all. Best-effort like the rest of attach -- a device
+        // that cannot take it yet is still usable through its peers, and
+        // the next write to the keyring (a slot change, a rekey) reaches
+        // it once it is online.
+        if let Some(state) = self.keyring.lock().as_ref()
+            && let Err(e) = keyring::write_on(new_root, &state.file)
+        {
+            tracing::warn!("writing the keyring to newly attached {}: {e}", new_root.display());
+        }
         let member = VdevSet::member(Vdev::new(new_id, new_root.to_path_buf()), backend, lock);
         let report = self.join_live(member)?;
         tracing::info!(
@@ -6633,10 +6670,12 @@ fn read_superblock(backend: &FileBackend) -> Result<Option<SuperblockSlot>, Pool
         // it. Skipping would silently fall back to an older, still-valid slot
         // written before the upgrade, i.e. mount a stale epoch and present it
         // as current: a far worse failure than refusing to open.
-        // A slot that decodes but says an older version: v3's layout is
-        // v4's, only the root object behind it differs (PoolParams grew
-        // its stripe policy), so the slot is the clearest place to refuse.
-        if slot.format_version < lchfs_format::FORMAT_VERSION {
+        // A slot older than this build's floor: e.g. v2's sparse-file
+        // semantics, which a v5 reader cannot correctly reconstruct.
+        // v4 is deliberately still accepted -- see lchfs_format::sealed's
+        // doc comment: an all-plaintext v4 pool decodes identically as a
+        // v5 one, no migration needed, so v5 both writes and reads it.
+        if slot.format_version < lchfs_format::MIN_READABLE_FORMAT_VERSION {
             return Err(PoolError::LegacyFormatVersion {
                 found: slot.format_version,
                 supported: lchfs_format::FORMAT_VERSION,

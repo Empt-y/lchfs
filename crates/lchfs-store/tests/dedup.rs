@@ -62,7 +62,7 @@ fn scanner_converges_a_forced_duplicate_to_one_canonical_location() {
     pool.checkpoint().unwrap();
 
     let merges = pool.run_dedup_pass().unwrap();
-    let hash = lchfs_format::Hash32::of(&shared);
+    let hash = pool.debug_content_hash(&shared);
     let relevant: Vec<_> = merges.iter().filter(|m| m.content_hash == hash).collect();
     assert_eq!(relevant.len(), 1, "expected exactly one merge for the forced-duplicate hash");
     // Which physical copy wins the deterministic tie-break depends on
@@ -98,7 +98,7 @@ fn loser_becomes_reclaimable_by_gc_after_convergence() {
     pool.checkpoint().unwrap();
 
     let forced_loc = pool.debug_force_duplicate_chunk(&shared).unwrap();
-    let hash = lchfs_format::Hash32::of(&shared);
+    let hash = pool.debug_content_hash(&shared);
     let merges = pool.run_dedup_pass().unwrap();
     let merge = merges
         .iter()
@@ -162,7 +162,7 @@ fn repeated_dedup_passes_are_idempotent() {
     pool.checkpoint().unwrap();
 
     let first = pool.run_dedup_pass().unwrap();
-    let hash = lchfs_format::Hash32::of(&shared);
+    let hash = pool.debug_content_hash(&shared);
     let first_merge = first
         .iter()
         .find(|m| m.content_hash == hash)

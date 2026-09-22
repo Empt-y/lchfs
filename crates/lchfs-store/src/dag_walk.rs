@@ -19,7 +19,7 @@ use crate::segment::SegmentReader;
 use crate::stripe::StripeReader;
 use crate::vdevs::VdevSet;
 use crate::{PoolError, SegmentReaders, StreamKind, Vdev, get_reader};
-use lchfs_format::{ContentRef, ExtentKind, ExtentLocation, Hash32, InoMap, InodeObject, IndirectHashList, RootObject};
+use lchfs_format::{ContentRef, ExtentKind, ExtentLocation, Hash32, InoMap, InodeObject, IndirectHashList, RecordCrypto, RootObject};
 use lchfs_index::{ChunkLocationCache, RedbIndex};
 use parking_lot::RwLock;
 use roaring::RoaringBitmap;
@@ -109,12 +109,12 @@ fn resolve_and_read(
         // what matters is the hash in the live set.
         let online = ctx.vdevs.online();
         let reader = StripeReader::open(loc.segment_id, |id| ctx.vdevs.root_of(id), &online)?;
-        let (header, bytes) = reader.read_record(loc)?;
+        let (header, bytes) = reader.read_record_with(loc, ctx.crypto)?;
         return Ok((header.kind, bytes));
     }
     let primary = ctx.primary;
     let reader: &SegmentReader = get_reader(readers, &primary.root, primary.id, loc.segment_id, stream)?;
-    let (header, bytes) = reader.read_record(loc)?;
+    let (header, bytes) = reader.read_record_with(loc, ctx.crypto)?;
     Ok((header.kind, bytes))
 }
 
@@ -123,6 +123,7 @@ fn resolve_and_read(
 pub(crate) struct WalkCtx<'a> {
     pub primary: &'a Vdev,
     pub vdevs: &'a VdevSet,
+    pub crypto: &'a RecordCrypto,
 }
 
 /// Marks `hash`'s own record live and, if it's a `RootObject`, walks

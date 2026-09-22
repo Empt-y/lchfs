@@ -83,12 +83,20 @@ fn errno_for(err: &PoolError) -> Errno {
         // the difference.
         PoolError::NoSuchXattr(_) => Errno::ENODATA,
         PoolError::InvalidArgument(_) => Errno::EINVAL,
-        // Both only reachable via Pool::open/create, which happen before the
+        // Only reachable via Pool::open/create, which happen before the
         // mount is serving callbacks -- mapped for exhaustiveness, not
-        // because a live FUSE request can produce either.
+        // because a live FUSE request can produce any of these.
         PoolError::UnsupportedFormatVersion { .. }
-        | PoolError::LegacyFormatVersion { .. } => Errno::EINVAL,
+        | PoolError::LegacyFormatVersion { .. }
+        | PoolError::KeyRequired
+        | PoolError::Keyring(_) => Errno::EINVAL,
         PoolError::PoolLocked(_) => Errno::EBUSY,
+        // A record that will not decrypt or authenticate -- wrong key
+        // (only possible if the keyring itself was corrupted after
+        // mount), a modified record, or an epoch this pool has since
+        // retired -- is exactly the same class of live failure as a
+        // plaintext hash mismatch.
+        PoolError::Sealed(_) => Errno::EIO,
     }
 }
 

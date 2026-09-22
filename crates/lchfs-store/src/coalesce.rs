@@ -12,6 +12,7 @@
 //! mark-and-sweep is the analysis step feeding this daemon, not a fourth
 //! independent one (see gc.rs's module doc comment).
 
+use crate::crypto::{self, CryptoHandle};
 use crate::gc::GcEngine;
 use crate::segment::{ScanEnd, self, SegmentReader, SegmentWriter};
 use crate::vdevs::VdevSet;
@@ -47,6 +48,10 @@ pub struct CoalesceDaemon {
     /// asked (`take_removed_segments`), so the pool can close the handles
     /// its reader cache still holds on them.
     removed_segments: Vec<u64>,
+    /// How to open and re-seal records during a repack. Plaintext for a
+    /// pool with no keys; set once at pool construction via
+    /// `set_crypto`, same as `set_seal_generations`.
+    crypto: CryptoHandle,
 }
 
 impl CoalesceDaemon {
@@ -63,7 +68,16 @@ impl CoalesceDaemon {
             vdevs,
             gc,
             removed_segments: Vec::new(),
+            crypto: crypto::plaintext_handle(),
         }
+    }
+
+    /// Installs the pool's record crypto, so repacks read and re-seal
+    /// records of any epoch the pool holds keys for, and can copy an
+    /// already-sealed record forward without re-encrypting it.
+    pub fn set_crypto(&mut self, crypto: CryptoHandle) {
+        self.gc.set_crypto(Arc::clone(&crypto));
+        self.crypto = crypto;
     }
 
     /// Every mirrored segment deleted since the last call. An open reader
@@ -230,7 +244,7 @@ impl CoalesceDaemon {
                     offset,
                     len: header.record_len,
                 };
-                if reader.read_record(loc).is_err() {
+                if reader.read_record_with(loc, &self.crypto.load()).is_err() {
                     clean = false;
                     break;
                 }
@@ -391,7 +405,7 @@ impl CoalesceDaemon {
                     offset,
                     len: header.record_len,
                 };
-                let (full, raw) = reader.read_record_raw(loc).map_err(to_io_err)?;
+                let (full, raw) = reader.read_record_raw_with(loc, &self.crypto.load()).map_err(to_io_err)?;
                 keep.push((full, raw));
             } else {
                 dead.push(header.content_hash);
@@ -403,14 +417,7 @@ impl CoalesceDaemon {
         if !keep.is_empty() {
             let mut writer = SegmentWriter::create_on(&online, new_id, StreamKind::Data, 0)?;
             for (header, raw) in &keep {
-                let new_loc = writer.append(
-                    header.kind,
-                    header.content_hash,
-                    header.codec_id,
-                    header.uncompressed_len,
-                    raw,
-                    header.backpointers.clone(),
-                )?;
+                let new_loc = writer.append_prebuilt(header, raw)?;
                 records.push((header.content_hash, new_loc));
             }
             written = writer.vdev_ids().to_vec();
@@ -477,6 +484,7 @@ impl CoalesceDaemon {
         let empty = RoaringBitmap::new();
         let live_bitmap = live.get(&old_id).unwrap_or(&empty);
         let pins = self.gc.pins();
+        let crypto = self.crypto.load();
 
         // Collect every live record's raw (still-compressed, if
         // applicable) bytes *before* creating anything -- a read failure
@@ -493,7 +501,7 @@ impl CoalesceDaemon {
                     offset,
                     len: header.record_len,
                 };
-                let (full_header, raw_payload) = reader.read_record_raw(loc).map_err(to_io_err)?;
+                let (full_header, raw_payload) = reader.read_record_raw_with(loc, &crypto).map_err(to_io_err)?;
                 live_records.push((full_header, raw_payload));
             } else {
                 dropped.push((offset, header));
@@ -514,7 +522,7 @@ impl CoalesceDaemon {
                     offset,
                     len: header.record_len,
                 };
-                let (full_header, raw_payload) = reader.read_record_raw(loc).map_err(to_io_err)?;
+                let (full_header, raw_payload) = reader.read_record_raw_with(loc, &crypto).map_err(to_io_err)?;
                 live_records.push((full_header, raw_payload));
             } else {
                 dead.push(header.content_hash);
@@ -538,14 +546,7 @@ impl CoalesceDaemon {
         let mut writer = SegmentWriter::create(&[root], new_id, StreamKind::Data, owner_shard)?;
         let mut relocations = Vec::with_capacity(live_records.len());
         for (header, raw_payload) in &live_records {
-            let new_loc = writer.append(
-                header.kind,
-                header.content_hash,
-                header.codec_id,
-                header.uncompressed_len,
-                raw_payload,
-                header.backpointers.clone(),
-            )?;
+            let new_loc = writer.append_prebuilt(header, raw_payload)?;
             relocations.push((header.content_hash, new_loc));
         }
         // A repack writes to one device; a failure here is the daemon's

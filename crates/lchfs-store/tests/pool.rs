@@ -263,9 +263,13 @@ fn corrupted_chunk_is_detected_on_read() {
     let pool = Pool::open(dir.path()).unwrap();
     let ino = pool.lookup(1, "f.bin").unwrap().unwrap();
     let result = pool.read(ino, 0, 5000);
+    // A plaintext pool reports this as a content-hash mismatch
+    // (IntegrityFailure); an encrypted one catches the same flipped byte
+    // earlier, as the sealed record's AEAD authentication failing --
+    // PoolError::Sealed, an equally valid detection of the same damage.
     assert!(
-        matches!(result, Err(PoolError::IntegrityFailure(_))),
-        "expected IntegrityFailure, got {result:?}"
+        matches!(result, Err(PoolError::IntegrityFailure(_)) | Err(PoolError::Sealed(_))),
+        "expected IntegrityFailure or Sealed, got {result:?}"
     );
 }
 

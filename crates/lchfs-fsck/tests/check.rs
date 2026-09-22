@@ -108,12 +108,18 @@ fn corrupted_chunk_payload_is_detected() {
     let live_roots = lchfs_fsck::collect_live_roots(dir.path()).unwrap();
     let report = lchfs_fsck::check(dir.path(), &live_roots);
     assert!(!report.is_clean(), "corruption should have been detected");
+    // A plaintext pool reports this as a content-hash mismatch. An
+    // encrypted one (`test-encrypt-all`) catches the very same flipped
+    // byte earlier and more definitively: it corrupts the sealed record's
+    // ciphertext, so AEAD authentication fails before a hash is ever
+    // computed -- reported as an unreadable object, not a hash mismatch.
+    // Either is the same finding by a different, equally valid mechanism.
     assert!(
-        report
-            .errors
-            .iter()
-            .any(|e| matches!(e, lchfs_fsck::FsckError::ContentHashMismatch { .. })),
-        "expected a ContentHashMismatch, got {:?}",
+        report.errors.iter().any(|e| matches!(
+            e,
+            lchfs_fsck::FsckError::ContentHashMismatch { .. } | lchfs_fsck::FsckError::UnreadableObject { .. }
+        )),
+        "expected a ContentHashMismatch or UnreadableObject, got {:?}",
         report.errors
     );
 }

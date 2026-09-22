@@ -16,7 +16,7 @@ use lchfs_format::{
     ExtentLocation, Hash32, SEGMENT_HEADER_MAGIC, STRIPE_DESCRIPTOR_OFFSET, SegmentHeader, SegmentState,
     StreamKind, StripeDescriptor, finalize_segment_header_checksum,
 };
-use lchfs_store::segment::{SEGMENT_HEADER_PAGE_SIZE, decode_record_bytes, verify_record};
+use lchfs_store::segment::{SEGMENT_HEADER_PAGE_SIZE, decode_record_bytes, verify_record_with};
 use reed_solomon_erasure::galois_8::ReedSolomon;
 use std::collections::HashMap;
 use std::fs::File;
@@ -104,9 +104,16 @@ impl Stripe {
     /// The full verifying read of one record, on bytes assembled from the
     /// shards: `SegmentReader::read_record`'s checks, same order.
     pub fn read_record(&self, loc: ExtentLocation) -> Result<Vec<u8>, String> {
+        self.read_record_with(loc, lchfs_store::segment::plaintext())
+    }
+
+    /// `read_record` for a record of any epoch `crypto` holds keys for.
+    pub fn read_record_with(&self, loc: ExtentLocation, crypto: &lchfs_format::RecordCrypto) -> Result<Vec<u8>, String> {
         let bytes = self.read_body(loc.offset as u64 - SEGMENT_HEADER_PAGE_SIZE, loc.len as u64)?;
         let (header, payload) = decode_record_bytes(bytes).map_err(|e| e.to_string())?;
-        verify_record(&header, payload, self.segment_id, loc.offset).map_err(|e| e.to_string())
+        verify_record_with(&header, payload, self.segment_id, loc.offset, crypto)
+            .map(|(_, bytes)| bytes)
+            .map_err(|e| e.to_string())
     }
 
 }

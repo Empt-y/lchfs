@@ -5,6 +5,11 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 
+[features]
+# See lchfs-crypto's Cargo.toml comment: forwarded so the whole workspace
+# test suite can build with one flag.
+test-encrypt-all = ["lchfs-crypto/test-encrypt-all"]
+
 [dependencies]
 lchfs-store = { workspace = true }
 lchfs-index = { workspace = true }

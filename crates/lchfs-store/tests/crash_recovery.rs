@@ -267,6 +267,20 @@ fn gc_mark_succeeds_after_checkpoint_following_fsync_only_crash_recovery() {
         std::sync::Arc::new(cache),
         std::sync::Arc::new(lchfs_index::PendingDedupPins::new()),
     );
+    // A bare GcEngine defaults to plaintext, same as a mounted pool would
+    // if it never installed one: under `test-encrypt-all` the pool this
+    // reopens is encrypted, so mark needs the same key to resolve
+    // anything at all -- exactly what `Pool::open` wires in internally
+    // via `unlock_pool`/`set_crypto`, reproduced here by hand since this
+    // test drives GcEngine directly, bypassing Pool.
+    if lchfs_crypto::keyring::exists_on(dir.path()) {
+        let unlocked = lchfs_crypto::keyring::unlock_newest(
+            &[dir.path()],
+            &lchfs_crypto::keyring::Unlock::Passphrase(lchfs_crypto::testing::TEST_PASSPHRASE),
+        )
+        .unwrap();
+        gc.set_crypto(lchfs_store::crypto::handle(lchfs_store::crypto::from_keyring(&unlocked.ring)));
+    }
     let live = gc.mark(&[root]);
     assert!(
         !live.is_empty(),

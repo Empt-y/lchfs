@@ -26,6 +26,7 @@ fn make_op(inode_id: u64, logical_offset: u64, payload: &[u8]) -> (IngressOp, cr
         codec_id: CodecId::None,
         uncompressed_len: payload.len() as u32,
         payload: bytes::Bytes::copy_from_slice(payload),
+        sealed: None,
         logical_offset,
         completion: tx,
     };

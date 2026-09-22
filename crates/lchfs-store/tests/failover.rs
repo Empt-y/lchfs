@@ -149,8 +149,12 @@ fn a_single_vdev_pool_still_reports_the_error() {
     let pool = Pool::open(a.path()).unwrap();
     let err = pool.read(ino, 0, payload().len() as u32).unwrap_err();
     let msg = err.to_string();
+    // A plaintext pool surfaces this as a content-hash mismatch or a
+    // corrupted-record decode failure; an encrypted one catches the same
+    // flipped byte earlier, as an AEAD authentication failure on the
+    // sealed record -- an equally valid "verification failed" outcome.
     assert!(
-        msg.contains("content hash mismatch") || msg.contains("corrupted record"),
+        msg.contains("content hash mismatch") || msg.contains("corrupted record") || msg.contains("failed authentication"),
         "expected the verification failure to surface, got: {err}"
     );
     assert_eq!(pool.repair_stats(), Default::default());

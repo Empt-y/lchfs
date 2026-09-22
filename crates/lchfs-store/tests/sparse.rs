@@ -40,6 +40,23 @@ fn deterministic_bytes(seed: u64, len: usize) -> Vec<u8> {
     out
 }
 
+/// This pool's record crypto, straight off its own keyring -- plaintext
+/// if it has none. Under `test-encrypt-all` the pool `chunk_list` reads
+/// is encrypted, so its meta objects are sealed and reading them raw off
+/// disk (as that helper deliberately does, bypassing `Pool`) needs this
+/// same key to open them.
+fn pool_crypto(pool_root: &std::path::Path) -> lchfs_format::RecordCrypto {
+    if !lchfs_crypto::keyring::exists_on(pool_root) {
+        return lchfs_format::RecordCrypto::plaintext();
+    }
+    let unlocked = lchfs_crypto::keyring::unlock_newest(
+        &[pool_root],
+        &lchfs_crypto::keyring::Unlock::Passphrase(lchfs_crypto::testing::TEST_PASSPHRASE),
+    )
+    .unwrap();
+    lchfs_store::crypto::from_keyring(&unlocked.ring)
+}
+
 /// The file's persisted chunk list, read back off disk through
 /// `lchfs-fsck`'s public scan plus a `SegmentReader` -- deliberately not via
 /// any `Pool` internals, so these tests assert against what actually landed
@@ -55,7 +72,7 @@ fn chunk_list(pool_root: &std::path::Path, pool: &Pool, ino: u64) -> IndirectHas
                 StreamKind::Meta,
             )
             .unwrap();
-            let (_header, bytes) = reader.read_record(loc).unwrap();
+            let (_header, bytes) = reader.read_record_with(loc, &pool_crypto(pool_root)).unwrap();
             lchfs_format::decode(&bytes).unwrap()
         }
         _ => IndirectHashList { chunks: Vec::new() },
@@ -86,6 +103,16 @@ fn live_bytes(pool_root: &std::path::Path, root: lchfs_format::Hash32) -> u64 {
         Arc::new(cache),
         Arc::new(PendingDedupPins::new()),
     );
+    // See crash_recovery.rs's identical fix: a bare GcEngine defaults to
+    // plaintext, but under `test-encrypt-all` this pool is encrypted.
+    if lchfs_crypto::keyring::exists_on(pool_root) {
+        let unlocked = lchfs_crypto::keyring::unlock_newest(
+            &[pool_root],
+            &lchfs_crypto::keyring::Unlock::Passphrase(lchfs_crypto::testing::TEST_PASSPHRASE),
+        )
+        .unwrap();
+        gc.set_crypto(lchfs_store::crypto::handle(lchfs_store::crypto::from_keyring(&unlocked.ring)));
+    }
     gc.mark(&[root]).by_segment.values().map(|bitmap| bitmap.len()).sum()
 }
 

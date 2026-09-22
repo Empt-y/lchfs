@@ -43,6 +43,16 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # The whole suite again with every pool the engine creates encrypted
+      # under a fixed test passphrase (lchfs-crypto's `test-encrypt-all`),
+      # so every existing test also exercises sealed records, keyed
+      # addressing and the keyring -- not just the tests written for them.
+      - name: Test (every pool encrypted)
+        run: cargo test --workspace --features lchfs-crypto/test-encrypt-all
+
+      - name: Clippy (every pool encrypted)
+        run: cargo clippy --workspace --all-targets --features lchfs-crypto/test-encrypt-all -- -D warnings
+
       # TPM2 key slots (the `tpm` feature, off by default because it links
       # the system tpm2-tss) against a throwaway software TPM -- never a
       # real one: the tests deliberately enter a wrong PIN, which counts

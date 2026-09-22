@@ -13,6 +13,7 @@
 //! only live extents" -- mark-and-sweep feeds directly into coalescing,
 //! it isn't a parallel concern.
 
+use crate::crypto::{self, CryptoHandle};
 use crate::segment::{SegmentReader, segment_ids_on};
 use crate::vdevs::VdevSet;
 use crate::{SegmentReaders, StreamKind, Vdev, dag_walk};
@@ -147,6 +148,10 @@ pub struct GcEngine {
     /// writer is running and every segment on disk is therefore already
     /// checkpointed; a mounted pool always installs one.
     seal_generations: Option<Arc<SealGenerations>>,
+    /// How to open sealed records during the mark walk. Plaintext for a
+    /// pool with no keys; installed once via `set_crypto`, same as
+    /// `set_seal_generations`.
+    crypto: CryptoHandle,
 }
 
 impl GcEngine {
@@ -192,7 +197,13 @@ impl GcEngine {
             readers: HashMap::new(),
             liveness_threshold: DEFAULT_LIVENESS_THRESHOLD,
             seal_generations: None,
+            crypto: crypto::plaintext_handle(),
         }
+    }
+
+    /// Installs the pool's record crypto.
+    pub fn set_crypto(&mut self, crypto: CryptoHandle) {
+        self.crypto = crypto;
     }
 
     /// Installs the seal-generation gate. A mounted pool does this at
@@ -235,9 +246,11 @@ impl GcEngine {
     pub fn mark(&mut self, live_roots: &[Hash32]) -> LiveSet {
         let mut live = LiveSet::default();
         let primary = self.primary();
+        let crypto_guard = self.crypto.load();
         let ctx = dag_walk::WalkCtx {
             primary: &primary,
             vdevs: &self.vdevs,
+            crypto: &crypto_guard,
         };
         for &root in live_roots {
             if let Err(e) = dag_walk::walk_reachable(

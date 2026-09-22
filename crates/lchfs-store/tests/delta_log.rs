@@ -2,7 +2,7 @@
 //! trailing-record tolerance, and basic replay-since-watermark behavior.
 //! No `Pool` involvement.
 
-use lchfs_format::{ExtentKind, Hash32};
+use lchfs_format::{ExtentKind, Hash32, RecordCrypto};
 use lchfs_store::delta_log::{ShardCommitRecord, ShardDeltaLog};
 use std::io::{Seek, SeekFrom, Write};
 
@@ -31,11 +31,11 @@ fn commit_then_replay_from_zero_returns_all_entries_in_order() {
     let mut log = ShardDeltaLog::open(&[dir.path().to_path_buf()], 0).unwrap();
 
     for i in 1..=5u64 {
-        log.commit(i, Hash32::of(format!("hash-{i}").as_bytes()), &[inode_record(&i.to_string())])
+        log.commit(i, Hash32::of(format!("hash-{i}").as_bytes()), &[inode_record(&i.to_string())], &RecordCrypto::plaintext())
             .unwrap();
     }
 
-    let replay = log.replay_since(0).unwrap();
+    let replay = log.replay_since(0, &RecordCrypto::plaintext()).unwrap();
     assert_eq!(replay.entries.len(), 5);
     let epochs: Vec<u64> = replay.entries.iter().map(|e| e.epoch).collect();
     assert_eq!(epochs, vec![1, 2, 3, 4, 5]);
@@ -50,11 +50,11 @@ fn replay_since_watermark_only_returns_newer_entries() {
     let dir = device();
     let mut log = ShardDeltaLog::open(&[dir.path().to_path_buf()], 0).unwrap();
     for i in 1..=5u64 {
-        log.commit(i, Hash32::of(format!("hash-{i}").as_bytes()), &[])
+        log.commit(i, Hash32::of(format!("hash-{i}").as_bytes()), &[], &RecordCrypto::plaintext())
             .unwrap();
     }
 
-    let replay = log.replay_since(3).unwrap();
+    let replay = log.replay_since(3, &RecordCrypto::plaintext()).unwrap();
     let epochs: Vec<u64> = replay.entries.iter().map(|e| e.epoch).collect();
     assert_eq!(epochs, vec![4, 5]);
 }
@@ -64,8 +64,8 @@ fn state_survives_drop_and_reopen() {
     let dir = device();
     {
         let mut log = ShardDeltaLog::open(&[dir.path().to_path_buf()], 2).unwrap();
-        log.commit(10, Hash32::of(b"a"), &[]).unwrap();
-        log.commit(11, Hash32::of(b"b"), &[]).unwrap();
+        log.commit(10, Hash32::of(b"a"), &[], &RecordCrypto::plaintext()).unwrap();
+        log.commit(11, Hash32::of(b"b"), &[], &RecordCrypto::plaintext()).unwrap();
     }
 
     // Reopen: local_epoch must have survived via the shard superblock, and
@@ -75,8 +75,8 @@ fn state_survives_drop_and_reopen() {
     assert_eq!(slot.local_epoch, 2);
     assert_eq!(slot.shard_id, 2);
 
-    log2.commit(12, Hash32::of(b"c"), &[]).unwrap();
-    let replay = log2.replay_since(0).unwrap();
+    log2.commit(12, Hash32::of(b"c"), &[], &RecordCrypto::plaintext()).unwrap();
+    let replay = log2.replay_since(0, &RecordCrypto::plaintext()).unwrap();
     let epochs: Vec<u64> = replay.entries.iter().map(|e| e.epoch).collect();
     assert_eq!(epochs, vec![1, 2, 3]);
 }
@@ -86,8 +86,8 @@ fn torn_trailing_record_is_tolerated_not_fatal() {
     let dir = device();
     {
         let mut log = ShardDeltaLog::open(&[dir.path().to_path_buf()], 5).unwrap();
-        log.commit(1, Hash32::of(b"first"), &[]).unwrap();
-        log.commit(2, Hash32::of(b"second"), &[]).unwrap();
+        log.commit(1, Hash32::of(b"first"), &[], &RecordCrypto::plaintext()).unwrap();
+        log.commit(2, Hash32::of(b"second"), &[], &RecordCrypto::plaintext()).unwrap();
     }
 
     // Find the shard's single delta segment file (segment_id 0, since
@@ -108,7 +108,7 @@ fn torn_trailing_record_is_tolerated_not_fatal() {
     drop(file);
 
     let log = ShardDeltaLog::open(&[dir.path().to_path_buf()], 5).unwrap();
-    let replay = log.replay_since(0).unwrap();
+    let replay = log.replay_since(0, &RecordCrypto::plaintext()).unwrap();
     // The first, intact record must still be recovered; the torn one is
     // silently dropped, not a hard error.
     assert_eq!(replay.entries.len(), 1);
@@ -129,7 +129,7 @@ fn corrupt_shard_superblock_degrades_to_fresh_state_not_a_hard_error() {
     let dir = device();
     {
         let mut log = ShardDeltaLog::open(&[dir.path().to_path_buf()], 1).unwrap();
-        log.commit(1, Hash32::of(b"x"), &[]).unwrap();
+        log.commit(1, Hash32::of(b"x"), &[], &RecordCrypto::plaintext()).unwrap();
     }
     let sb_path = dir.path().join("segments/delta/00001/superblock.sblk");
     assert!(sb_path.is_file());
@@ -146,6 +146,6 @@ fn corrupt_shard_superblock_degrades_to_fresh_state_not_a_hard_error() {
     let log = ShardDeltaLog::open(&[dir.path().to_path_buf()], 1).unwrap();
     let slot = log.read_shard_superblock().unwrap();
     assert_eq!(slot.local_epoch, 0);
-    let replay = log.replay_since(0).unwrap();
+    let replay = log.replay_since(0, &RecordCrypto::plaintext()).unwrap();
     assert_eq!(replay.entries.len(), 1);
 }

@@ -127,6 +127,7 @@ fn aad(pool_uuid: &[u8; 16], header: &ExtentRecordHeader) -> Vec<u8> {
 /// which epoch new records go into, which epochs it still accepts, and
 /// the keys of every epoch it holds. A plaintext pool is
 /// `RecordCrypto::plaintext()` -- epoch 0 current, nothing held.
+#[derive(Clone)]
 pub struct RecordCrypto {
     pool_uuid: [u8; 16],
     current: u16,

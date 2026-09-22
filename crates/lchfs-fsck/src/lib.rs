@@ -254,11 +254,10 @@ pub fn read_superblock(pool_root: &Path) -> Result<SuperblockSlot, FsckError> {
         // Mirrors lchfs-store's own read_superblock: only trust the version
         // once magic and CRC vouch for the slot, then fail hard rather than
         // skipping to an older slot and diagnosing a stale epoch as if it
-        // were current.
-        // A slot that decodes but says an older version: v3's layout is
-        // v4's, only the root object behind it differs (PoolParams grew
-        // its stripe policy), so the slot is the clearest place to refuse.
-        if slot.format_version < lchfs_format::FORMAT_VERSION {
+        // were current. v4 is deliberately still accepted -- see
+        // MIN_READABLE_FORMAT_VERSION's doc comment: an all-plaintext v4
+        // pool is a valid v5 one with no migration.
+        if slot.format_version < lchfs_format::MIN_READABLE_FORMAT_VERSION {
             return Err(FsckError::LegacyFormatVersion {
                 found: slot.format_version,
                 supported: lchfs_format::FORMAT_VERSION,
@@ -277,6 +276,36 @@ pub fn read_superblock(pool_root: &Path) -> Result<SuperblockSlot, FsckError> {
     best.ok_or_else(|| FsckError::NoValidSuperblock(pool_root.display().to_string()))
 }
 
+/// How this run reads sealed records. fsck has no way to prompt for a
+/// passphrase or touch a TPM (that is the CLI's job, `lchfs-cli fsck
+/// --unlock ...`, still to be built) -- what it *can* do on its own is
+/// recognise the one key every `test-encrypt-all` pool shares, so the
+/// whole test suite gets a real, working fsck against encrypted pools
+/// with no test code changed. On any other encrypted pool, or when the
+/// keyring can't be read yet (still being written by a live mount), this
+/// falls back to `RecordCrypto::plaintext()` -- every sealed record then
+/// reports `KeyRequired` as a normal, safe fsck finding rather than a
+/// crash; it never guesses at a passphrase.
+fn pool_crypto(vdev_roots: &[&Path]) -> lchfs_format::RecordCrypto {
+    if !vdev_roots.iter().any(|r| lchfs_crypto::keyring::exists_on(r)) {
+        return lchfs_format::RecordCrypto::plaintext();
+    }
+    if lchfs_crypto::testing::TEST_ENCRYPT_ALL {
+        let how = lchfs_crypto::keyring::Unlock::Passphrase(lchfs_crypto::testing::TEST_PASSPHRASE);
+        if let Ok(found) = lchfs_crypto::keyring::unlock_newest(vdev_roots, &how) {
+            let config = found.ring.config();
+            return lchfs_format::RecordCrypto::new(
+                found.ring.pool_uuid(),
+                config.current_epoch,
+                config.min_epoch,
+                config.padding,
+                found.ring.epoch_keys(),
+            );
+        }
+    }
+    lchfs_format::RecordCrypto::plaintext()
+}
+
 /// Every currently-live root: the current superblock's root, plus every
 /// retained snapshot's root (ARCHITECTURE.md §6/§10: "every live root
 /// (current + every retained snapshot)"). The convenience entry point
@@ -285,11 +314,12 @@ pub fn read_superblock(pool_root: &Path) -> Result<SuperblockSlot, FsckError> {
 pub fn collect_live_roots(pool_root: &Path) -> Result<Vec<Hash32>, FsckError> {
     let slot = read_superblock(pool_root)?;
     let mut roots = vec![slot.root_hash];
+    let crypto = pool_crypto(&[pool_root]);
 
     let reader = SegmentReader::open(pool_root, slot.root_location.segment_id, StreamKind::Meta)
         .map_err(|e| FsckError::Io(format!("opening root object segment: {e}")))?;
     let (_header, bytes) = reader
-        .read_record(slot.root_location)
+        .read_record_with(slot.root_location, &crypto)
         .map_err(|e| FsckError::Io(format!("reading root object: {e}")))?;
     let root: RootObject = lchfs_format::decode(&bytes)
         .map_err(|e| FsckError::Io(format!("decoding root object: {e}")))?;
@@ -298,7 +328,7 @@ pub fn collect_live_roots(pool_root: &Path) -> Result<Vec<Hash32>, FsckError> {
     if let Some(&loc) = locations.get(&root.snapshot_table_hash) {
         let reader = SegmentReader::open(pool_root, loc.segment_id, StreamKind::Meta)
             .map_err(|e| FsckError::Io(format!("opening snapshot table segment: {e}")))?;
-        if let Ok((_header, bytes)) = reader.read_record(loc)
+        if let Ok((_header, bytes)) = reader.read_record_with(loc, &crypto)
             && let Ok(table) = lchfs_format::decode::<SnapshotTable>(&bytes)
         {
             roots.extend(table.entries.iter().map(|e| e.root_hash));
@@ -326,10 +356,11 @@ struct Walker {
     /// checks exactly this set against `INDEX.redb`.
     visited: HashMap<Hash32, ExtentLocation>,
     report: FsckReport,
+    crypto: lchfs_format::RecordCrypto,
 }
 
 impl Walker {
-    fn new(pool_root: PathBuf, scanned: Scanned) -> Self {
+    fn new(pool_root: PathBuf, scanned: Scanned, crypto: lchfs_format::RecordCrypto) -> Self {
         let mut report = FsckReport::default();
         report.errors.extend(scanned.damaged);
         Self {
@@ -340,16 +371,26 @@ impl Walker {
             striped_only: HashSet::new(),
             visited: HashMap::new(),
             report,
+            crypto,
         }
     }
 
-    fn reader(&mut self, segment_id: u64, stream: StreamKind) -> Result<&SegmentReader, SegmentError> {
-        if let std::collections::hash_map::Entry::Vacant(e) = self.readers.entry((segment_id, stream)) {
+    /// Takes `readers`/`pool_root` as explicit fields rather than `&mut
+    /// self`, so a caller can still borrow `self.crypto` immutably
+    /// alongside the reference this returns -- a plain `&mut self` method
+    /// would tie the returned borrow to the whole struct and refuse that.
+    fn reader<'a>(
+        readers: &'a mut HashMap<(u64, StreamKind), SegmentReader>,
+        pool_root: &Path,
+        segment_id: u64,
+        stream: StreamKind,
+    ) -> Result<&'a SegmentReader, SegmentError> {
+        if let std::collections::hash_map::Entry::Vacant(e) = readers.entry((segment_id, stream)) {
             // A chunk can legitimately resolve to a Meta record and vice
             // versa -- same bytes, same hash (`SegmentReader::open_either`).
-            e.insert(SegmentReader::open_either(&self.pool_root, segment_id, stream)?);
+            e.insert(SegmentReader::open_either(pool_root, segment_id, stream)?);
         }
-        Ok(self.readers.get(&(segment_id, stream)).unwrap())
+        Ok(readers.get(&(segment_id, stream)).unwrap())
     }
 
     /// Resolves, reads, and content-hash-verifies `hash` (via
@@ -372,7 +413,7 @@ impl Walker {
         {
             self.striped_only.insert(loc.segment_id);
             let stripe = &self.stripes[&loc.segment_id];
-            return match stripe.read_record(loc) {
+            return match stripe.read_record_with(loc, &self.crypto) {
                 Ok(bytes) => {
                     self.report.objects_visited += 1;
                     self.visited.insert(hash, loc);
@@ -384,7 +425,7 @@ impl Walker {
                 }
             };
         }
-        let reader = match self.reader(loc.segment_id, stream) {
+        let reader = match Self::reader(&mut self.readers, &self.pool_root, loc.segment_id, stream) {
             Ok(r) => r,
             Err(e) => {
                 self.report
@@ -393,7 +434,7 @@ impl Walker {
                 return None;
             }
         };
-        match reader.read_record(loc) {
+        match reader.read_record_with(loc, &self.crypto) {
             Ok((_header, bytes)) => {
                 self.report.objects_visited += 1;
                 self.visited.insert(hash, loc);
@@ -566,7 +607,8 @@ pub fn check_devices(vdev_roots: &[&Path], live_roots: &[Hash32]) -> FsckReport 
             return report;
         }
     };
-    let mut walker = Walker::new(vdev_roots[0].to_path_buf(), scanned);
+    let crypto = pool_crypto(vdev_roots);
+    let mut walker = Walker::new(vdev_roots[0].to_path_buf(), scanned, crypto);
     for &root in live_roots {
         walker.walk_root(root);
     }
@@ -602,7 +644,8 @@ pub fn verify_index_devices(vdev_roots: &[&Path], live_roots: &[Hash32]) -> Fsck
         }
     };
 
-    let mut walker = Walker::new(pool_root.to_path_buf(), scanned);
+    let crypto = pool_crypto(vdev_roots);
+    let mut walker = Walker::new(pool_root.to_path_buf(), scanned, crypto);
     for &root in live_roots {
         walker.walk_root(root);
     }
@@ -701,6 +744,7 @@ pub fn check_replicas(vdev_roots: &[&Path]) -> FsckReport {
     if vdev_roots.is_empty() {
         return report;
     }
+    let crypto = pool_crypto(vdev_roots);
 
     // Superblocks: membership, then currency.
     let mut members: Vec<(u16, &Path, SuperblockSlot)> = Vec::with_capacity(vdev_roots.len());
@@ -823,7 +867,7 @@ pub fn check_replicas(vdev_roots: &[&Path]) -> FsckReport {
         .ok()
         .zip(scan_devices(vdev_roots).ok())
         .map(|(live_roots, scanned)| {
-            let mut walker = Walker::new(vdev_roots[0].to_path_buf(), scanned);
+            let mut walker = Walker::new(vdev_roots[0].to_path_buf(), scanned, crypto.clone());
             for root in live_roots {
                 walker.walk_root(root);
             }
@@ -853,7 +897,7 @@ pub fn check_replicas(vdev_roots: &[&Path]) -> FsckReport {
                 }
                 continue;
             };
-            let header = match read_verified_record(&mut readers, *id, root, loc) {
+            let header = match read_verified_record(&mut readers, *id, root, loc, &crypto) {
                 Ok(h) => h,
                 Err(detail) => {
                     report.errors.push(FsckError::ReplicaCorrupt { hash, vdev_id: *id, detail });
@@ -919,6 +963,7 @@ fn read_verified_record(
     vdev_id: u16,
     root: &Path,
     loc: ExtentLocation,
+    crypto: &lchfs_format::RecordCrypto,
 ) -> Result<ExtentRecordHeader, String> {
     let mut last_err = String::from("segment file not found in either stream");
     for kind in [StreamKind::Data, StreamKind::Meta] {
@@ -932,7 +977,7 @@ fn read_verified_record(
                 }
             }
         };
-        match reader.read_record(loc) {
+        match reader.read_record_with(loc, crypto) {
             Ok((header, _bytes)) => return Ok(header),
             Err(e) => last_err = e.to_string(),
         }

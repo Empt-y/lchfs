@@ -49,6 +49,16 @@ fn mark_bytes(pool_root: &std::path::Path, roots: &[Hash32]) -> u64 {
         load_locations(pool_root),
         Arc::new(PendingDedupPins::new()),
     );
+    // See crash_recovery.rs's identical fix: a bare GcEngine defaults to
+    // plaintext, but under `test-encrypt-all` this pool is encrypted.
+    if lchfs_crypto::keyring::exists_on(pool_root) {
+        let unlocked = lchfs_crypto::keyring::unlock_newest(
+            &[pool_root],
+            &lchfs_crypto::keyring::Unlock::Passphrase(lchfs_crypto::testing::TEST_PASSPHRASE),
+        )
+        .unwrap();
+        gc.set_crypto(lchfs_store::crypto::handle(lchfs_store::crypto::from_keyring(&unlocked.ring)));
+    }
     gc.mark(roots).by_segment.values().map(|b| b.len()).sum()
 }
 

@@ -32,6 +32,11 @@ fault-injection = []
 # and cross-thread handoffs) and dump it at `Pool::drop`. Zero-cost when off;
 # used to attribute the write-path scaling limit (ARCHITECTURE.md §17.0).
 write-timing = []
+# See lchfs-crypto's Cargo.toml comment: makes every pool this crate
+# creates or opens without an explicit key encrypted, under a fixed test
+# passphrase, so the existing test suite can run entirely against
+# encrypted pools with no test code changed. Never for a real build.
+test-encrypt-all = ["lchfs-crypto/test-encrypt-all"]
 
 [dev-dependencies]
 lchfs-store = { path = ".", features = ["fault-injection"] }

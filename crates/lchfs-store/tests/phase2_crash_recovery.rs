@@ -60,6 +60,18 @@ fn gc_marks_cleanly(pool_root: &std::path::Path, root: lchfs_format::Hash32) -> 
         Arc::new(cache),
         Arc::new(PendingDedupPins::new()),
     );
+    // A bare GcEngine defaults to plaintext; under `test-encrypt-all` the
+    // recovered pool is encrypted, so mark needs the same key `Pool`
+    // would have wired in via `unlock_pool`/`set_crypto` (see
+    // crash_recovery.rs's identical fix for why).
+    if lchfs_crypto::keyring::exists_on(pool_root) {
+        let unlocked = lchfs_crypto::keyring::unlock_newest(
+            &[pool_root],
+            &lchfs_crypto::keyring::Unlock::Passphrase(lchfs_crypto::testing::TEST_PASSPHRASE),
+        )
+        .unwrap();
+        gc.set_crypto(lchfs_store::crypto::handle(lchfs_store::crypto::from_keyring(&unlocked.ring)));
+    }
     !gc.mark(&[root]).is_empty()
 }
 
