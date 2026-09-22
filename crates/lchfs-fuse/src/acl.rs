@@ -59,11 +59,12 @@ pub fn parse(bytes: &[u8]) -> Option<Vec<Entry>> {
         return None;
     }
     let mut entries = Vec::with_capacity((bytes.len() - HEADER_LEN) / ENTRY_LEN);
-    for chunk in bytes[HEADER_LEN..].chunks_exact(ENTRY_LEN) {
+    // The length check above leaves no remainder.
+    for chunk in bytes[HEADER_LEN..].as_chunks::<ENTRY_LEN>().0 {
         entries.push(Entry {
-            tag: u16::from_le_bytes(chunk[0..2].try_into().ok()?),
-            perm: u16::from_le_bytes(chunk[2..4].try_into().ok()?),
-            id: u32::from_le_bytes(chunk[4..8].try_into().ok()?),
+            tag: u16::from_le_bytes([chunk[0], chunk[1]]),
+            perm: u16::from_le_bytes([chunk[2], chunk[3]]),
+            id: u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]),
         });
     }
     Some(entries)
