@@ -37,6 +37,35 @@ A FUSE3 filesystem where every chunk of every file is content-addressed: its BLA
 | Checkpoint interval | Every 5s by default, or on `fsync()`, ring backpressure, or unmount |
 | Crash recovery | Zero-replay base case; bounded, idempotent per-shard delta-log replay when the fast `fsync()` path has been used |
 
+## Encryption (in progress)
+
+Native, per-pool encryption is being built in milestones. The design is
+in ARCHITECTURE.md §18; the short version:
+
+- **Content:** each chunk is addressed by a *keyed* BLAKE3 hash and sealed
+  with XChaCha20-Poly1305 (random 192-bit nonce). Dedup still works
+  within a pool. Without the key you can't tell whether the pool holds a
+  given file, and nothing is shared across pools. Record sizes are
+  Padmé-padded. All metadata (names, sizes, tree shape, xattrs) is
+  encrypted too.
+- **Keys:** a LUKS-style keyring on every device. A keyring key wraps
+  each epoch's content key, and slots wrap the keyring key. There are
+  three slot types:
+  - **passphrase** (Argon2id);
+  - **post-quantum recipient key**: X-Wing, i.e. X25519 + ML-KEM-768
+    (FIPS 203), so a copy taken today stays shut against a future
+    quantum computer;
+  - **TPM2**, sealed to PCRs with an optional PIN.
+
+  A pool always keeps one non-TPM slot.
+- **Status:**
+  - Milestone 1, the crypto core (keyring, slots, envelopes, fuzz
+    targets, software-TPM tests in CI), is on `master`.
+  - Engine integration is on the `encryption-m2-wip` branch and is not
+    usable yet.
+  - Still to come: CLI and fsck support, in-place conversion of
+    plaintext pools, key rotation, and hardening.
+
 ## Build
 
 ```sh
