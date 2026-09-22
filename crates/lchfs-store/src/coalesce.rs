@@ -43,6 +43,10 @@ pub struct CoalesceDaemon {
     /// Marks on the primary. One walk serves every target, because the DAG
     /// is content-addressed and identical on every device.
     gc: GcEngine,
+    /// Mirrored segment files this daemon has deleted since the pool last
+    /// asked (`take_removed_segments`), so the pool can close the handles
+    /// its reader cache still holds on them.
+    removed_segments: Vec<u64>,
 }
 
 impl CoalesceDaemon {
@@ -55,7 +59,20 @@ impl CoalesceDaemon {
 
     pub fn new_on(vdevs: Arc<VdevSet>, locations: Arc<ChunkLocationCache>, pins: Arc<PendingDedupPins>) -> Self {
         let gc = GcEngine::new_on(Arc::clone(&vdevs), locations, pins);
-        Self { vdevs, gc }
+        Self {
+            vdevs,
+            gc,
+            removed_segments: Vec::new(),
+        }
+    }
+
+    /// Every mirrored segment deleted since the last call. An open reader
+    /// on one keeps serving its unlinked bytes, which is what makes the
+    /// pool's cache safe without invalidation -- but only if the handle is
+    /// eventually closed: otherwise the space is never freed and a long
+    /// mount holds one fd per segment coalesce ever deleted.
+    pub fn take_removed_segments(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.removed_segments)
     }
 
     fn primary_id(&self) -> u16 {
@@ -248,6 +265,7 @@ impl CoalesceDaemon {
                 if mirror.exists() {
                     let _ = segment::mark_coalesced(&vdev.root, segment_id, StreamKind::Data);
                     std::fs::remove_file(&mirror)?;
+                    self.removed_segments.push(segment_id);
                 }
             }
             tracing::info!(
@@ -512,6 +530,7 @@ impl CoalesceDaemon {
             }
             segment::mark_coalesced(root, old_id, StreamKind::Data)?;
             std::fs::remove_file(segment::segment_path(root, old_id, StreamKind::Data))?;
+            self.removed_segments.push(old_id);
             return Ok(());
         }
 
@@ -576,6 +595,7 @@ impl CoalesceDaemon {
 
         segment::mark_coalesced(root, old_id, StreamKind::Data)?;
         std::fs::remove_file(segment::segment_path(root, old_id, StreamKind::Data))?;
+        self.removed_segments.push(old_id);
         Ok(())
     }
 

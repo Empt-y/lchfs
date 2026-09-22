@@ -704,6 +704,18 @@ pub mod fault_injection {
     pub fn is_dead(root: &Path) -> bool {
         dead().lock().unwrap().contains(root)
     }
+
+    static FAIL_NEXT_CHECKPOINT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// The next checkpoint fails just after it has taken the dirty set --
+    /// the point a real mid-checkpoint I/O error leaves it at.
+    pub fn fail_next_checkpoint() {
+        FAIL_NEXT_CHECKPOINT.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn take_checkpoint_failure() -> bool {
+        FAIL_NEXT_CHECKPOINT.swap(false, std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 /// Flips an already-sealed segment's header page to `SegmentState::Coalesced`

@@ -157,6 +157,12 @@ impl<V> ShardedInoMap<V> {
     fn shard(&self, ino: u64) -> parking_lot::MutexGuard<'_, HashMap<u64, V>> {
         self.shards[(ino as usize) & (INO_SHARDS - 1)].lock()
     }
+
+    /// Every ino with an entry, one shard locked at a time -- a snapshot
+    /// that concurrent inserts may already have outgrown.
+    fn inos(&self) -> Vec<u64> {
+        self.shards.iter().flat_map(|s| s.lock().keys().copied().collect::<Vec<_>>()).collect()
+    }
 }
 
 /// Cache of open segment readers, shared across threads. A `SegmentReader`
@@ -165,11 +171,21 @@ impl<V> ShardedInoMap<V> {
 /// holds a lock only for the map lookup or insert -- never across the read
 /// itself. That is the whole point: a read is disk I/O, and holding a lock
 /// across it serializes every concurrent read (ARCHITECTURE.md §17.5).
-/// Sharded by segment id so even the lookup rarely contends. There is no
-/// invalidation, by construction: segment ids are monotonic and never
-/// reused, and an open fd keeps reading a segment that coalesce has since
-/// unlinked, so a cached reader can never point at the wrong bytes.
+/// Sharded by segment id so even the lookup rarely contends. Nothing ever
+/// has to be invalidated for correctness: segment ids are monotonic and
+/// never reused, and an open fd keeps reading a segment that coalesce has
+/// since unlinked, so a cached reader can never point at the wrong bytes.
+/// Deleted segments are still evicted (`evict_segment`), because that
+/// same open fd pins the unlinked file's space and costs a descriptor for
+/// the life of the mount; a read that raced the deletion finds the
+/// record's new location and retries (`read_verified`).
 type ReaderKey = (u16, u64, StreamKind);
+
+/// How many times `read_verified` follows a record that moved under it. One
+/// is the ordinary case; more means coalesce relocated the same record
+/// again inside a single read, and past a few the read is let fail as it
+/// would have.
+const RELOCATION_RETRIES: u32 = 3;
 type ReaderShard = Mutex<HashMap<ReaderKey, Arc<SegmentReader>>>;
 
 struct ReaderCache {
@@ -181,6 +197,15 @@ impl ReaderCache {
         Self {
             shards: (0..INO_SHARDS).map(|_| Mutex::new(HashMap::new())).collect(),
         }
+    }
+
+    /// Closes every cached handle on `segment_id`, on any device and in
+    /// either stream. A read already holding one keeps its `Arc` until it
+    /// finishes.
+    fn evict_segment(&self, segment_id: u64) {
+        self.shards[(segment_id as usize) & (INO_SHARDS - 1)]
+            .lock()
+            .retain(|&(_, id, _), _| id != segment_id);
     }
 
     /// Seeds a cache from the map the mount path built while scanning, so
@@ -781,6 +806,17 @@ struct PoolShared {
     /// `CoalesceDaemon`'s repacks from reclaiming a location a write
     /// still depends on but hasn't checkpointed yet.
     dedup_pins: Arc<PendingDedupPins>,
+    /// Which inode took each of those pins, one entry per pin. A pin is
+    /// released when a checkpoint that captured *its inode* is published --
+    /// not per chunk hash the checkpoint happens to encode. Everything an
+    /// inode pinned before its capture is either in the captured state or
+    /// superseded by it, so the published root is all it still needs. The
+    /// per-hash release this replaces undercounted: an overwrite on the
+    /// fallback path re-chunks the whole file and pins every unchanged
+    /// chunk again, but a checkpoint released each hash once, so a few
+    /// overwrites between checkpoints left pins nothing would ever release
+    /// and that content unreclaimable until remount.
+    pins_by_ino: ShardedInoMap<Vec<Hash32>>,
     /// Persisted `INDEX.redb` (Phase C, ARCHITECTURE.md §4): "a
     /// rebuildable cache, never authoritative." `RwLock` since
     /// `get_chunk_location` only needs shared access while `put_*`/
@@ -980,6 +1016,7 @@ impl Pool {
             ino_locks: ShardedInoMap::new(),
             dedup_index: Arc::clone(&dedup_index),
             dedup_pins: Arc::clone(&dedup_pins),
+            pins_by_ino: ShardedInoMap::new(),
             persisted_index: Arc::clone(&persisted_index),
             readers: ReaderCache::new(),
             heal_writers: Mutex::new(HashMap::new()),
@@ -1720,6 +1757,7 @@ impl Pool {
             ino_locks: ShardedInoMap::new(),
             dedup_index: Arc::clone(&dedup_index),
             dedup_pins: Arc::clone(&dedup_pins),
+            pins_by_ino: ShardedInoMap::new(),
             persisted_index: Arc::clone(&persisted_index),
             readers: ReaderCache::from_map(readers),
             heal_writers: Mutex::new(HashMap::new()),
@@ -2199,6 +2237,14 @@ impl Pool {
         self.0.current_chunks_for_new_session(ino)
     }
 
+    /// How many distinct hashes currently hold a dedup pin. Once every
+    /// write has been checkpointed this should be zero; anything left is a
+    /// pin nothing will release, keeping dead content from being reclaimed
+    /// until the pool is remounted.
+    pub fn debug_pinned_hash_count(&self) -> usize {
+        self.0.dedup_pins.snapshot().len()
+    }
+
     /// Retains the current state as a named snapshot (ARCHITECTURE.md §6).
     /// `PoolError::AlreadyExists` if `name` is already taken.
     pub fn create_snapshot(&self, name: &str) -> Result<(), PoolError> {
@@ -2454,14 +2500,21 @@ impl PoolShared {
             min_age_segments: current.min_age_segments,
             ..coalesce::StripePolicy::default()
         };
-        self.coalesce.lock().run_pass_with(
+        let mut coalesce = self.coalesce.lock();
+        let pass = coalesce.run_pass_with(
             &live_roots,
             generation_at_mark,
             &self.published_generation,
             &self.persisted_index,
             &self.next_segment_id,
             policy,
-        )?;
+        );
+        // Even after a failed pass: whatever it deleted before failing is
+        // just as gone.
+        for segment_id in coalesce.take_removed_segments() {
+            self.readers.evict_segment(segment_id);
+        }
+        pass?;
         Ok(())
     }
 
@@ -2820,7 +2873,23 @@ impl PoolShared {
     /// that failed are then healed from those bytes, synchronously and
     /// best-effort -- a heal that fails is logged and counted, never
     /// allowed to turn a read that just succeeded into an error.
+    ///
+    /// A failure is first checked against the cache: coalesce relocates a
+    /// live record and then deletes its old segment, so a read that looked
+    /// the location up just before that can find the old file gone. If the
+    /// hash has moved, that is all it was -- the read starts over at the
+    /// new location, and nothing is charged to a device.
     fn read_verified(&self, hash: Hash32, kind: StreamKind, ino: Option<u64>) -> Result<Vec<u8>, PoolError> {
+        self.read_verified_from(hash, kind, ino, RELOCATION_RETRIES)
+    }
+
+    fn read_verified_from(
+        &self,
+        hash: Hash32,
+        kind: StreamKind,
+        ino: Option<u64>,
+        retries: u32,
+    ) -> Result<Vec<u8>, PoolError> {
         let what = match kind {
             StreamKind::Data => "chunk",
             _ => "object",
@@ -2829,6 +2898,13 @@ impl PoolShared {
             .dedup_index
             .get_tagged(hash)
             .ok_or_else(|| PoolError::Format(format!("{what} {hash:?} not found")))?;
+        let moved = || {
+            retries > 0
+                && self
+                    .dedup_index
+                    .get_tagged(hash)
+                    .is_some_and(|now| now != (preferred, preferred_vdev))
+        };
 
         if preferred_vdev == stripe::STRIPED {
             // Cold data: no mirror copy exists to try first. Served from
@@ -2844,6 +2920,7 @@ impl PoolShared {
             });
             return match outcome {
                 Ok(bytes) => Ok(bytes),
+                Err(_) if moved() => self.read_verified_from(hash, kind, ino, retries - 1),
                 Err(e) => {
                     self.record_corruption(CorruptionEvent {
                         at: SystemTime::now(),
@@ -2879,6 +2956,7 @@ impl PoolShared {
                 });
             match reader.and_then(|r| r.read_record(preferred).map_err(PoolError::from)) {
                 Ok((_header, bytes)) => return Ok(bytes),
+                Err(_) if moved() => return self.read_verified_from(hash, kind, ino, retries - 1),
                 Err(e) => Some(e),
             }
         } else {
@@ -3688,7 +3766,13 @@ impl PoolShared {
             PreparedChunk::Dedup {
                 content_hash,
                 location,
-            } => Ok((content_hash, location)),
+            } => {
+                // Under the inode lock, like every caller: the checkpoint
+                // that captures this inode takes its pins under the same
+                // lock, so it releases exactly the pins its capture covers.
+                self.pins_by_ino.shard(inode_id).entry(inode_id).or_default().push(content_hash);
+                Ok((content_hash, location))
+            }
             PreparedChunk::New {
                 content_hash,
                 codec_id,
@@ -4216,21 +4300,10 @@ impl PoolShared {
         let mut new_refs: Vec<ChunkRef> = Vec::with_capacity(prepared.len());
         for (rel_offset, bytes) in &prepared {
             let logical_offset = base_offset + rel_offset;
-            let (hash, _loc) = match self.commit_chunk(ino, logical_offset, bytes) {
-                Ok(v) => v,
-                Err(e) => {
-                    // `new_refs` is about to be discarded -- any dedup-hit
-                    // pin already taken for an earlier chunk in this batch
-                    // (see `PendingDedupPins`'s doc comment) would otherwise
-                    // never be released, since it'll never reach
-                    // `checkpointed_chunk_hashes` now. No-op for any hash
-                    // that was never pinned (every `New`-path chunk here).
-                    for r in &new_refs {
-                        self.dedup_pins.unpin(r.content_hash);
-                    }
-                    return Err(e);
-                }
-            };
+            // A failure discards `new_refs`, but not the pins an earlier
+            // chunk in it took: they are in `pins_by_ino`, and the inode is
+            // already dirty, so the next checkpoint releases them.
+            let (hash, _loc) = self.commit_chunk(ino, logical_offset, bytes)?;
             new_refs.push(ChunkRef {
                 content_hash: hash,
                 logical_offset,
@@ -4758,17 +4831,8 @@ impl PoolShared {
                 {
                     continue;
                 }
-                let (hash, _loc) = match self.commit_chunk(ino, b.offset, bytes) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        // `refs` is about to be discarded -- see the matching
-                        // comment in `write_incremental`.
-                        for r in &refs {
-                            self.dedup_pins.unpin(r.content_hash);
-                        }
-                        return Err(e);
-                    }
-                };
+                // On failure, see the matching comment in `write_incremental`.
+                let (hash, _loc) = self.commit_chunk(ino, b.offset, bytes)?;
                 refs.push(ChunkRef {
                     content_hash: hash,
                     logical_offset: b.offset,
@@ -5388,6 +5452,25 @@ impl PoolShared {
             let mut namespace = self.namespace.lock();
             namespace.dirty_inodes.drain().collect()
         };
+        // Any `?` from here to the end would otherwise lose these marks for
+        // good: the next checkpoint would never re-derive those inodes, and
+        // whatever they hold beyond the last published root -- a file's new
+        // chunk list, a directory's new entries -- would stay unpublished
+        // until something happened to touch them again. Putting them back
+        // is always safe: marking is at-least-once, and a mark with nothing
+        // new behind it is already handled as a no-op below.
+        let mut dirty_guard = RestoreOnFailure {
+            namespace: &self.namespace,
+            pins_by_ino: &self.pins_by_ino,
+            inos: Some(dirty),
+            pins: Vec::new(),
+        };
+        let dirty = dirty_guard.inos.clone().unwrap_or_default();
+        let dirty = dirty.as_slice();
+        #[cfg(feature = "fault-injection")]
+        if segment::fault_injection::take_checkpoint_failure() {
+            return Err(PoolError::Io(std::io::Error::other("injected checkpoint failure")));
+        }
 
         struct DirtyWork {
             ino: u64,
@@ -5412,12 +5495,9 @@ impl PoolShared {
                 .collect()
         };
 
-        // Every chunk hash that ends up in a freshly-written IndirectHashList
-        // this pass -- unpinned (see `PendingDedupPins`) once the root that
-        // captures them is published, below. Unconditional: a hash that was
-        // never actually pinned (an ordinary `New`-path chunk) makes `unpin`
-        // a no-op, so there's no need to track dedup-hit origin separately.
-        let mut checkpointed_chunk_hashes: Vec<Hash32> = Vec::new();
+        // Pins taken by every file this pass captures go into the guard, to
+        // be released once the root that captures them is published, below
+        // (see `pins_by_ino`), or handed back if the pass fails first.
 
         // Applied immediately per-file rather than collected into a map to
         // apply later: for File inodes, `ino`'s lock is held from
@@ -5443,6 +5523,12 @@ impl PoolShared {
                     let ino_lock = self.lock_for_ino(w.ino);
                     let _guard = ino_lock.lock();
                     let session_chunks = self.finalize_incremental_session(w.ino)?;
+                    // After finalize, which can pin its trailing chunk; under
+                    // the inode lock, so no write can pin between this and
+                    // the state captured below.
+                    if let Some(pins) = self.pins_by_ino.shard(w.ino).remove(&w.ino) {
+                        dirty_guard.pins.push((w.ino, pins));
+                    }
                     // Read under the inode lock, not snapshotted for every
                     // dirty inode before this loop: a fallback-path write
                     // holds the lock while it puts bytes into `contents`
@@ -5522,7 +5608,6 @@ impl PoolShared {
                         let chunks = session_chunks
                             .or_else(|| file_state_now.as_ref().map(|s| s.chunks.clone()))
                             .unwrap_or_default();
-                        checkpointed_chunk_hashes.extend(chunks.iter().map(|c| c.content_hash));
                         let ihl = IndirectHashList { chunks };
                         let (hash, _loc) =
                             self.put_meta_object(ExtentKind::IndirectHashList, &ihl)?;
@@ -5545,6 +5630,24 @@ impl PoolShared {
                     }
                 }
                 InodeKind::Symlink => {} // unchanged; content already correct
+            }
+        }
+
+        // Pins held by files that were unlinked before any checkpoint
+        // captured them: no root will ever capture those inodes, and once
+        // this one is published without them their content is needed by
+        // nothing (a read of a removed ino fails before it touches a chunk).
+        let orphaned: Vec<u64> = {
+            let namespace = self.namespace.lock();
+            self.pins_by_ino
+                .inos()
+                .into_iter()
+                .filter(|ino| !namespace.inodes.contains_key(ino))
+                .collect()
+        };
+        for ino in orphaned {
+            if let Some(pins) = self.pins_by_ino.shard(ino).remove(&ino) {
+                dirty_guard.pins.push((ino, pins));
             }
         }
 
@@ -5641,12 +5744,14 @@ impl PoolShared {
         // under it either, since unpinning never happens before this store.
         self.published_generation.store(generation, Ordering::Release);
 
-        // Every chunk hash freshly captured by the root just published is
-        // now DAG-reachable in its own right -- release its pin (a no-op
-        // for hashes that were never pinned to begin with). See
-        // `PendingDedupPins`'s doc comment.
-        for hash in &checkpointed_chunk_hashes {
-            self.dedup_pins.unpin(*hash);
+        // Every pin taken by a file this root captured has served its
+        // purpose: what the file still references is DAG-reachable now, and
+        // what it pinned and then overwrote it no longer needs. See
+        // `pins_by_ino` and `PendingDedupPins`'s doc comment.
+        for (_, pins) in std::mem::take(&mut dirty_guard.pins) {
+            for hash in pins {
+                self.dedup_pins.unpin(hash);
+            }
         }
 
         let slot = SuperblockSlot {
@@ -5702,7 +5807,31 @@ impl PoolShared {
         }
         self.report_faults(failed);
 
+        dirty_guard.inos = None;
         Ok(())
+    }
+}
+
+/// What `run_checkpoint` takes out of shared state before it can publish
+/// -- the drained dirty set and the captured files' pins -- handed back
+/// unless the checkpoint reaches the end. Pins still held here on a failure
+/// go back to their inodes, so the retry that captures them releases them;
+/// dropping them instead would leave them pinned for good.
+struct RestoreOnFailure<'a> {
+    namespace: &'a Mutex<Namespace>,
+    pins_by_ino: &'a ShardedInoMap<Vec<Hash32>>,
+    inos: Option<Vec<u64>>,
+    pins: Vec<(u64, Vec<Hash32>)>,
+}
+
+impl Drop for RestoreOnFailure<'_> {
+    fn drop(&mut self) {
+        if let Some(inos) = self.inos.take() {
+            self.namespace.lock().dirty_inodes.extend(inos);
+        }
+        for (ino, pins) in self.pins.drain(..) {
+            self.pins_by_ino.shard(ino).entry(ino).or_default().extend(pins);
+        }
     }
 }
 

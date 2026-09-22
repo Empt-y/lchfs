@@ -372,3 +372,74 @@ fn a_chunk_identical_to_a_meta_object_reads_back() {
     let report = lchfs_fsck::check(dir.path(), &live_roots);
     assert!(report.is_clean(), "fsck: {:?}", report.errors);
 }
+
+/// Open descriptors this process holds on files under `root` that have
+/// since been unlinked -- what the kernel shows as "(deleted)".
+fn deleted_fds_under(root: &std::path::Path) -> usize {
+    std::fs::read_dir("/proc/self/fd")
+        .unwrap()
+        .filter_map(|e| std::fs::read_link(e.ok()?.path()).ok())
+        .filter(|target| {
+            let target = target.to_string_lossy();
+            target.starts_with(&*root.to_string_lossy()) && target.ends_with(" (deleted)")
+        })
+        .count()
+}
+
+#[test]
+fn coalesce_closes_its_readers_on_segments_it_deleted() {
+    // An open reader keeps an unlinked segment's space allocated and costs
+    // a descriptor; the reader cache used to keep one for every segment
+    // coalesce ever deleted, for the life of the mount.
+    let dir = tempfile::tempdir().unwrap();
+    let (pool, survivors) = setup_low_liveness_pool(dir.path());
+    drop(pool);
+    // A fresh mount opens a reader on every segment it scans.
+    let pool = Pool::open(dir.path()).unwrap();
+    let data_dir = dir.path().join("segments/data");
+    let before: std::collections::HashSet<_> = std::fs::read_dir(&data_dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.file_name()))
+        .collect();
+
+    for _ in 0..4 {
+        pool.checkpoint().unwrap();
+        pool.run_gc_and_coalesce_pass().unwrap();
+    }
+    let after: std::collections::HashSet<_> = std::fs::read_dir(&data_dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.file_name()))
+        .collect();
+    assert!(!before.is_subset(&after), "setup: coalesce must have deleted a segment");
+
+    assert_eq!(deleted_fds_under(dir.path()), 0, "descriptors left open on deleted segments");
+    for (ino, expected) in &survivors {
+        assert_eq!(pool.read(*ino, 0, expected.len() as u32).unwrap().as_ref(), expected.as_slice());
+    }
+}
+
+#[test]
+fn every_dedup_pin_is_released_by_the_checkpoint_that_captures_it() {
+    // Overwrites on the fallback path re-chunk the whole file, so each one
+    // pins every unchanged chunk again. Checkpoints used to release one pin
+    // per hash they encoded, leaving the rest pinned until remount -- and a
+    // pinned hash is never reclaimed, whatever later happens to the file.
+    let dir = tempfile::tempdir().unwrap();
+    let pool = Pool::create(dir.path(), small_params()).unwrap();
+    let kept = pool.create_file(1, "kept", 0o644).unwrap();
+    let doomed = pool.create_file(1, "doomed", 0o644).unwrap();
+    pool.write(kept, 0, &deterministic_bytes(3, 40_000)).unwrap();
+    pool.write(doomed, 0, &deterministic_bytes(4, 40_000)).unwrap();
+    pool.checkpoint().unwrap();
+
+    for k in 0..5u64 {
+        pool.write(kept, 20_000 + k * 100, b"x").unwrap();
+        pool.write(doomed, 20_000 + k * 100, b"x").unwrap();
+    }
+    assert!(pool.debug_pinned_hash_count() > 0, "setup: overwrites must dedup-hit");
+    // A file unlinked before any checkpoint captured its pins.
+    pool.unlink(1, "doomed").unwrap();
+
+    pool.checkpoint().unwrap();
+    assert_eq!(pool.debug_pinned_hash_count(), 0);
+}
