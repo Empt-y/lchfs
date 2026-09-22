@@ -27,6 +27,9 @@ path = "../crates/lchfs-fsck"
 [dependencies.lchfs-format]
 path = "../crates/lchfs-format"
 
+[dependencies.lchfs-crypto]
+path = "../crates/lchfs-crypto"
+
 [[bin]]
 name = "extent_header"
 path = "fuzz_targets/extent_header.rs"
@@ -58,6 +61,20 @@ bench = false
 [[bin]]
 name = "stripe_mutation"
 path = "fuzz_targets/stripe_mutation.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "keyring_parse"
+path = "fuzz_targets/keyring_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "envelope_open"
+path = "fuzz_targets/envelope_open.rs"
 test = false
 doc = false
 bench = false

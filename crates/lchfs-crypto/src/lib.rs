@@ -1,4 +1,5 @@
-//! BLAKE3 content hashing and CRC32C header checksums.
+//! Content addressing, integrity checks, record encryption and key
+//! management.
 //!
 //! See ARCHITECTURE.md, unifying design principle and §1 (On-disk format):
 //! `Hash32` is the single mechanism that serves as Merkle DAG pointer,
@@ -6,6 +7,15 @@
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+pub mod envelope;
+pub mod keyring;
+pub mod epoch;
+pub mod padme;
+pub mod secret;
+pub mod slots;
+
+pub use secret::Key32;
 
 /// A BLAKE3-256 content hash. The identity of every Extent Record's payload
 /// (§1) and the pointer type used throughout the Merkle DAG object schemas.

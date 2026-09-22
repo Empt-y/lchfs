@@ -20,7 +20,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libfuse3-dev pkg-config
+          sudo apt-get install -y libfuse3-dev pkg-config libtss2-dev swtpm
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -42,3 +42,18 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # TPM2 key slots (the `tpm` feature, off by default because it links
+      # the system tpm2-tss) against a throwaway software TPM -- never a
+      # real one: the tests deliberately enter a wrong PIN, which counts
+      # toward a TPM's dictionary-attack lockout.
+      - name: TPM slot tests (swtpm)
+        run: |
+          mkdir -p "$RUNNER_TEMP/swtpm"
+          swtpm socket --tpm2 --tpmstate dir="$RUNNER_TEMP/swtpm" \
+            --server type=tcp,port=2321 --ctrl type=tcp,port=2322 \
+            --flags not-need-init,startup-clear &
+          sleep 1
+          LCHFS_TEST_TPM=1 LCHFS_TPM_TCTI="swtpm:host=127.0.0.1,port=2321" \
+            cargo test -p lchfs-crypto --features tpm
+          cargo clippy -p lchfs-crypto --all-targets --features tpm -- -D warnings

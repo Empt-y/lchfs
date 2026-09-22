@@ -1,18 +1,33 @@
 [package]
 name = "lchfs-crypto"
-description = "BLAKE3 content hashing and CRC32C header checksums for LCHFS"
+description = "Content addressing, record encryption and key management for LCHFS"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+
+[features]
+# TPM2 key slots. Links the system tpm2-tss library, so it is opt-in for
+# the crate and turned on by the CLI.
+tpm = ["dep:tss-esapi"]
 
 [dependencies]
 blake3 = { workspace = true }
 crc32fast = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
+bincode = { workspace = true }
+chacha20poly1305 = { workspace = true }
+argon2 = { workspace = true }
+x-wing = { workspace = true }
+zeroize = { workspace = true }
+getrandom = { workspace = true }
+tss-esapi = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+tempfile = { workspace = true }
 
 [[bench]]
 name = "hashing"
