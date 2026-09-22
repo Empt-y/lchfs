@@ -9,6 +9,7 @@
 //! §5 for why true work-stealing at the segment-append level was
 //! considered and rejected.
 
+use crate::gc::SealGenerations;
 use crate::segment::SegmentWriter;
 use crate::vdevs::VdevSet;
 use crossbeam::deque::{Injector, Steal};
@@ -80,6 +81,11 @@ struct ShardDataWriter {
     shard_id: u32,
     segment_cap_bytes: u64,
     next_segment_id: Arc<AtomicU64>,
+    /// Stamped with the current checkpoint generation every time this
+    /// shard seals a segment, so the sweep can tell a segment whose
+    /// records no published root has captured yet from one it has --
+    /// see `SealGenerations`.
+    seal_generations: Arc<SealGenerations>,
 }
 
 impl ShardDataWriter {
@@ -172,6 +178,11 @@ impl ShardDataWriter {
         // behind: the invariant a live attach's barrier rests on.
         self.flush_index()?;
         let Some(old) = self.writer.take() else { return Ok(()) };
+        // Before the seal, not after: the sweep looks for sealed segments
+        // on disk, so the segment must already be tracked by the time its
+        // footer lands. We hold this shard's lock, so its last append is
+        // behind us. See `SealGenerations::stamp`.
+        self.seal_generations.stamp(old.segment_id());
         // The seal is the last chance to learn a replica failed on it.
         let faults = old.seal()?;
         for id in faults {
@@ -215,6 +226,7 @@ impl LogicalShard {
         vdevs: Arc<VdevSet>,
         segment_cap_bytes: u64,
         next_segment_id: Arc<AtomicU64>,
+        seal_generations: Arc<SealGenerations>,
         indexer: Arc<OnceLock<Indexer>>,
     ) -> io::Result<Self> {
         Ok(Self {
@@ -232,6 +244,7 @@ impl LogicalShard {
                 shard_id: id,
                 segment_cap_bytes,
                 next_segment_id,
+                seal_generations,
             }),
         })
     }
@@ -329,6 +342,7 @@ impl CommitterPool {
         ring_capacity: usize,
         data_segment_cap_bytes: u64,
         next_segment_id: Arc<AtomicU64>,
+        seal_generations: Arc<SealGenerations>,
     ) -> io::Result<Self> {
         Self::new_on(
             Arc::new(VdevSet::from_roots(vdev_roots)),
@@ -337,6 +351,7 @@ impl CommitterPool {
             ring_capacity,
             data_segment_cap_bytes,
             next_segment_id,
+            seal_generations,
         )
     }
 
@@ -347,6 +362,7 @@ impl CommitterPool {
         ring_capacity: usize,
         data_segment_cap_bytes: u64,
         next_segment_id: Arc<AtomicU64>,
+        seal_generations: Arc<SealGenerations>,
     ) -> io::Result<Self> {
         let indexer: Arc<OnceLock<Indexer>> = Arc::new(OnceLock::new());
         let mut shards = Vec::with_capacity(shard_count as usize);
@@ -357,6 +373,7 @@ impl CommitterPool {
                 Arc::clone(&vdevs),
                 data_segment_cap_bytes,
                 Arc::clone(&next_segment_id),
+                Arc::clone(&seal_generations),
                 Arc::clone(&indexer),
             )?));
         }

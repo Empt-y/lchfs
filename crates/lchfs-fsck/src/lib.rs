@@ -345,7 +345,9 @@ impl Walker {
 
     fn reader(&mut self, segment_id: u64, stream: StreamKind) -> Result<&SegmentReader, SegmentError> {
         if let std::collections::hash_map::Entry::Vacant(e) = self.readers.entry((segment_id, stream)) {
-            e.insert(SegmentReader::open(&self.pool_root, segment_id, stream)?);
+            // A chunk can legitimately resolve to a Meta record and vice
+            // versa -- same bytes, same hash (`SegmentReader::open_either`).
+            e.insert(SegmentReader::open_either(&self.pool_root, segment_id, stream)?);
         }
         Ok(self.readers.get(&(segment_id, stream)).unwrap())
     }
@@ -798,6 +800,43 @@ pub fn check_replicas(vdev_roots: &[&Path]) -> FsckReport {
         }
     }
 
+    // Redundancy is a property of *live* data, so only a record some root
+    // still references is compared for presence.
+    //
+    // The sweep is per-vdev while the mark is pool-wide (§15.7), so two
+    // devices legitimately hold different *dead* records: one that was
+    // offline while its peers coalesced still carries records they have
+    // dropped, and a segment that fell below the liveness threshold on one
+    // device may sit above it on another that repacked differently.
+    // Reporting those as missing replicas says "damaged" about a pool
+    // doing exactly what it is designed to do, and buries the finding that
+    // matters underneath hundreds of lines of garbage awaiting collection.
+    //
+    // A reference the walk could not resolve counts as reachable: that is
+    // the case where a device really has lost a live record, and it must
+    // still be reported here (the walk reads mirrored segments from the
+    // first device only, so a record left on one other device alone is
+    // exactly what it fails to resolve). If the walk cannot be run at all,
+    // nothing is filtered -- fewer findings is never the safe default for
+    // a checker.
+    let reachable: Option<HashSet<Hash32>> = collect_live_roots(vdev_roots[0])
+        .ok()
+        .zip(scan_devices(vdev_roots).ok())
+        .map(|(live_roots, scanned)| {
+            let mut walker = Walker::new(vdev_roots[0].to_path_buf(), scanned);
+            for root in live_roots {
+                walker.walk_root(root);
+            }
+            let mut set: HashSet<Hash32> = walker.visited.keys().copied().collect();
+            set.extend(walker.report.errors.iter().filter_map(|e| match e {
+                FsckError::MissingObject { hash } | FsckError::UnreadableObject { hash, .. } => {
+                    Some(*hash)
+                }
+                _ => None,
+            }));
+            set
+        });
+
     let mut readers: HashMap<(u16, u64, StreamKind), SegmentReader> = HashMap::new();
     for hash in every_hash {
         report.objects_visited += 1;
@@ -807,7 +846,9 @@ pub fn check_replicas(vdev_roots: &[&Path]) -> FsckReport {
         let mut reference: Option<(u16, ExtentRecordHeader)> = None;
         for (id, root, locations) in &scans {
             let Some(&loc) = locations.get(&hash) else {
-                if !striped_on.get(id).is_some_and(|set| set.contains(&hash)) {
+                if !striped_on.get(id).is_some_and(|set| set.contains(&hash))
+                    && reachable.as_ref().is_none_or(|live| live.contains(&hash))
+                {
                     report.errors.push(FsckError::ReplicaMissing { hash, vdev_id: *id });
                 }
                 continue;

@@ -2,6 +2,7 @@
 //! public `run_gc_and_coalesce_pass()` (the same path the background
 //! timer calls, exposed so tests can call it synchronously).
 
+use lchfs_chunk::{Chunker, FastCdcChunker};
 use lchfs_format::PoolParams;
 use lchfs_index::{ChunkLocationCache, PendingDedupPins, RedbIndex};
 use lchfs_store::coalesce::CoalesceDaemon;
@@ -283,4 +284,91 @@ fn repeated_coalesce_passes_are_idempotent() {
         let read_back = pool.read(*ino, 0, expected.len() as u32).unwrap();
         assert_eq!(read_back.as_ref(), expected.as_slice(), "mismatch for ino {ino} after repeated coalesce");
     }
+}
+
+#[test]
+fn content_rewritten_after_its_segment_was_reclaimed_is_stored_again() {
+    // The mirror image of the test above: here the coalesce pass wins
+    // outright and deletes the dead content's segment *before* anything
+    // writes those bytes again. Reclaiming used to leave the content's
+    // dedup-cache and index entries behind, pointing into the deleted
+    // segment, so the next write of identical bytes dedup-hit a record
+    // that no longer existed and the file came back unreadable. A
+    // database writing a page back to an earlier state is all it takes;
+    // the torture suite's fault-storm test hit it most runs.
+    let dir = tempfile::tempdir().unwrap();
+    let (pool, _survivors) = setup_low_liveness_pool(dir.path());
+    let resurrected = deterministic_bytes(1, 3000);
+
+    // Enough checkpoints to clear every segment's seal-generation grace,
+    // and enough passes for the dead content's segment to actually go.
+    for _ in 0..4 {
+        pool.checkpoint().unwrap();
+        pool.run_gc_and_coalesce_pass().unwrap();
+    }
+
+    let ino = pool.create_file(1, "same-bytes-again", 0o644).unwrap();
+    pool.write(ino, 0, &resurrected).unwrap();
+    pool.checkpoint().unwrap();
+
+    // Through the persisted index and on-disk segments only: an fd the
+    // running pool still holds on the unlinked segment could otherwise
+    // serve the read and hide the loss.
+    drop(pool);
+    let pool = Pool::open(dir.path()).unwrap();
+    let read_back = pool.read(ino, 0, resurrected.len() as u32).unwrap();
+    assert_eq!(read_back.as_ref(), resurrected.as_slice());
+}
+
+#[test]
+fn a_chunk_identical_to_a_meta_object_reads_back() {
+    // The dedup cache is keyed by content hash alone, shared by the Data
+    // and Meta streams. The empty root directory's DirectoryObject encodes
+    // to eight zero bytes, so a file whose last chunk is eight zero bytes
+    // dedup-hits that Meta-stream record -- and reads used to open the
+    // segment id in the Data directory, where it does not exist.
+    let dir = tempfile::tempdir().unwrap();
+    let pool = Pool::create(dir.path(), small_params()).unwrap();
+    pool.checkpoint().unwrap();
+
+    // The chunker cuts only while a full `chunk_max_size` is buffered and
+    // flushes the rest as one final chunk, so eight zeros become a chunk of
+    // their own after a forced max-size cut: a run of one byte value the
+    // rolling hash never cuts inside. Which value that is belongs to the
+    // chunker, so ask it rather than hard-code one.
+    let params = small_params();
+    let max = params.chunk_max_size as usize;
+    let content = (1..=255u8)
+        .map(|b| {
+            let mut c = vec![b; max];
+            c.extend_from_slice(&[0u8; 8]);
+            c
+        })
+        .find(|c| {
+            let mut chunker = FastCdcChunker::new(params.chunk_avg_size, params.chunk_min_size, params.chunk_max_size);
+            let mut cuts = chunker.push(c);
+            cuts.extend(chunker.finish());
+            cuts.last().is_some_and(|last| last.len == 8)
+        })
+        .expect("setup: some byte value never cuts before chunk_max_size");
+    let boundary = max;
+
+    let ino = pool.create_file(1, "zero-tail", 0o644).unwrap();
+    pool.write(ino, 0, &content).unwrap();
+    pool.checkpoint().unwrap();
+    let tail = *pool.debug_chunk_refs(ino).unwrap().last().unwrap();
+    assert_eq!((tail.logical_offset, tail.len), (boundary as u64, 8), "setup: the zeros must be a chunk of their own");
+
+    drop(pool);
+    let pool = Pool::open(dir.path()).unwrap();
+    let read_back = pool.read(ino, 0, content.len() as u32).unwrap();
+    assert_eq!(read_back.as_ref(), content.as_slice());
+    // And the GC mark and fsck, which read every reachable record, still
+    // walk it.
+    pool.run_gc_and_coalesce_pass().unwrap();
+    pool.checkpoint().unwrap();
+    drop(pool);
+    let live_roots = lchfs_fsck::collect_live_roots(dir.path()).unwrap();
+    let report = lchfs_fsck::check(dir.path(), &live_roots);
+    assert!(report.is_clean(), "fsck: {:?}", report.errors);
 }

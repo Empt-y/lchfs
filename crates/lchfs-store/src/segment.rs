@@ -793,24 +793,55 @@ pub fn decode_payload(
 pub struct SegmentReader {
     file: File,
     segment_id: u64,
+    stream: StreamKind,
 }
 
 impl SegmentReader {
     pub fn open(pool_root: &Path, segment_id: u64, kind: StreamKind) -> io::Result<Self> {
         let path = segment_path(pool_root, segment_id, kind);
-        Self::open_at(&path, segment_id)
+        Self::open_at(&path, segment_id, kind)
+    }
+
+    /// `open` for reading a record at a known location, which may be in
+    /// either the Data or the Meta stream whatever the caller expects.
+    ///
+    /// The dedup cache and the index are keyed by content hash alone, so a
+    /// chunk whose bytes happen to equal an encoded meta object resolves to
+    /// that object's record, and vice versa -- the empty `DirectoryObject`
+    /// is eight zero bytes, which a file's tail chunk can easily be. Same
+    /// bytes, same hash: the record is the right one, it just lives in the
+    /// other stream. Segment ids come from one counter shared by both
+    /// streams, so the id alone names the segment, and trying the other
+    /// directory cannot find a different one.
+    pub fn open_either(pool_root: &Path, segment_id: u64, kind: StreamKind) -> io::Result<Self> {
+        let other = match kind {
+            StreamKind::Data => StreamKind::Meta,
+            StreamKind::Meta => StreamKind::Data,
+            StreamKind::Delta => return Self::open(pool_root, segment_id, kind),
+        };
+        match Self::open(pool_root, segment_id, kind) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                Self::open(pool_root, segment_id, other).map_err(|_| e)
+            }
+            r => r,
+        }
+    }
+
+    /// The stream this segment was found in.
+    pub fn stream(&self) -> StreamKind {
+        self.stream
     }
 
     /// Open a reader for shard `shard_id`'s own Delta stream segment
     /// `segment_id`. See `SegmentWriter::create_delta`.
     pub fn open_delta(pool_root: &Path, shard_id: u32, segment_id: u64) -> io::Result<Self> {
         let path = delta_segment_path(pool_root, shard_id, segment_id);
-        Self::open_at(&path, segment_id)
+        Self::open_at(&path, segment_id, StreamKind::Delta)
     }
 
-    fn open_at(path: &Path, segment_id: u64) -> io::Result<Self> {
+    fn open_at(path: &Path, segment_id: u64, stream: StreamKind) -> io::Result<Self> {
         let file = OpenOptions::new().read(true).open(path)?;
-        Ok(Self { file, segment_id })
+        Ok(Self { file, segment_id, stream })
     }
 
     /// Reads and validates the segment's own header page. Not required for

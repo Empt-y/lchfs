@@ -20,10 +20,12 @@ use crate::dag_walk::LiveSet;
 use std::path::Path;
 use lchfs_format::{Hash32, SegmentState};
 use lchfs_index::{ChunkLocationCache, PendingDedupPins};
+use parking_lot::Mutex;
 use roaring::RoaringBitmap;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Below this fraction of a sealed segment's bytes still being live, it's
 /// a sweep candidate (ARCHITECTURE.md §6, "default 50%").
@@ -35,6 +37,102 @@ const DEFAULT_LIVENESS_THRESHOLD: f64 = 0.5;
 /// N sealed ids" is a correct, zero-persistence stand-in for "current/
 /// immediately-prior epoch").
 const GRACE_WINDOW_SEGMENTS: usize = 2;
+/// How many checkpoints must have completed since a Data segment sealed
+/// before coalesce may reclaim it. This is the *correctness* half of the
+/// grace period, where `GRACE_WINDOW_SEGMENTS` above is only a recency
+/// heuristic.
+///
+/// Two, not one: a segment sealing while `published_generation == G` may
+/// or may not have its records captured by the checkpoint that publishes
+/// `G+1` -- that checkpoint's drain of dirty inodes can have run before
+/// the seal. The checkpoint publishing `G+2` provably *starts* after
+/// `G+1` was published, which was after the seal, so its drain runs after
+/// every append the segment ever took, and the published root it writes
+/// references all of them.
+const CHECKPOINT_GRACE_GENERATIONS: u64 = 2;
+
+/// Above this many tracked segments, `stamp` drops the entries that have
+/// already aged past the gate. Purely a memory bound: an absent entry and
+/// an aged-out one mean the same thing (eligible).
+const SEAL_GENERATIONS_PRUNE_AT: usize = 4096;
+
+/// When each Data segment sealed, counted in published checkpoint
+/// generations -- the hard invariant behind coalesce eligibility:
+/// *coalesce must never reclaim a segment holding records newer than the
+/// last completed checkpoint.*
+///
+/// The bug this exists to prevent: `mark` counts a chunk live only if it
+/// is reachable from a published root or currently dedup-pinned. A fresh
+/// (first-occurrence) write's chunk is committed, and can be cap-sealed
+/// into a segment, *before* the checkpoint that references it runs -- in
+/// that window it is in neither set, and nothing but the count-based
+/// `GRACE_WINDOW_SEGMENTS` stood between it and the sweep. Segments seal
+/// faster than checkpoints run under any sustained write load (two
+/// segments per interval is ~25 MB/s at the default cap), so that window
+/// aged out and coalesce reclaimed live data: on a replicated pool
+/// silently lost redundancy, on a single-vdev pool real data loss (a
+/// PostgreSQL soak on an lchfs mount lost 28 chunks and crash-looped on
+/// EIO).
+///
+/// A segment with *no* entry is eligible: it sealed before this mount, so
+/// it survived into the recovered root's world and is checkpointed by
+/// definition. Only segments sealed during this mount carry a generation,
+/// which is why nothing has to be persisted for this to be safe across a
+/// crash.
+pub struct SealGenerations {
+    published_generation: Arc<AtomicU64>,
+    sealed: Mutex<HashMap<u64, u64>>,
+}
+
+impl SealGenerations {
+    pub fn new(published_generation: Arc<AtomicU64>) -> Arc<Self> {
+        Arc::new(Self {
+            published_generation,
+            sealed: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Records that `segment_id` is sealing now.
+    ///
+    /// Call this *before* the seal, not after: the sweep finds candidates
+    /// by reading segment headers off disk, so a stamp written after the
+    /// footer lands leaves a window in which the segment looks sealed and
+    /// untracked -- exactly the "no entry means eligible" default, applied
+    /// to the one segment it must not be applied to. Every caller stamps
+    /// while it still holds whatever lock keeps appends out (the shard
+    /// lock, the heal-writer map, its own fresh writer), so the generation
+    /// read here is one that was current at or after the segment's last
+    /// append, which is what the `+2` argument above rests on.
+    ///
+    /// Once per segment seal -- a rollover, not a record -- so this never
+    /// touches the write path (ARCHITECTURE.md §5: no global lock there).
+    pub fn stamp(&self, segment_id: u64) {
+        let generation = self.published_generation.load(Ordering::Acquire);
+        let mut sealed = self.sealed.lock();
+        sealed.insert(segment_id, generation);
+        if sealed.len() >= SEAL_GENERATIONS_PRUNE_AT {
+            let published = self.published_generation.load(Ordering::Acquire);
+            sealed.retain(|_, &mut sealed_at| published < sealed_at + CHECKPOINT_GRACE_GENERATIONS);
+        }
+    }
+
+    /// Whether coalesce may reclaim `segment_id` yet. Forgets an entry
+    /// that has aged past the gate: `published_generation` only ever
+    /// rises, so a segment that is eligible once is eligible forever, and
+    /// an absent entry already reads as eligible.
+    pub fn may_reclaim(&self, segment_id: u64) -> bool {
+        let mut sealed = self.sealed.lock();
+        let Some(&generation) = sealed.get(&segment_id) else {
+            return true;
+        };
+        let published = self.published_generation.load(Ordering::Acquire);
+        if published >= generation + CHECKPOINT_GRACE_GENERATIONS {
+            sealed.remove(&segment_id);
+            return true;
+        }
+        false
+    }
+}
 
 pub struct GcEngine {
     /// The pool's device set; mark reads from whichever device is the
@@ -44,6 +142,11 @@ pub struct GcEngine {
     pins: Arc<PendingDedupPins>,
     readers: SegmentReaders,
     liveness_threshold: f64,
+    /// The seal-generation gate (see `SealGenerations`). `None` for an
+    /// engine driven directly by a test or an offline tool, where no
+    /// writer is running and every segment on disk is therefore already
+    /// checkpointed; a mounted pool always installs one.
+    seal_generations: Option<Arc<SealGenerations>>,
 }
 
 impl GcEngine {
@@ -88,7 +191,29 @@ impl GcEngine {
             pins,
             readers: HashMap::new(),
             liveness_threshold: DEFAULT_LIVENESS_THRESHOLD,
+            seal_generations: None,
         }
+    }
+
+    /// Installs the seal-generation gate. A mounted pool does this at
+    /// construction, before any writer can roll a segment.
+    pub fn set_seal_generations(&mut self, seal_generations: Arc<SealGenerations>) {
+        self.seal_generations = Some(seal_generations);
+    }
+
+    /// The gate, for the `CoalesceDaemon` that owns this engine: it stamps
+    /// the segments its own repacks seal, and gates the striped segments
+    /// it repacks, through the same map.
+    pub fn seal_generations(&self) -> Option<&Arc<SealGenerations>> {
+        self.seal_generations.as_ref()
+    }
+
+    /// Whether the sweep may reclaim `segment_id` yet -- `true` when no
+    /// gate is installed (see the field's comment).
+    pub fn may_reclaim(&self, segment_id: u64) -> bool {
+        self.seal_generations
+            .as_ref()
+            .is_none_or(|gens| gens.may_reclaim(segment_id))
     }
 
     /// Walk RootObject -> InoMap -> per-ino InodeObject -> DirectoryObject
@@ -233,6 +358,10 @@ impl GcEngine {
         sealed_ids[..grace_cutoff]
             .iter()
             .copied()
+            // The hard gate: a segment sealed since the last checkpoint
+            // holds records no published root references yet, and mark
+            // cannot tell those from dead ones. See `SealGenerations`.
+            .filter(|&id| self.may_reclaim(id))
             .filter(|&id| {
                 let Ok(meta) = std::fs::metadata(crate::segment::segment_path(
                     vdev_root,

@@ -211,7 +211,7 @@ impl ReaderCache {
         if let Some(reader) = shard.lock().get(&key) {
             return Ok(Arc::clone(reader));
         }
-        let opened = Arc::new(SegmentReader::open(&root()?, segment_id, kind)?);
+        let opened = Arc::new(SegmentReader::open_either(&root()?, segment_id, kind)?);
         Ok(Arc::clone(shard.lock().entry(key).or_insert(opened)))
     }
 }
@@ -811,6 +811,13 @@ struct PoolShared {
     /// coalesce.rs to `Namespace` -- see `CoalesceDaemon::run_pass`'s doc
     /// comment for why that specific check exists.
     published_generation: Arc<AtomicU64>,
+    /// When each Data segment sealed during this mount, in checkpoint
+    /// generations -- what stops coalesce reclaiming a segment whose
+    /// records no published root references yet (see
+    /// `gc::SealGenerations`). Shared with every shard's writer, which
+    /// stamps it at each rollover, and with the coalesce daemon, which
+    /// gates on it.
+    seal_generations: Arc<gc::SealGenerations>,
 
     committer_pool: CommitterPool,
     prep_pool: IngestPreparationPool,
@@ -898,6 +905,8 @@ impl Pool {
         dirs.insert(ROOT_DIR_INO, DirectoryObject::default());
 
         let next_segment_id = Arc::new(AtomicU64::new(0));
+        let published_generation = Arc::new(AtomicU64::new(0));
+        let seal_generations = gc::SealGenerations::new(Arc::clone(&published_generation));
         let shard_count = params.logical_shard_count;
         let committer_pool = CommitterPool::new_on(
             Arc::clone(&vdev_set),
@@ -906,6 +915,7 @@ impl Pool {
             SHARD_RING_CAPACITY,
             params.data_segment_cap_bytes as u64,
             Arc::clone(&next_segment_id),
+            Arc::clone(&seal_generations),
         )?;
 
         let shard_delta_logs = (0..shard_count)
@@ -939,7 +949,6 @@ impl Pool {
             Arc::clone(&dedup_index),
             Arc::clone(&dedup_pins),
         );
-        let published_generation = Arc::new(AtomicU64::new(0));
 
         let namespace = Namespace {
             inodes,
@@ -978,15 +987,20 @@ impl Pool {
             meta_writer: Mutex::new(None),
             next_segment_id,
             published_generation,
+            seal_generations: Arc::clone(&seal_generations),
             committer_pool,
             prep_pool,
             shard_delta_logs,
             checkpoint_lock: Mutex::new(()),
-            coalesce: Mutex::new(coalesce::CoalesceDaemon::new_on(
-                Arc::clone(&vdev_set),
-                Arc::clone(&dedup_index),
-                Arc::clone(&dedup_pins),
-            )),
+            coalesce: Mutex::new({
+                let mut daemon = coalesce::CoalesceDaemon::new_on(
+                    Arc::clone(&vdev_set),
+                    Arc::clone(&dedup_index),
+                    Arc::clone(&dedup_pins),
+                );
+                daemon.set_seal_generations(Arc::clone(&seal_generations));
+                daemon
+            }),
             dedup: Mutex::new(dedup::DedupScanner::new_on(
                 Arc::clone(&vdev_set),
                 Arc::clone(&dedup_index),
@@ -1498,6 +1512,8 @@ impl Pool {
             max_segment_id = max_segment_id.max(highest_segment_id_on(&vdev.root)?);
         }
         let next_segment_id = Arc::new(AtomicU64::new(max_segment_id + 1));
+        let published_generation = Arc::new(AtomicU64::new(slot.generation));
+        let seal_generations = gc::SealGenerations::new(Arc::clone(&published_generation));
         let shard_count = root.pool_params.logical_shard_count;
         let committer_pool = CommitterPool::new_on(
             Arc::clone(&vdev_set),
@@ -1506,6 +1522,7 @@ impl Pool {
             SHARD_RING_CAPACITY,
             root.pool_params.data_segment_cap_bytes as u64,
             Arc::clone(&next_segment_id),
+            Arc::clone(&seal_generations),
         )?;
 
         // Two-tier crash recovery (ARCHITECTURE.md §7): the InoMap walk
@@ -1653,7 +1670,6 @@ impl Pool {
             Arc::clone(&dedup_index),
             Arc::clone(&dedup_pins),
         );
-        let published_generation = Arc::new(AtomicU64::new(slot.generation));
 
         let namespace = Namespace {
             inodes,
@@ -1714,15 +1730,20 @@ impl Pool {
             meta_writer: Mutex::new(None),
             next_segment_id,
             published_generation,
+            seal_generations: Arc::clone(&seal_generations),
             committer_pool,
             prep_pool,
             shard_delta_logs,
             checkpoint_lock: Mutex::new(()),
-            coalesce: Mutex::new(coalesce::CoalesceDaemon::new_on(
-                Arc::clone(&vdev_set),
-                Arc::clone(&dedup_index),
-                Arc::clone(&dedup_pins),
-            )),
+            coalesce: Mutex::new({
+                let mut daemon = coalesce::CoalesceDaemon::new_on(
+                    Arc::clone(&vdev_set),
+                    Arc::clone(&dedup_index),
+                    Arc::clone(&dedup_pins),
+                );
+                daemon.set_seal_generations(Arc::clone(&seal_generations));
+                daemon
+            }),
             dedup: Mutex::new(dedup::DedupScanner::new_on(
                 Arc::clone(&vdev_set),
                 Arc::clone(&dedup_index),
@@ -3004,6 +3025,10 @@ impl PoolShared {
             .is_some_and(|w| w.current_size() + raw_payload.len() as u64 > u64::from(cap));
         if needs_rollover {
             let full = writers.remove(&key).expect("checked present");
+            // Heal segments are Data-stream segments too, and the sweep
+            // does not know a heal from a committer's write: stamp them
+            // the same way, before the seal (`gc::SealGenerations`).
+            self.stamp_seal(&full);
             self.report_faults(full.seal()?);
         }
         let writer = match writers.entry(key) {
@@ -3075,9 +3100,20 @@ impl PoolShared {
     fn seal_heal_writers(&self) -> Result<(), PoolError> {
         let drained: Vec<_> = self.heal_writers.lock().drain().collect();
         for (_, w) in drained {
+            self.stamp_seal(&w);
             self.report_faults(w.seal()?);
         }
         Ok(())
+    }
+
+    /// Records a Data segment this pool is about to seal outside the
+    /// committer pool (a heal writer) in the seal-generation map, so the
+    /// sweep gives it the same checkpoint grace. Meta segments are never
+    /// coalesce candidates (gc.rs is Data-only), so they are skipped.
+    fn stamp_seal(&self, writer: &SegmentWriter) {
+        if writer.stream_kind() == StreamKind::Data {
+            self.seal_generations.stamp(writer.segment_id());
+        }
     }
 
     fn record_corruption(&self, event: CorruptionEvent) {
@@ -3732,7 +3768,9 @@ impl PoolShared {
     ) -> Result<(Hash32, ExtentLocation), PoolError> {
         let encoded = lchfs_format::encode(value).map_err(|e| PoolError::Format(e.to_string()))?;
         let hash = Hash32::of(&encoded);
-        if let Some(loc) = self.dedup_index.get(hash) {
+        if let Some((loc, vdev_id)) = self.dedup_index.get_tagged(hash)
+            && self.is_meta_record(loc, vdev_id)
+        {
             return Ok((hash, loc));
         }
         let mut slot = self.meta_writer.lock();
@@ -3764,6 +3802,23 @@ impl PoolShared {
         self.record_replicated_location(hash, loc, &vdev_ids)?;
         drop(slot);
         Ok((hash, loc))
+    }
+
+    /// Whether `loc` on `vdev_id` is a Meta-stream record: the only kind of
+    /// hit `put_meta_object` may reuse. Meta segments are never reclaimed,
+    /// so pointing a new object at one needs no pin. A Data record with the
+    /// same bytes (see `SegmentReader::open_either`) is another matter --
+    /// coalesce drops it once no file references it, and nothing would
+    /// hold it for the object -- so that case writes the object afresh,
+    /// which also repoints the hash at the permanent copy. Cheap on the
+    /// hot path: every checkpoint re-puts each inode, and the segment's
+    /// reader is almost always already open.
+    fn is_meta_record(&self, loc: ExtentLocation, vdev_id: u16) -> bool {
+        vdev_id != stripe::STRIPED
+            && self
+                .readers
+                .get_or_open(vdev_id, loc.segment_id, StreamKind::Meta, || self.vdev_root(vdev_id))
+                .is_ok_and(|r| r.stream() == StreamKind::Meta)
     }
 
     /// The meta writer, created on the online set as it stands if there
@@ -4141,6 +4196,9 @@ impl PoolShared {
     /// touches `file_state` -- `read()` assembles straight from the
     /// session while one is open (see `read`'s doc comment).
     fn write_incremental(&self, ino: u64, buf: &[u8]) -> Result<(), PoolError> {
+        // Before any chunk this write commits reaches a segment: see
+        // `mark_dirty_before_commit`.
+        self.mark_dirty_before_commit(ino);
         let base_offset;
         let mut prepared: Vec<(u64, Vec<u8>)> = Vec::new();
         {
@@ -4634,7 +4692,36 @@ impl PoolShared {
     /// representation from `file_state[ino]`'s current bytes, updates
     /// size/mtime/ctime, and marks the inode dirty for the next
     /// checkpoint.
+    /// Marks `ino` dirty *before* the operation commits any chunk of it.
+    ///
+    /// Both write paths also mark it at the end, when the size and mtime
+    /// go back into the namespace, and for the namespace that is the only
+    /// mark that matters. This earlier one is what makes coalesce safe.
+    ///
+    /// A committed chunk becomes reclaimable garbage in the eyes of
+    /// `GcEngine::mark` until some published root references it, and only
+    /// a checkpoint that *finalizes this inode* puts it there. A
+    /// checkpoint finalizes exactly the inodes it found in `dirty_inodes`
+    /// when it drained the set, and it takes each one's inode lock to do
+    /// it -- which this operation holds from before the commit until
+    /// after the chunk is registered in the session (or `file_state`). So
+    /// marking here means: every checkpoint that drains the set after
+    /// this point *will* wait for this operation and capture its chunks.
+    /// Marking only at the end left a window where the chunk was on disk,
+    /// its segment could seal, and any number of checkpoints could come
+    /// and go without the inode ever being in their dirty set -- which is
+    /// precisely what let the sweep reclaim live data faster than
+    /// `SealGenerations`' two-checkpoint grace could cover (a chaos thread
+    /// checkpointing flat out drove two full checkpoints through that
+    /// window; so did a database doing small writes under a soak).
+    fn mark_dirty_before_commit(&self, ino: u64) {
+        self.namespace.lock().dirty_inodes.insert(ino);
+    }
+
     fn rechunk_and_touch(&self, ino: u64) -> Result<(), PoolError> {
+        // Before the first `commit_chunk` below, not after the rechunk:
+        // see `mark_dirty_before_commit`.
+        self.mark_dirty_before_commit(ino);
         let content_snapshot = self.file_state.lock()[&ino].contents.clone();
         let new_size = content_snapshot.len() as u64;
 
@@ -5122,6 +5209,16 @@ impl PoolShared {
 
         let ino_lock = self.lock_for_ino(ino);
         let _guard = ino_lock.lock();
+
+        // `finalize_incremental_session` below commits this session's
+        // trailing chunk, and what fsync then publishes -- the delta log
+        // and `file_state` -- is invisible to `GcEngine::mark`, which only
+        // walks published roots. Until a checkpoint encodes this file's
+        // chunk list into the meta stream, that chunk looks like garbage
+        // to the sweep. Marking here makes the next checkpoint do exactly
+        // that, and (like every other commit site) does it *before* the
+        // chunk exists: see `mark_dirty_before_commit`.
+        self.mark_dirty_before_commit(ino);
 
         let session_chunks = self.finalize_incremental_session(ino)?;
 
@@ -5631,7 +5728,7 @@ pub(crate) fn get_reader_lazy(
 ) -> Result<&SegmentReader, PoolError> {
     let key = (vdev_id, segment_id, kind);
     if let std::collections::hash_map::Entry::Vacant(e) = readers.entry(key) {
-        e.insert(SegmentReader::open(&vdev_root()?, segment_id, kind)?);
+        e.insert(SegmentReader::open_either(&vdev_root()?, segment_id, kind)?);
     }
     Ok(readers.get(&key).unwrap())
 }

@@ -280,6 +280,13 @@ impl CoalesceDaemon {
             if budget == 0 {
                 break;
             }
+            // Same gate as the mirrored sweep: this drops every record the
+            // mark missed, and a stripe keeps the segment id (and so the
+            // seal generation) of the mirrored segment it was converted
+            // from. See `gc::SealGenerations`.
+            if !self.gc.may_reclaim(segment_id) {
+                continue;
+            }
             let root_of = |id: u16| self.vdevs.root_of(id);
             let Ok(reader) = stripe::StripeReader::open(segment_id, root_of, &online) else { continue };
             let total = reader.desc.logical_len;
@@ -354,6 +361,7 @@ impl CoalesceDaemon {
         let body = reader.verified_body()?;
         let pins = self.gc.pins();
         let mut keep = Vec::new();
+        let mut dead = Vec::new();
         for (header, offset) in stripe::scan_body(&body) {
             let wanted = match live {
                 Some(bitmap) => bitmap.contains(offset) || pins.is_pinned(header.content_hash),
@@ -367,6 +375,8 @@ impl CoalesceDaemon {
                 };
                 let (full, raw) = reader.read_record_raw(loc).map_err(to_io_err)?;
                 keep.push((full, raw));
+            } else {
+                dead.push(header.content_hash);
             }
         }
         let new_id = next_segment_id.fetch_add(1, Ordering::Relaxed);
@@ -386,17 +396,25 @@ impl CoalesceDaemon {
                 records.push((header.content_hash, new_loc));
             }
             written = writer.vdev_ids().to_vec();
+            // Stamped like any other seal: the records copied forward
+            // include pinned ones no published root names yet, so this
+            // segment gets the same two checkpoints of grace.
+            self.stamp_seal(new_id);
             for id in writer.seal()? {
                 self.vdevs.fault(id);
             }
         }
-        if let Some((at_mark, published)) = gate
-            && published.load(Ordering::Acquire) != at_mark
-        {
+        let proceed = match gate {
+            Some((at_mark, published)) => {
+                self.forget_dead(stripe::STRIPED, segment_id, &dead, at_mark, published, persisted_index)?
+            }
+            None => true,
+        };
+        if !proceed {
             for vdev in &online {
                 let _ = std::fs::remove_file(segment::segment_path(&vdev.root, new_id, StreamKind::Data));
             }
-            tracing::info!("stripe: segment {segment_id} not repacked; a checkpoint landed mid-pass");
+            tracing::info!("stripe: segment {segment_id} not repacked; a checkpoint or a dedup hit landed mid-pass");
             return Ok(None);
         }
         persisted_index
@@ -470,6 +488,7 @@ impl CoalesceDaemon {
         // `PendingDedupPins`'s doc comment). Not the final word either --
         // the generation check right before this segment is actually
         // deleted, below, covers what this recheck itself can still miss.
+        let mut dead = Vec::new();
         for &(offset, ref header) in &dropped {
             if pins.is_pinned(header.content_hash) {
                 let loc = ExtentLocation {
@@ -479,14 +498,16 @@ impl CoalesceDaemon {
                 };
                 let (full_header, raw_payload) = reader.read_record_raw(loc).map_err(to_io_err)?;
                 live_records.push((full_header, raw_payload));
+            } else {
+                dead.push(header.content_hash);
             }
         }
 
         if live_records.is_empty() {
-            // Fully dead segment: nothing to copy forward, no index
-            // update needed -- just tombstone + delete directly, gated on
-            // the same freshness check as the normal path below.
-            if published_generation.load(Ordering::Acquire) != generation_at_mark {
+            // Fully dead segment: nothing to copy forward -- just forget
+            // its records and tombstone + delete, behind the same gate as
+            // the normal path below.
+            if !self.forget_dead(vdev.id, old_id, &dead, generation_at_mark, published_generation, persisted_index)? {
                 return Ok(());
             }
             segment::mark_coalesced(root, old_id, StreamKind::Data)?;
@@ -510,6 +531,7 @@ impl CoalesceDaemon {
         }
         // A repack writes to one device; a failure here is the daemon's
         // to report like any writer's.
+        self.stamp_seal(new_id);
         for id in writer.seal()? {
             self.vdevs.fault(id);
         }
@@ -545,7 +567,10 @@ impl CoalesceDaemon {
         // regardless -- content genuinely live at mark time stays
         // referenceable forever, a generation bump never un-lives it -- so
         // there's nothing to roll back.
-        if published_generation.load(Ordering::Acquire) != generation_at_mark {
+        //
+        // The gate itself lives in `forget_dead`, which also takes the dead
+        // records out of the index -- the other half of reclaiming them.
+        if !self.forget_dead(vdev.id, old_id, &dead, generation_at_mark, published_generation, persisted_index)? {
             return Ok(());
         }
 
@@ -554,8 +579,74 @@ impl CoalesceDaemon {
         Ok(())
     }
 
+    /// The last step before a segment holding dead records is deleted:
+    /// takes those records out of the dedup cache and the persisted index,
+    /// or, if deleting is no longer safe, changes nothing and returns
+    /// `false` so the caller keeps the segment for the next pass.
+    ///
+    /// Leaving the entries behind was a data-loss bug in its own right:
+    /// once the segment was gone they were dedup targets for bytes that no
+    /// longer existed, and the next write of identical content -- a
+    /// database page going back to an earlier state is enough -- resolved
+    /// against one and referenced a record nothing could read.
+    ///
+    /// Cache first, then the pin check: `prepare_chunk` pins before it
+    /// looks up, so a write that found one of these entries is already
+    /// pinned by the time this looks, and one that looks after the removal
+    /// misses and stores a fresh copy (`PendingDedupPins`'s doc comment).
+    /// The generation check covers a pin taken *and* released inside the
+    /// pass, which only a published checkpoint can do. `vdev_tag` is the
+    /// key the records are indexed under on this segment's device --
+    /// `STRIPED_VDEV` for a stripe.
+    fn forget_dead(
+        &self,
+        vdev_tag: u16,
+        segment_id: u64,
+        dead: &[Hash32],
+        generation_at_mark: u64,
+        published_generation: &AtomicU64,
+        persisted_index: &RwLock<RedbIndex>,
+    ) -> io::Result<bool> {
+        let cache = self.gc_locations();
+        let removed: Vec<(Hash32, (ExtentLocation, u16))> = dead
+            .iter()
+            .filter_map(|&h| cache.remove_if_in(h, segment_id, vdev_tag).map(|e| (h, e)))
+            .collect();
+        let pins = self.gc.pins();
+        if published_generation.load(Ordering::Acquire) != generation_at_mark
+            || dead.iter().any(|&h| pins.is_pinned(h))
+        {
+            for (h, (loc, v)) in removed {
+                cache.put_if_absent(h, loc, v);
+            }
+            return Ok(false);
+        }
+        let entries: Vec<(Hash32, u16)> = dead.iter().map(|&h| (h, vdev_tag)).collect();
+        persisted_index
+            .write()
+            .forget_segment_records(segment_id, &entries)
+            .map_err(to_io_err)?;
+        Ok(true)
+    }
+
     fn gc_locations(&self) -> &ChunkLocationCache {
         self.gc.locations()
+    }
+
+    /// Records a segment this daemon has just written as sealing now, so
+    /// the next pass gives it the same checkpoint grace a committer's
+    /// segment gets (`gc::SealGenerations`). No-op for a daemon driven
+    /// directly by a test, which has no gate.
+    fn stamp_seal(&self, segment_id: u64) {
+        if let Some(gens) = self.gc.seal_generations() {
+            gens.stamp(segment_id);
+        }
+    }
+
+    /// Installs the pool's seal-generation gate on the engine this daemon
+    /// marks with.
+    pub fn set_seal_generations(&mut self, seal_generations: Arc<crate::gc::SealGenerations>) {
+        self.gc.set_seal_generations(seal_generations);
     }
 }
 

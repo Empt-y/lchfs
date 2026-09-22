@@ -373,6 +373,42 @@ impl RedbIndex {
         Ok(removed)
     }
 
+    /// Drops the entry for each `(hash, vdev)` in `entries`, but only where
+    /// it still points into `segment_id`, in one transaction; returns how
+    /// many went. What reclaiming dead records needs: coalesce deletes the
+    /// segment that held them, and an entry left behind is a dedup target
+    /// for bytes that no longer exist -- the next write of identical
+    /// content resolves against it, and the file it lands in references a
+    /// record nothing can read. An entry that has since moved (relocated,
+    /// or rewritten by a fresh copy of the same content) is real and kept.
+    pub fn forget_segment_records(
+        &mut self,
+        segment_id: u64,
+        entries: &[(Hash32, u16)],
+    ) -> Result<usize, IndexError> {
+        let mut txn = self.db.begin_write().map_err(err)?;
+        txn.set_durability(Durability::Immediate).map_err(err)?;
+        let mut removed = 0;
+        {
+            let mut table = txn.open_table(CHUNK_LOCATIONS).map_err(err)?;
+            for &(hash, vdev_id) in entries {
+                let key = encode_chunk_key(hash, vdev_id);
+                let stale = table
+                    .get(key.as_slice())
+                    .map_err(err)?
+                    .map(|g| decode_location(g.value()))
+                    .transpose()?
+                    .is_some_and(|l| l.segment_id == segment_id);
+                if stale {
+                    table.remove(key.as_slice()).map_err(err)?;
+                    removed += 1;
+                }
+            }
+        }
+        txn.commit().map_err(err)?;
+        Ok(removed)
+    }
+
     /// Forgets one replica's entry. Not used by the engine itself -- a
     /// device that misses writes simply never gets the entry -- but it is
     /// how a test manufactures that state without taking a vdev offline.
@@ -559,6 +595,29 @@ impl ChunkLocationCache {
         bucket.insert(hash, (loc, vdev_id));
     }
 
+    /// Removes `hash`'s entry if it is the copy in `segment_id` on
+    /// `vdev_id`, returning what was removed so a caller that backs out
+    /// can `put_if_absent` it again. Anything else -- no entry, or one
+    /// that has already moved -- is left alone.
+    pub fn remove_if_in(&self, hash: Hash32, segment_id: u64, vdev_id: u16) -> Option<(ExtentLocation, u16)> {
+        let mut bucket = self.buckets[bucket_for(hash)]
+            .write()
+            .expect("ChunkLocationCache lock poisoned");
+        match bucket.get(&hash) {
+            Some(&(loc, v)) if loc.segment_id == segment_id && v == vdev_id => bucket.remove(&hash),
+            _ => None,
+        }
+    }
+
+    /// `put`, unless `hash` already has an entry -- which, the content
+    /// being the same, is at least as current as the one offered here.
+    pub fn put_if_absent(&self, hash: Hash32, loc: ExtentLocation, vdev_id: u16) {
+        let mut bucket = self.buckets[bucket_for(hash)]
+            .write()
+            .expect("ChunkLocationCache lock poisoned");
+        bucket.entry(hash).or_insert((loc, vdev_id));
+    }
+
     /// Bulk-load preferred replicas as `iter_preferred_locations` yields
     /// them: on the mount-time fast path, on a promotion, or from a full
     /// segment scan on the cold-rebuild path.
@@ -603,12 +662,20 @@ impl ChunkLocationCache {
 /// reclaim its only physical copy out from under the in-flight write --
 /// silent, durable data loss with no crash or error involved.
 ///
-/// This registry closes that gap: `prepare_chunk` pins a hash the instant
-/// it resolves a dedup hit; `Pool::run_checkpoint` unpins each hash actually
+/// This registry closes that gap: `prepare_chunk` pins a hash *before* it
+/// looks it up, keeping the pin only on a hit; `Pool::run_checkpoint` unpins each hash actually
 /// captured by the root it just published, once that root is durable and
 /// visible (see that function for exactly where). `GcEngine`/`CoalesceDaemon`
 /// treat every currently-pinned hash's location as live, in addition to
 /// whatever the DAG walk itself finds.
+///
+/// Pin-then-look-up is what makes the pin airtight. Before deleting a
+/// segment, coalesce removes its dead records from `ChunkLocationCache`
+/// and only then checks their pins. A write whose lookup came before that
+/// removal took its pin earlier still, so the check sees it and coalesce
+/// backs off; a lookup after it misses and the write stores a fresh copy.
+/// Look-up-then-pin leaves a window where the write holds a location and
+/// no pin yet, and a pass can check, find nothing, and delete.
 ///
 /// Refcounted, not a plain set, because the same hash can be pinned by
 /// multiple concurrent dedup-hit writes (or the same write's multiple

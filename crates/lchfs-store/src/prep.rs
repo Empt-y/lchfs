@@ -58,20 +58,23 @@ pub enum PreparedChunk {
 /// time, hashing compressed output would break dedup for identical logical
 /// content compressed differently on different occasions).
 ///
-/// A dedup hit pins `content_hash` in `pins` before returning it -- see
+/// A dedup hit returns with `content_hash` pinned in `pins` -- see
 /// `PendingDedupPins`'s doc comment for why: the caller is about to start
 /// depending on `location` before its own reference to it is checkpointed,
 /// and a concurrent GC/Coalesce pass must not reclaim it out from under
 /// that in-flight write.
 pub fn prepare_chunk(raw_bytes: &[u8], dedup_index: &ChunkLocationCache, pins: &PendingDedupPins) -> PreparedChunk {
     let content_hash = Hash32::of(raw_bytes);
+    // Pin first, look up second -- the other order races coalesce's
+    // reclaim (see `PendingDedupPins`'s doc comment).
+    pins.pin(content_hash);
     if let Some(location) = dedup_index.get(content_hash) {
-        pins.pin(content_hash);
         return PreparedChunk::Dedup {
             content_hash,
             location,
         };
     }
+    pins.unpin(content_hash);
 
     let decision = lchfs_compress::sample_and_decide(raw_bytes);
     let (codec_id, payload): (CodecId, Vec<u8>) = match decision {
