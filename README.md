@@ -59,12 +59,17 @@ in ARCHITECTURE.md §18; the short version:
 
   A pool always keeps one non-TPM slot.
 - **Status:**
-  - Milestone 1, the crypto core (keyring, slots, envelopes, fuzz
-    targets, software-TPM tests in CI), is on `master`.
-  - Engine integration is on the `encryption-m2-wip` branch and is not
-    usable yet.
-  - Still to come: CLI and fsck support, in-place conversion of
-    plaintext pools, key rotation, and hardening.
+  - Milestones 1 and 2 are on `master`: the crypto core (keyring, slots,
+    envelopes, fuzz targets, software-TPM tests in CI) and the engine
+    integration. The library can create and open encrypted pools
+    (`Pool::create_encrypted`, `Pool::open_with`).
+  - The whole test suite runs twice in CI, once plaintext and once with
+    every pool encrypted, and a leakage test checks that no file content,
+    name, xattr, symlink target or plaintext content hash reaches the disk.
+  - Not usable from the command line yet: `lchfs` has no flags to create,
+    unlock or manage an encrypted pool. That is next (milestone 3),
+    followed by in-place conversion of plaintext pools, key rotation, and
+    hardening.
 
 ## Build
 
