@@ -22,7 +22,7 @@ use lchfs_format::{ExtentLocation, Hash32};
 use lchfs_index::{ChunkLocationCache, IndexStore, PendingDedupPins, RedbIndex};
 use parking_lot::RwLock;
 use roaring::RoaringBitmap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -91,6 +91,105 @@ impl CoalesceDaemon {
 
     fn primary_id(&self) -> u16 {
         self.gc.primary_id()
+    }
+
+    /// A mark pass on its own: what is live from `live_roots`, plus what is
+    /// pinned. What conversion's completion check and retirement mark with.
+    pub fn mark(&mut self, live_roots: &[Hash32]) -> LiveSet {
+        self.gc.mark(live_roots)
+    }
+
+    /// Retirement's data half (ARCHITECTURE.md §18): every sealed data
+    /// segment, on every online device, holding any record of an epoch
+    /// other than `target` is repacked now, whatever its live fraction and
+    /// however recent -- the grace window is a recency heuristic, and
+    /// retirement has to reach the last segments too. The correctness gates
+    /// stay: `may_reclaim` (nothing a published root does not yet cover),
+    /// the pin recheck, and `forget_dead`'s generation check. Every live
+    /// record is in `target` by now, so the repack copies it forward as it
+    /// is and leaves the old epoch's records behind with the old segment.
+    ///
+    /// Stripes holding such a record are decoded back into mirrored
+    /// segments the same way. Returns how many segments still hold another
+    /// epoch's records -- ones a gate held back, for the next attempt.
+    #[allow(clippy::too_many_arguments)]
+    pub fn retire_data(
+        &mut self,
+        live: &LiveSet,
+        target: u16,
+        generation_at_mark: u64,
+        published_generation: &AtomicU64,
+        persisted_index: &RwLock<RedbIndex>,
+        next_segment_id: &AtomicU64,
+    ) -> io::Result<usize> {
+        let mut held_back = 0;
+        for vdev in self.vdevs.online() {
+            let bitmaps = if vdev.id == self.primary_id() {
+                live.by_segment.clone()
+            } else {
+                live.resolve_on(vdev.id, persisted_index).map_err(to_io_err)?
+            };
+            for segment_id in segment::segment_ids_on(&vdev.root, StreamKind::Data) {
+                let Ok(reader) = SegmentReader::open(&vdev.root, segment_id, StreamKind::Data) else { continue };
+                let sealed = reader
+                    .read_header()
+                    .is_ok_and(|h| h.state != lchfs_format::SegmentState::Open);
+                if !sealed || !holds_other_epoch(&reader, target) {
+                    continue;
+                }
+                if !self.gc.may_reclaim(segment_id) {
+                    held_back += 1;
+                    continue;
+                }
+                self.repack_segment(
+                    &vdev,
+                    segment_id,
+                    &bitmaps,
+                    &live.hashes,
+                    generation_at_mark,
+                    published_generation,
+                    persisted_index,
+                    next_segment_id,
+                )?;
+                if segment::segment_path(&vdev.root, segment_id, StreamKind::Data).exists() {
+                    held_back += 1;
+                }
+            }
+        }
+
+        let online = self.vdevs.online();
+        let striped_live = live.resolve_on(stripe::STRIPED, persisted_index).map_err(to_io_err)?;
+        let empty = RoaringBitmap::new();
+        for segment_id in stripe::striped_segment_ids(&online) {
+            let root_of = |id: u16| self.vdevs.root_of(id);
+            let Ok(reader) = stripe::StripeReader::open(segment_id, root_of, &online) else {
+                held_back += 1;
+                continue;
+            };
+            let Ok(body) = reader.verified_body() else {
+                held_back += 1;
+                continue;
+            };
+            let other = stripe::scan_body(&body).iter().any(|(h, _)| lchfs_format::record_epoch(h) != target);
+            if !other {
+                continue;
+            }
+            if !self.gc.may_reclaim(segment_id) {
+                held_back += 1;
+                continue;
+            }
+            let bitmap = striped_live.get(&segment_id).unwrap_or(&empty);
+            let gate = Some((generation_at_mark, published_generation));
+            match self.unstripe(&reader, Some((bitmap, &live.hashes)), gate, persisted_index, next_segment_id) {
+                Ok(Some(_)) => {}
+                Ok(None) => held_back += 1,
+                Err(e) => {
+                    tracing::warn!("retire: stripe {segment_id} cannot be repacked yet ({e})");
+                    held_back += 1;
+                }
+            }
+        }
+        Ok(held_back)
     }
 
     /// One idle-cycle pass: mark, find segments below the liveness
@@ -165,6 +264,7 @@ impl CoalesceDaemon {
                     vdev,
                     segment_id,
                     &bitmaps,
+                    &live.hashes,
                     generation_at_mark,
                     published_generation,
                     persisted_index,
@@ -330,7 +430,7 @@ impl CoalesceDaemon {
             let live_bitmap = striped_live.get(&segment_id).unwrap_or(&empty);
             budget = budget.saturating_sub(total);
             let gate = Some((generation_at_mark, published_generation));
-            if let Err(e) = self.unstripe(&reader, Some(live_bitmap), gate, persisted_index, next_segment_id) {
+            if let Err(e) = self.unstripe(&reader, Some((live_bitmap, &live.hashes)), gate, persisted_index, next_segment_id) {
                 tracing::warn!("stripe: segment {segment_id} cannot be repacked ({e})");
             }
         }
@@ -383,7 +483,7 @@ impl CoalesceDaemon {
     fn unstripe(
         &mut self,
         reader: &stripe::StripeReader,
-        live: Option<&RoaringBitmap>,
+        live: Option<(&RoaringBitmap, &HashSet<Hash32>)>,
         gate: Option<(u64, &AtomicU64)>,
         persisted_index: &RwLock<RedbIndex>,
         next_segment_id: &AtomicU64,
@@ -395,8 +495,13 @@ impl CoalesceDaemon {
         let mut keep = Vec::new();
         let mut dead = Vec::new();
         for (header, offset) in stripe::scan_body(&body) {
+            // Live by location, or by hash: a stripe is the one logical copy
+            // of what it holds, and an index entry missing for it must not
+            // turn a live record into a dropped one (see `repack_segment`).
             let wanted = match live {
-                Some(bitmap) => bitmap.contains(offset) || pins.is_pinned(header.content_hash),
+                Some((bitmap, hashes)) => {
+                    bitmap.contains(offset) || hashes.contains(&header.content_hash) || pins.is_pinned(header.content_hash)
+                }
                 None => true,
             };
             if wanted {
@@ -471,6 +576,7 @@ impl CoalesceDaemon {
         vdev: &Vdev,
         old_id: u64,
         live: &HashMap<u64, RoaringBitmap>,
+        live_hashes: &HashSet<Hash32>,
         generation_at_mark: u64,
         published_generation: &AtomicU64,
         persisted_index: &RwLock<RedbIndex>,
@@ -495,7 +601,10 @@ impl CoalesceDaemon {
         let mut live_records = Vec::new();
         let mut dropped = Vec::new();
         for (header, offset) in reader.scan() {
-            if live_bitmap.contains(offset) {
+            if live_bitmap.contains(offset)
+                || (live_hashes.contains(&header.content_hash)
+                    && !self.other_copy_on(vdev, header.content_hash, old_id, offset, persisted_index))
+            {
                 let loc = ExtentLocation {
                     segment_id: old_id,
                     offset,
@@ -650,6 +759,38 @@ impl CoalesceDaemon {
         Ok(true)
     }
 
+    /// Whether `vdev` holds `hash` somewhere other than `(segment_id,
+    /// offset)`, by its index entry, in a segment still on disk.
+    ///
+    /// The per-device sweep's bitmaps come from the index (`resolve_on`),
+    /// so a record whose `(hash, vdev)` entry is missing -- a device that
+    /// took the write while a fault was being reported, a heal whose index
+    /// write lost a race -- was never marked live on that device, and a
+    /// repack dropped the device's only copy of a live record. The mirror
+    /// stayed readable through the other device, which is why only fsck's
+    /// replica comparison ever saw it (the rare `ReplicaMissing` in the
+    /// mirror fault storm), until retirement repacked every segment on
+    /// every device and made it certain. A live hash is dead *here* only
+    /// if this device provably has it elsewhere.
+    fn other_copy_on(
+        &self,
+        vdev: &Vdev,
+        hash: Hash32,
+        segment_id: u64,
+        offset: u32,
+        persisted_index: &RwLock<RedbIndex>,
+    ) -> bool {
+        let Ok(entries) = persisted_index.read().chunk_locations(hash) else {
+            return false;
+        };
+        entries.iter().any(|&(v, l)| {
+            v == vdev.id
+                && (l.segment_id, l.offset) != (segment_id, offset)
+                && (segment::segment_path(&vdev.root, l.segment_id, StreamKind::Data).exists()
+                    || segment::segment_path(&vdev.root, l.segment_id, StreamKind::Meta).exists())
+        })
+    }
+
     fn gc_locations(&self) -> &ChunkLocationCache {
         self.gc.locations()
     }
@@ -669,6 +810,12 @@ impl CoalesceDaemon {
     pub fn set_seal_generations(&mut self, seal_generations: Arc<crate::gc::SealGenerations>) {
         self.gc.set_seal_generations(seal_generations);
     }
+}
+
+/// Whether any record in the segment `reader` covers is of an epoch other
+/// than `target`. Keyless: the epoch is in the outer header.
+pub fn holds_other_epoch(reader: &SegmentReader, target: u16) -> bool {
+    reader.scan().any(|(h, _)| lchfs_format::record_epoch(&h) != target)
 }
 
 /// The pool's erasure-coding policy as the daemon sees it (§17.2.5).

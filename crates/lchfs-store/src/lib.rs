@@ -41,6 +41,7 @@ pub mod delta_log;
 pub mod gc;
 pub mod ingress;
 pub mod prep;
+pub mod rekey;
 pub mod segment;
 pub mod stripe;
 pub mod vdevs;
@@ -407,6 +408,10 @@ const SHARD_RING_CAPACITY: usize = 256;
 /// How often the background Checkpoint Coordinator runs a full epoch
 /// (ARCHITECTURE.md §3: "every 5s default, or on fsync(), ring pressure,
 /// or unmount").
+/// How often the conversion task looks for work. Idle unless the keyring
+/// records a conversion; a step that finds one runs to the end of its
+/// phase's pass.
+const REKEY_INTERVAL: Duration = Duration::from_secs(1);
 const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
 /// How often the Coalescing Daemon (which drives GC mark-and-sweep) runs
 /// an idle-cycle pass. Deliberately much longer than the checkpoint
@@ -804,6 +809,11 @@ impl EncryptionSetup<'static> {
     }
 }
 
+/// Snapshot names the engine keeps for itself: a conversion's in-progress
+/// rewrite of a snapshot (ARCHITECTURE.md §18). Hidden from listings and
+/// refused as a user's name.
+pub const RESERVED_SNAPSHOT_PREFIX: &str = "\0lchfs-rekey/";
+
 struct PoolShared {
     pool_root: PathBuf,
     pool_params: PoolParams,
@@ -912,8 +922,19 @@ struct PoolShared {
     committer_pool: CommitterPool,
     prep_pool: IngestPreparationPool,
     shard_delta_logs: Vec<Mutex<ShardDeltaLog>>,
+    /// Shard watermarks of the last two published roots, newest second.
+    /// Delta truncation deletes only through the *older* of the two, so a
+    /// mount that has to fall back to the second-newest superblock slot
+    /// still finds every entry it would replay.
+    published_watermarks: Mutex<(Vec<u64>, Vec<u64>)>,
 
     checkpoint_lock: Mutex<()>,
+    /// Serializes every read-modify-write of the SnapshotTable: create,
+    /// delete, and a conversion rewriting snapshot roots. Without it two
+    /// concurrent creates each read the same table and the second publish
+    /// drops the first's entry. Taken before `checkpoint_lock` (each
+    /// publish checkpoints under it).
+    snapshot_lock: Mutex<()>,
     coalesce: Mutex<coalesce::CoalesceDaemon>,
     dedup: Mutex<dedup::DedupScanner>,
     /// `None` until `spawn_background_threads` runs (after this
@@ -924,6 +945,18 @@ struct PoolShared {
     dedup_task: Mutex<Option<background::PeriodicTask>>,
     scrub_task: Mutex<Option<background::PeriodicTask>>,
     failover_task: Mutex<Option<background::PeriodicTask>>,
+    /// Drives an in-place conversion or key rotation (`rekey.rs`) whenever
+    /// the keyring records one; idle otherwise.
+    rekey_task: Mutex<Option<background::PeriodicTask>>,
+    /// One conversion step at a time, whether from the task or a caller.
+    conversion_lock: Mutex<()>,
+    /// What the running conversion has done, for `conversion_status`.
+    conversion_progress: Mutex<rekey::Progress>,
+    /// Set at shutdown: a conversion pass stops at its next check instead
+    /// of holding the unmount until it finishes.
+    conversion_cancel: std::sync::atomic::AtomicBool,
+    /// Bytes per second a conversion may rewrite; `None` for no limit.
+    conversion_rate: Mutex<Option<u64>>,
 }
 
 impl Pool {
@@ -1133,7 +1166,14 @@ impl Pool {
             committer_pool,
             prep_pool,
             shard_delta_logs,
+            published_watermarks: Mutex::new((Vec::new(), Vec::new())),
             checkpoint_lock: Mutex::new(()),
+            snapshot_lock: Mutex::new(()),
+            rekey_task: Mutex::new(None),
+            conversion_lock: Mutex::new(()),
+            conversion_progress: Mutex::new(rekey::Progress::default()),
+            conversion_cancel: std::sync::atomic::AtomicBool::new(false),
+            conversion_rate: Mutex::new(None),
             coalesce: Mutex::new({
                 let mut daemon = coalesce::CoalesceDaemon::new_on(
                     Arc::clone(&vdev_set),
@@ -1940,7 +1980,14 @@ impl Pool {
             committer_pool,
             prep_pool,
             shard_delta_logs,
+            published_watermarks: Mutex::new((Vec::new(), Vec::new())),
             checkpoint_lock: Mutex::new(()),
+            snapshot_lock: Mutex::new(()),
+            rekey_task: Mutex::new(None),
+            conversion_lock: Mutex::new(()),
+            conversion_progress: Mutex::new(rekey::Progress::default()),
+            conversion_cancel: std::sync::atomic::AtomicBool::new(false),
+            conversion_rate: Mutex::new(None),
             coalesce: Mutex::new({
                 let mut daemon = coalesce::CoalesceDaemon::new_on(
                     Arc::clone(&vdev_set),
@@ -2091,6 +2138,22 @@ impl Pool {
         Ok((value, failed))
     }
 
+    /// Checks that `proof` opens a slot of this mount's keyring and yields
+    /// the keyring key the mount holds -- the same proof `update_keyring`
+    /// demands, for an operation that changes no slot (starting a key
+    /// rotation over the control socket).
+    pub fn verify_key(&self, proof: &Unlock<'_>) -> Result<(), PoolError> {
+        let guard = self.0.keyring.lock();
+        let Some(state) = guard.as_ref() else {
+            return Err(PoolError::InvalidArgument("this pool is not encrypted".into()));
+        };
+        let proven = keyring::parse(&state.file)?.unlock(proof)?;
+        if proven.keyring_key() != state.ring.keyring_key() {
+            return Err(PoolError::Keyring(lchfs_crypto::keyring::KeyringError::NoMatchingSlot));
+        }
+        Ok(())
+    }
+
     /// `update_keyring` for a pool that is not mounted: takes every given
     /// device's pool lock (a mounted pool refuses -- its in-memory keyring
     /// would later hand the old generation to a device it attaches), unlocks
@@ -2133,6 +2196,53 @@ impl Pool {
             )));
         }
         Ok((value, failed))
+    }
+
+    /// Encrypts this plaintext pool in place (ARCHITECTURE.md §18): new
+    /// writes are sealed from the moment this returns, and the conversion
+    /// task rewrites everything already stored, then destroys the
+    /// plaintext. Watch it with `conversion_status`; the keyring records
+    /// the conversion, so it resumes after a remount or a crash.
+    pub fn start_encrypt(&self, setup: EncryptionSetup<'_>) -> Result<(), PoolError> {
+        self.0.start_encrypt(setup)
+    }
+
+    /// Rotates this encrypted pool's content key: a new epoch for new
+    /// writes, everything rewritten into it, and the old key destroyed at
+    /// the end. Returns the new epoch.
+    pub fn start_rekey(&self) -> Result<u16, PoolError> {
+        self.0.start_rekey()
+    }
+
+    /// Where a conversion or rotation stands.
+    pub fn conversion_status(&self) -> rekey::ConversionStatus {
+        self.0.conversion_status()
+    }
+
+    /// Runs the current conversion to its end on this thread instead of
+    /// leaving it to the background task.
+    pub fn run_conversion_to_completion(&self) -> Result<(), PoolError> {
+        self.0.run_conversion_to_completion()
+    }
+
+    /// Runs one conversion step now (a rewriting pass or a retirement
+    /// attempt); `false` when no conversion is running. For tests that
+    /// need to observe the pool between steps.
+    pub fn conversion_step(&self) -> Result<bool, PoolError> {
+        let _one = self.0.conversion_lock.lock();
+        self.0.conversion_step_locked()
+    }
+
+    /// Limits how fast a conversion rewrites existing content, in bytes per
+    /// second; `None` lifts the limit.
+    pub fn set_conversion_rate(&self, bytes_per_sec: Option<u64>) {
+        *self.0.conversion_rate.lock() = bytes_per_sec;
+    }
+
+    /// Segments on the online devices still holding records of an epoch
+    /// other than `epoch`, by stream. Reads outer headers only.
+    pub fn old_epoch_census(&self, epoch: u16) -> Result<rekey::Census, PoolError> {
+        self.0.old_epoch_census(epoch)
     }
 
     /// True when this mount is running without some of the pool's devices
@@ -2545,6 +2655,35 @@ impl Pool {
     /// write has been checkpointed this should be zero; anything left is a
     /// pin nothing will release, keeping dead content from being reclaimed
     /// until the pool is remounted.
+    /// Test support: rolls every shard's delta log to a fresh segment now,
+    /// as passing `delta_log::DELTA_ROLL_BYTES` would.
+    #[doc(hidden)]
+    pub fn debug_roll_delta_logs(&self) -> Result<(), PoolError> {
+        for log in &self.0.shard_delta_logs {
+            log.lock().roll_over()?;
+        }
+        Ok(())
+    }
+
+    /// Test support: every delta segment file on every device.
+    #[doc(hidden)]
+    pub fn debug_delta_segment_count(&self) -> usize {
+        self.vdev_status()
+            .into_iter()
+            .filter_map(|s| s.root)
+            .map(|root| {
+                std::fs::read_dir(root.join("segments").join("delta"))
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .map(|shard| std::fs::read_dir(shard.path()).into_iter().flatten().flatten()
+                        .filter(|f| f.path().extension().is_some_and(|x| x == "dseg"))
+                        .count())
+                    .sum::<usize>()
+            })
+            .sum()
+    }
+
     pub fn debug_pinned_hash_count(&self) -> usize {
         self.0.dedup_pins.snapshot().len()
     }
@@ -2581,6 +2720,8 @@ impl Drop for Pool {
         self.0.dedup_task.lock().take();
         self.0.scrub_task.lock().take();
         self.0.failover_task.lock().take();
+        self.0.conversion_cancel.store(true, Ordering::Release);
+        self.0.rekey_task.lock().take();
         write_timing::dump();
         // A clean shutdown leaves no meta segment open, as the committer
         // pool's leaves no data segment open: what stays Open on disk is
@@ -2764,6 +2905,15 @@ impl PoolShared {
                 }
             });
         *self.failover_task.lock() = Some(failover_task);
+
+        let rekey_shared = Arc::clone(self);
+        let rekey_task = background::PeriodicTask::spawn("lchfs-rekey", REKEY_INTERVAL, move || {
+            if let Err(e) = rekey_shared.conversion_step() {
+                tracing::error!("conversion step failed (it resumes on the next tick): {e}");
+                rekey_shared.conversion_progress.lock().last_error = Some(e.to_string());
+            }
+        });
+        *self.rekey_task.lock() = Some(rekey_task);
     }
 
     /// One idle-cycle GC-mark-and-coalesce pass (ARCHITECTURE.md §6):
@@ -2818,8 +2968,34 @@ impl PoolShared {
         for segment_id in coalesce.take_removed_segments() {
             self.readers.evict_segment(segment_id);
         }
+        drop(coalesce);
         pass?;
+        self.truncate_delta_logs()?;
         Ok(())
+    }
+
+    /// Deletes every delta segment no replay can need any more (see
+    /// `delta_log::truncate_through`), through the older of the last two
+    /// published roots' watermarks. Returns how many segments went.
+    fn truncate_delta_logs(&self) -> Result<usize, PoolError> {
+        let through = self.published_watermarks.lock().0.clone();
+        if through.is_empty() {
+            return Ok(0);
+        }
+        let crypto = self.crypto.load();
+        let mut deleted = 0;
+        for (shard_id, log) in self.shard_delta_logs.iter().enumerate() {
+            let Some(&watermark) = through.get(shard_id) else { continue };
+            let (current, roots) = {
+                let log = log.lock();
+                (log.current_segment_id(), log.roots())
+            };
+            deleted += delta_log::truncate_through(&roots, shard_id as u32, current, watermark, &crypto)?.len();
+        }
+        if deleted > 0 {
+            tracing::debug!("delta logs: {deleted} segment(s) no replay needs were deleted");
+        }
+        Ok(deleted)
     }
 
     /// One idle-cycle Dedup Index Scanner pass. `Pool::run_dedup_pass`
@@ -2861,6 +3037,10 @@ impl PoolShared {
     /// the retention has *itself* survived a crash, not just the content
     /// it points at.
     fn create_snapshot(&self, name: &str) -> Result<(), PoolError> {
+        if name.starts_with(RESERVED_SNAPSHOT_PREFIX) {
+            return Err(PoolError::InvalidArgument(format!("snapshot names may not start with {RESERVED_SNAPSHOT_PREFIX:?}")));
+        }
+        let _table = self.snapshot_lock.lock();
         self.run_checkpoint()?;
         let (root_to_retain, epoch) = {
             let namespace = self.namespace.lock();
@@ -2888,6 +3068,10 @@ impl PoolShared {
     /// `run_gc_and_coalesce_pass`'s live-roots list from here on, and
     /// becomes reclaimable on the next ordinary mark-sweep.
     fn delete_snapshot(&self, name: &str) -> Result<(), PoolError> {
+        if name.starts_with(RESERVED_SNAPSHOT_PREFIX) {
+            return Err(PoolError::NotFound(name.to_string()));
+        }
+        let _table = self.snapshot_lock.lock();
         let mut table = self.current_snapshot_table()?;
         let before = table.entries.len();
         table.entries.retain(|e| e.name != name);
@@ -2898,7 +3082,9 @@ impl PoolShared {
     }
 
     fn list_snapshots(&self) -> Result<Vec<SnapshotEntry>, PoolError> {
-        Ok(self.current_snapshot_table()?.entries)
+        let mut entries = self.current_snapshot_table()?.entries;
+        entries.retain(|e| !e.name.starts_with(RESERVED_SNAPSHOT_PREFIX));
+        Ok(entries)
     }
 
     #[allow(clippy::needless_lifetimes)]
@@ -4162,9 +4348,15 @@ impl PoolShared {
         value: &T,
     ) -> Result<(Hash32, ExtentLocation), PoolError> {
         let encoded = lchfs_format::encode(value).map_err(|e| PoolError::Format(e.to_string()))?;
+        self.put_meta_encoded(kind, &encoded)
+    }
+
+    /// `put_meta_object` for bytes already encoded -- a conversion moving
+    /// an object into a new epoch unchanged.
+    fn put_meta_encoded(&self, kind: ExtentKind, encoded: &[u8]) -> Result<(Hash32, ExtentLocation), PoolError> {
         // One snapshot for the address and the seal (see `crypto`).
         let crypto = self.crypto.load();
-        let (epoch, hash) = crypto.address(&encoded);
+        let (epoch, hash) = crypto.address(encoded);
         if let Some((loc, vdev_id)) = self.dedup_index.get_tagged(hash)
             && self.is_meta_record(loc, vdev_id)
         {
@@ -4187,7 +4379,7 @@ impl PoolShared {
             hash,
             CodecId::None,
             encoded.len() as u32,
-            &encoded,
+            encoded,
         );
         let faults = meta_writer.take_faults();
         let vdev_ids: Vec<u16> = meta_writer.vdev_ids().to_vec();
@@ -4383,6 +4575,29 @@ impl PoolShared {
             )));
         }
 
+        // A fault is recorded pool-wide by whichever writer hit it, but it
+        // takes the device out of only *that* writer's fan-out: every other
+        // writer open when the device failed -- a shard that happened not
+        // to append while it was dead -- still writes to it, and once the
+        // device answers again those appends succeed and are indexed under
+        // it. Sealing the device's Open replicas from their own scan (next)
+        // would then put a footer in the middle of a segment a live writer
+        // is still extending, and every record it appended after that
+        // point is on the device but invisible to its scan -- the index
+        // says the device has it, so no resilver copies it either. Found
+        // by the mirror fault storm (a rare single `ReplicaMissing` on the
+        // secondary), made frequent by conversion's retirement.
+        //
+        // Rolling every writer first seals each such segment through its
+        // own writer, footer at its real end, and opens the next on the
+        // online set, which does not include this device.
+        self.committer_pool.roll_all_writers()?;
+        self.close_meta_writer(&mut self.meta_writer.lock())?;
+        for log in &self.shard_delta_logs {
+            log.lock().roll_over()?;
+        }
+        self.seal_heal_writers()?;
+
         // Seal before taking the device out of the faulted set: if it
         // cannot be sealed (or has vanished again mid-rejoin), the faulted
         // set is untouched and the next failover pass retries, rather than
@@ -4412,11 +4627,14 @@ impl PoolShared {
     ///
     /// 0. Any replica left Open on the device -- cut short when it
     ///    faulted, or by an unclean stop before an attach -- is sealed
-    ///    from its own scan, now, while the device is nobody's: a
-    ///    faulted replica is dropped from its writer's fan-out for good
-    ///    and nothing can open a segment on a device that is not a
-    ///    member, so every Open replica on it is dead and sealing it is
-    ///    safe. One step later it is not (see `seal_orphaned_on`).
+    ///    from its own scan, now, while the device is nobody's. For a
+    ///    rejoin, every writer is rolled first (`online_vdev`): a fault
+    ///    drops the device from the fan-out of the writer that hit it, not
+    ///    from the others, and a replica one of them is still extending is
+    ///    not an orphan. After the roll nothing can open a segment on a
+    ///    device that is not a member, so every Open replica on it is dead
+    ///    and sealing it is safe. One step later it is not (see
+    ///    `seal_orphaned_on`).
     /// 1. The device joins the online set, marked as catching up, so
     ///    checkpoints leave its superblock alone until step 4.
     /// 2. Every fan-out writer -- each shard's data writer, the meta
@@ -5748,7 +5966,14 @@ impl PoolShared {
     /// whose bytes aren't yet fsync'd — enforced here simply by ordering
     /// every write before the fsync/superblock steps that depend on it.
     fn run_checkpoint(&self) -> Result<(), PoolError> {
-        let _checkpoint_guard = self.checkpoint_lock.lock();
+        let checkpoint_guard = self.checkpoint_lock.lock();
+        self.checkpoint_locked(&checkpoint_guard)
+    }
+
+    /// `run_checkpoint`'s body, for a caller that already holds
+    /// `checkpoint_lock` and must publish without letting another
+    /// checkpoint in between -- meta epoch compaction (`rekey.rs`).
+    fn checkpoint_locked(&self, _held: &parking_lot::MutexGuard<'_, ()>) -> Result<(), PoolError> {
 
         // Segments that stopped growing are sealed first, so they are
         // fsynced by the seal and cold to every daemon from here on.
@@ -6030,7 +6255,7 @@ impl PoolShared {
             next_ino_counter,
             snapshot_table_hash,
             pool_params: self.current_pool_params(),
-            shard_watermarks,
+            shard_watermarks: shard_watermarks.clone(),
         };
         let (root_hash, root_location) = self.put_meta_object(ExtentKind::RootObject, &root)?;
 
@@ -6137,6 +6362,10 @@ impl PoolShared {
         }
         self.report_faults(failed);
 
+        {
+            let mut published = self.published_watermarks.lock();
+            published.0 = std::mem::replace(&mut published.1, shard_watermarks);
+        }
         dirty_guard.inos = None;
         Ok(())
     }

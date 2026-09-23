@@ -91,6 +91,83 @@ impl Shadow {
     }
 }
 
+const CONVERT_PASSPHRASE: &[u8] = b"torture conversion passphrase";
+
+fn convert_unlock() -> lchfs_crypto::keyring::Unlock<'static> {
+    lchfs_crypto::keyring::Unlock::Passphrase(CONVERT_PASSPHRASE)
+}
+
+/// Starts a conversion on `pool` -- encrypting it if it is plaintext,
+/// rotating its key if not -- and steps it on a thread of its own until
+/// told to stop, racing the writers, the chaos thread and any faults.
+/// Retirement simply waits while a device is out.
+fn spawn_conversion(pool: Arc<Pool>) -> (Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let handle = {
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            if pool.is_encrypted() {
+                pool.start_rekey().unwrap();
+            } else {
+                pool.start_encrypt(lchfs_store::EncryptionSetup {
+                    padding: lchfs_crypto::keyring::Padding::Padme,
+                    slots: vec![lchfs_crypto::keyring::NewSlot::Passphrase {
+                        passphrase: CONVERT_PASSPHRASE,
+                        cost: lchfs_crypto::slots::passphrase::KdfCost::Explicit { m_kib: 64, t: 1, p: 1 },
+                        label: "torture".into(),
+                    }],
+                })
+                .unwrap();
+            }
+            while !stop.load(Ordering::Relaxed) {
+                match pool.conversion_step() {
+                    Ok(false) => return,
+                    Ok(true) => {}
+                    // A step can fail on a device faulting under it; the
+                    // conversion resumes from disk on the next one.
+                    Err(e) => eprintln!("conversion step: {e}"),
+                }
+                std::thread::yield_now();
+            }
+        })
+    };
+    (stop, handle)
+}
+
+/// Opens a torture pool again, with the conversion's key if it has one.
+fn reopen(roots: &[&std::path::Path], converted: bool) -> Pool {
+    if converted {
+        Pool::open_replicated_with(roots, &convert_unlock())
+            .or_else(|_| Pool::open_replicated(roots))
+            .unwrap()
+    } else {
+        Pool::open_replicated(roots).unwrap()
+    }
+}
+
+/// fsck with whatever key the pool needs.
+fn fsck_all(roots: &[&std::path::Path], replicas: bool) -> lchfs_fsck::FsckReport {
+    let key = lchfs_fsck::unlock(roots, &convert_unlock())
+        .or_else(|_| lchfs_fsck::unlock(roots, &lchfs_crypto::keyring::Unlock::Passphrase(lchfs_crypto::testing::TEST_PASSPHRASE)))
+        .ok();
+    let live_roots = lchfs_fsck::collect_live_roots_with(roots[0], key.as_ref()).unwrap();
+    let mut report = lchfs_fsck::check_devices_with(roots, &live_roots, key.as_ref());
+    if replicas {
+        report.errors.extend(lchfs_fsck::check_replicas_with(roots, key.as_ref()).errors);
+    }
+    report
+}
+
+/// After a converting run: nothing of the old epoch is left anywhere.
+fn assert_fully_converted(pool: &Pool) {
+    let status = pool.conversion_status();
+    assert!(status.target_epoch.is_none(), "conversion did not finish: {status:?}");
+    assert_eq!(status.min_epoch, status.current_epoch, "{status:?}");
+    let census = pool.old_epoch_census(status.current_epoch).unwrap();
+    assert_eq!(census.total(), 0, "{census:?}");
+}
+
 fn read_all(pool: &Pool, ino: u64, size: usize) -> Vec<u8> {
     pool.read(ino, 0, size as u32).unwrap().to_vec()
 }
@@ -158,6 +235,10 @@ fn drain_coalesce(pool: &Pool, roots: &[std::path::PathBuf]) {
 /// wrong bytes (the read/checkpoint race class) fails immediately -- and
 /// after a cold reopen everything must still match and fsck must be clean.
 fn run_disjoint_torture(stripe: bool, seed: u64) {
+    run_disjoint_torture_with(stripe, seed, false)
+}
+
+fn run_disjoint_torture_with(stripe: bool, seed: u64, convert: bool) {
     let roots: Vec<tempfile::TempDir> = (0..(if stripe { 3 } else { 1 }))
         .map(|_| tempfile::tempdir().unwrap())
         .collect();
@@ -174,6 +255,7 @@ fn run_disjoint_torture(stripe: bool, seed: u64) {
     let threads = 6;
     let steps = 1500;
     let (stop, chaos) = spawn_chaos(Arc::clone(&pool));
+    let conversion = convert.then(|| spawn_conversion(Arc::clone(&pool)));
 
     let workers: Vec<_> = (0..threads)
         .map(|t| {
@@ -278,18 +360,20 @@ fn run_disjoint_torture(stripe: bool, seed: u64) {
     let results: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
     stop.store(true, Ordering::Relaxed);
     chaos.join().unwrap();
+    if let Some((stop, handle)) = conversion {
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+        pool.run_conversion_to_completion().unwrap();
+        assert_fully_converted(&pool);
+    }
 
     // Cold reopen: everything a thread still had must survive with exactly
     // the bytes its shadow says.
     drain_coalesce(&pool, &root_paths);
     pool.checkpoint().unwrap();
     drop(pool);
-    let pool = if stripe {
-        let refs: Vec<&std::path::Path> = root_paths.iter().map(|p| p.as_path()).collect();
-        Pool::open_replicated(&refs).unwrap()
-    } else {
-        Pool::open(&root_paths[0]).unwrap()
-    };
+    let refs: Vec<&std::path::Path> = root_paths.iter().map(|p| p.as_path()).collect();
+    let pool = reopen(&refs, convert);
     for (t, _dir, files) in &results {
         let dir = pool.lookup(1, &format!("t{t}")).unwrap().expect("thread dir survives");
         for (name, (_old_ino, shadow)) in files {
@@ -310,13 +394,20 @@ fn run_disjoint_torture(stripe: bool, seed: u64) {
     // matter and neither implies the other -- the DAG walk says every
     // record a root references is physically there and verifies, the
     // replica comparison says every device has its copy of it.
-    let refs: Vec<&std::path::Path> = root_paths.iter().map(|p| p.as_path()).collect();
-    let live_roots = lchfs_fsck::collect_live_roots(&root_paths[0]).unwrap();
-    let mut report = lchfs_fsck::check_devices(&refs, &live_roots);
-    if stripe {
-        report.errors.extend(lchfs_fsck::check_replicas(&refs).errors);
-    }
+    let report = fsck_all(&refs, stripe);
     assert!(report.is_clean(), "seed {seed}: fsck found {:?}", report.errors);
+}
+
+#[test]
+fn torture_disjoint_writers_while_converting() {
+    for seed in [0xC0FFEE, 0x5EED_0042] {
+        run_disjoint_torture_with(false, seed, true);
+    }
+}
+
+#[test]
+fn torture_disjoint_writers_striped_while_converting() {
+    run_disjoint_torture_with(true, 0x57A1_C0DE, true);
 }
 
 #[test]
@@ -343,6 +434,15 @@ fn torture_disjoint_writers_striped() {
 /// that has carried real bugs; the content oracle makes any lapse loud.
 #[test]
 fn torture_mirror_under_a_fault_storm() {
+    run_mirror_fault_storm(false)
+}
+
+#[test]
+fn torture_mirror_under_a_fault_storm_while_converting() {
+    run_mirror_fault_storm(true)
+}
+
+fn run_mirror_fault_storm(convert: bool) {
     use lchfs_store::segment::fault_injection;
     let a = tempfile::tempdir().unwrap();
     let b = tempfile::tempdir().unwrap();
@@ -351,6 +451,7 @@ fn torture_mirror_under_a_fault_storm() {
     );
     let seed = 0xFA017_u64;
     let (stop, chaos) = spawn_chaos(Arc::clone(&pool));
+    let conversion = convert.then(|| spawn_conversion(Arc::clone(&pool)));
 
     // Fault thread: kill the secondary, let writes pile up on the primary,
     // revive it, bring it back online (resilver), repeat. Never touches the
@@ -427,11 +528,17 @@ fn torture_mirror_under_a_fault_storm() {
     // Give an in-flight auto-rejoin a moment, then force a resilver + scrub.
     std::thread::sleep(std::time::Duration::from_millis(200));
     let _ = pool.resilver(1);
+    if let Some((stop, handle)) = conversion {
+        stop.store(true, Ordering::Relaxed);
+        handle.join().unwrap();
+        pool.run_conversion_to_completion().unwrap();
+        assert_fully_converted(&pool);
+    }
     drain_coalesce(&pool, &[a.path().to_path_buf(), b.path().to_path_buf()]);
     pool.checkpoint().unwrap();
     drop(pool);
 
-    let pool = Pool::open_replicated(&[a.path(), b.path()]).unwrap();
+    let pool = reopen(&[a.path(), b.path()], convert);
     for (t, files) in &results {
         let dir = pool.lookup(1, &format!("t{t}")).unwrap().expect("dir survives");
         for (name, (_ino, shadow)) in files {
@@ -440,9 +547,38 @@ fn torture_mirror_under_a_fault_storm() {
         }
     }
     let refs = [a.path(), b.path()];
-    let live_roots = lchfs_fsck::collect_live_roots(a.path()).unwrap();
-    let mut report = lchfs_fsck::check_devices(&refs, &live_roots);
-    report.errors.extend(lchfs_fsck::check_replicas(&refs).errors);
+    let report = fsck_all(&refs, true);
+    if !report.is_clean() {
+        // On failure, say where each missing record actually is: what the
+        // index claims per device, and what each device's own scan finds.
+        // (This is what found the rejoin footer race.)
+        drop(pool);
+        let index = lchfs_index::RedbIndex::open(&a.path().join("INDEX.redb")).unwrap();
+        for e in &report.errors {
+            if let lchfs_fsck::FsckError::ReplicaMissing { hash, vdev_id } = e {
+                use lchfs_index::IndexStore;
+                eprintln!("replica diag: missing {hash:?} on vdev {vdev_id}; index: {:?}", index.chunk_locations(*hash));
+                for (v, root) in [(0u16, a.path()), (1u16, b.path())] {
+                    let found = lchfs_fsck::scan_all_segments(root).unwrap();
+                    eprintln!("replica diag:   vdev {v} scan: {:?}", found.get(hash));
+                }
+                if let Ok(entries) = index.chunk_locations(*hash) {
+                    for (v, loc) in entries {
+                        let root = if v == 0 { a.path() } else { b.path() };
+                        let path = root.join("segments").join("data").join(format!("{}.aseg", loc.segment_id));
+                        let meta_path = root.join("segments").join("meta").join(format!("{}.mseg", loc.segment_id));
+                        eprintln!("replica diag:   vdev {v} seg {}: data file {:?} meta file {:?}", loc.segment_id,
+                            std::fs::metadata(&path).map(|m| m.len()).ok(), std::fs::metadata(&meta_path).map(|m| m.len()).ok());
+                        if let Ok(r) = lchfs_store::segment::SegmentReader::open_either(root, loc.segment_id, lchfs_format::StreamKind::Data) {
+                            let mut scan = r.scan();
+                            let offs: Vec<u32> = (&mut scan).map(|(_, o)| o).collect();
+                            eprintln!("replica diag:     header {:?} records {} last {:?} end {:?} damaged {:?}", r.read_header().map(|h| h.state), offs.len(), offs.last(), scan.end, scan.damaged);
+                        }
+                    }
+                }
+            }
+        }
+    }
     assert!(report.is_clean(), "seed {seed}: fsck after fault storm: {:?}", report.errors);
 }
 

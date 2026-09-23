@@ -154,7 +154,7 @@ pub(crate) fn delta_segment_dir(pool_root: &Path, shard_id: u32) -> PathBuf {
         .join(format!("{shard_id:05}"))
 }
 
-fn delta_segment_path(pool_root: &Path, shard_id: u32, segment_id: u64) -> PathBuf {
+pub(crate) fn delta_segment_path(pool_root: &Path, shard_id: u32, segment_id: u64) -> PathBuf {
     delta_segment_dir(pool_root, shard_id).join(format!("{segment_id}.dseg"))
 }
 

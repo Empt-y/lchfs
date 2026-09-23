@@ -57,6 +57,11 @@ pub enum IndexError {
 const CHUNK_LOCATIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("chunk_locations");
 const INODE_HASHES: TableDefinition<u64, &[u8]> = TableDefinition::new("inode_hashes");
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
+/// A conversion's old-hash -> new-hash map (ARCHITECTURE.md §18): content
+/// rewritten into a new key epoch once is found again by its old address
+/// without reading it back. Advisory like the rest of the index -- lost on
+/// a rebuild, which only costs the conversion re-reads.
+const REKEY_MEMO: TableDefinition<&[u8], &[u8]> = TableDefinition::new("rekey_memo");
 const GENERATION_KEY: &str = "generation";
 
 /// `CHUNK_LOCATIONS` key: `hash || vdev_id` (little-endian u16).
@@ -407,6 +412,85 @@ impl RedbIndex {
         }
         txn.commit().map_err(err)?;
         Ok(removed)
+    }
+
+    /// The new-epoch address recorded for `old` during a conversion.
+    pub fn get_rekey_memo(&self, old: Hash32) -> Result<Option<Hash32>, IndexError> {
+        let txn = self.db.begin_read().map_err(err)?;
+        let table = match txn.open_table(REKEY_MEMO) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(err(e)),
+        };
+        let Some(v) = table.get(old.0.as_slice()).map_err(err)? else {
+            return Ok(None);
+        };
+        let bytes: [u8; 32] = v.value().try_into().map_err(|_| IndexError::Corrupt)?;
+        Ok(Some(Hash32(bytes)))
+    }
+
+    /// Records that `old` was rewritten as `new`. Buffered, like every put.
+    pub fn put_rekey_memo(&mut self, old: Hash32, new: Hash32) -> Result<(), IndexError> {
+        let mut txn = self.db.begin_write().map_err(err)?;
+        txn.set_durability(Durability::None).map_err(err)?;
+        {
+            let mut table = txn.open_table(REKEY_MEMO).map_err(err)?;
+            table.insert(old.0.as_slice(), new.0.as_slice()).map_err(err)?;
+        }
+        txn.commit().map_err(err)?;
+        Ok(())
+    }
+
+    /// Rewrites this index into a brand-new file at `path` (where it lives)
+    /// holding only what is live: every chunk location and the metadata,
+    /// not the conversion memo. What retiring a key epoch ends with -- a
+    /// B-tree file keeps the bytes of pages it has freed, so the old
+    /// epoch's addresses (for a converted plaintext pool, the unkeyed hash
+    /// of every chunk) would otherwise stay readable in it.
+    ///
+    /// Built beside the old file, fsynced, then renamed over it; a crash
+    /// leaves one or the other whole. The open handle moves to the new
+    /// file, which the rename does not disturb.
+    pub fn rewrite_fresh(&mut self, path: &Path) -> Result<(), IndexError> {
+        let tmp = path.with_extension("redb.tmp");
+        let _ = std::fs::remove_file(&tmp);
+        let fresh = Database::create(&tmp).map_err(err)?;
+        {
+            let read = self.db.begin_read().map_err(err)?;
+            let mut txn = fresh.begin_write().map_err(err)?;
+            txn.set_durability(Durability::Immediate).map_err(err)?;
+            {
+                let from = read.open_table(CHUNK_LOCATIONS).map_err(err)?;
+                let mut to = txn.open_table(CHUNK_LOCATIONS).map_err(err)?;
+                for entry in from.iter().map_err(err)? {
+                    let (k, v) = entry.map_err(err)?;
+                    to.insert(k.value(), v.value()).map_err(err)?;
+                }
+            }
+            {
+                let from = read.open_table(INODE_HASHES).map_err(err)?;
+                let mut to = txn.open_table(INODE_HASHES).map_err(err)?;
+                for entry in from.iter().map_err(err)? {
+                    let (k, v) = entry.map_err(err)?;
+                    to.insert(k.value(), v.value()).map_err(err)?;
+                }
+            }
+            {
+                let from = read.open_table(META).map_err(err)?;
+                let mut to = txn.open_table(META).map_err(err)?;
+                for entry in from.iter().map_err(err)? {
+                    let (k, v) = entry.map_err(err)?;
+                    to.insert(k.value(), v.value()).map_err(err)?;
+                }
+            }
+            txn.commit().map_err(err)?;
+        }
+        std::fs::rename(&tmp, path).map_err(err)?;
+        if let Some(dir) = path.parent() {
+            std::fs::File::open(dir).and_then(|d| d.sync_all()).map_err(err)?;
+        }
+        self.db = fresh;
+        Ok(())
     }
 
     /// Forgets one replica's entry. Not used by the engine itself -- a

@@ -29,7 +29,7 @@ pub enum KeyOp {
 }
 
 impl NewSlotSpec {
-    fn as_new_slot(&self) -> NewSlot<'_> {
+    pub fn as_new_slot(&self) -> NewSlot<'_> {
         match self {
             NewSlotSpec::Passphrase { passphrase, cost, label } => NewSlot::Passphrase {
                 passphrase,
@@ -48,7 +48,7 @@ impl NewSlotSpec {
         }
     }
 
-    fn to_json(&self) -> Value {
+    pub fn to_json(&self) -> Value {
         match self {
             NewSlotSpec::Passphrase { passphrase, cost, label } => {
                 let cost = match cost {
@@ -69,7 +69,7 @@ impl NewSlotSpec {
         }
     }
 
-    fn from_json(v: &Value) -> anyhow::Result<Self> {
+    pub fn from_json(v: &Value) -> anyhow::Result<Self> {
         let label = v.get("label").and_then(Value::as_str).unwrap_or("").to_string();
         let str_field = |name: &str| {
             v.get(name)

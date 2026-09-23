@@ -321,3 +321,61 @@ fn a_rejoin_that_fails_leaves_the_device_faulted_not_stranded() {
     drop(pool);
     clean_replicas(a.path(), b.path()).unwrap();
 }
+
+/// A device faulted by one writer is still in every *other* writer's
+/// fan-out. Once it answers again those writers' appends land on it and are
+/// indexed under it, so a rejoin that sealed its "orphaned" replicas from
+/// their own scan could put a footer into a segment still being extended
+/// (or remove one still empty): every record appended after that was on the
+/// device, invisible to its scan, and never resilvered, because the index
+/// said it was there -- the rare single `ReplicaMissing` of the mirror
+/// fault storm (ARCHITECTURE.md §18.4).
+///
+/// The loss needs an append to land between the rejoin's scan and its
+/// footer, which only concurrency produces; this serialized sequence guards
+/// the shape of the scenario (a writer that never saw the fault, appending
+/// across the rejoin) and passes with or without the fix. The race itself
+/// is exercised by `torture_mirror_under_a_fault_storm*`.
+#[test]
+fn a_rejoin_never_seals_a_replica_another_writer_is_still_extending() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let params = PoolParams {
+        data_segment_cap_bytes: 1 << 20,
+        logical_shard_count: 2,
+        ..small_params()
+    };
+    let pool = Pool::create_replicated(&[a.path(), b.path()], params).unwrap();
+    // One file per shard, so each has its own data writer.
+    let mut by_shard: [Option<u64>; 2] = [None, None];
+    let mut n = 0;
+    while by_shard.iter().any(|s| s.is_none()) {
+        let ino = pool.create_file(1, &format!("f{n}"), 0o644).unwrap();
+        let shard = lchfs_store::ingress::shard_for_inode(ino, 2) as usize;
+        by_shard[shard].get_or_insert(ino);
+        n += 1;
+    }
+    let (quiet, noisy) = (by_shard[0].unwrap(), by_shard[1].unwrap());
+    let quiet_bytes = |round: u32| payload(round);
+    pool.write(quiet, 0, &quiet_bytes(1)).unwrap();
+    pool.write(noisy, 0, &payload(100)).unwrap();
+
+    // The device dies; only the noisy shard notices, and faults it.
+    fault_injection::kill(b.path());
+    pool.write(noisy, 30_000, &payload(101)).unwrap();
+    assert_eq!(health(&pool, 1), VdevHealth::Faulted);
+    fault_injection::revive(b.path());
+
+    // The quiet shard's writer never saw the fault: these land on b too.
+    pool.write(quiet, 30_000, &quiet_bytes(2)).unwrap();
+    pool.online_vdev(b.path()).unwrap();
+    pool.write(quiet, 60_000, &quiet_bytes(3)).unwrap();
+    pool.checkpoint().unwrap();
+    drop(pool);
+
+    let refs = [a.path(), b.path()];
+    let live = lchfs_fsck::collect_live_roots(a.path()).unwrap();
+    let mut report = lchfs_fsck::check_devices(&refs, &live);
+    report.errors.extend(lchfs_fsck::check_replicas(&refs).errors);
+    assert!(report.is_clean(), "{:?}", report.errors);
+}

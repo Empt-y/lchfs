@@ -29,6 +29,12 @@ use std::path::{Path, PathBuf};
 
 const SHARD_SUPERBLOCK_FILE_SIZE: u64 = 4096;
 
+/// A shard's delta segment is rolled once it passes this, so that there
+/// are sealed segments for `truncate_through` to reclaim. Without a roll a
+/// long mount appended every fsync of its lifetime to one segment, which
+/// nothing could ever delete and every mount replayed from the start.
+pub const DELTA_ROLL_BYTES: u64 = 16 * 1024 * 1024;
+
 fn shard_superblock_path(pool_root: &Path, shard_id: u32) -> PathBuf {
     delta_segment_dir(pool_root, shard_id).join("superblock.sblk")
 }
@@ -247,7 +253,25 @@ impl ShardDeltaLog {
 
         self.local_epoch = epoch;
         self.delta_log_tail = loc;
-        self.write_shard_superblock()
+        self.write_shard_superblock()?;
+        // After the commit is durable and claimed: the roll only starts a
+        // new segment for the next one. A commit's records and its entry
+        // therefore always share a segment -- what `truncate_through`
+        // relies on to delete them together.
+        if self.writer.current_size() >= DELTA_ROLL_BYTES {
+            self.roll_over()?;
+        }
+        Ok(())
+    }
+
+    /// The segment new commits go to; never a truncation candidate.
+    pub fn current_segment_id(&self) -> u64 {
+        self.writer.segment_id()
+    }
+
+    /// The roots this log writes to right now.
+    pub fn roots(&self) -> Vec<PathBuf> {
+        self.vdev_roots.clone()
     }
 
     fn write_shard_superblock(&self) -> io::Result<()> {
@@ -425,6 +449,96 @@ impl ShardDeltaLog {
 
         Ok(ReplayResult { entries, locations })
     }
+}
+
+/// Deletes shard `shard_id`'s delta segments that no replay can need: every
+/// segment below `current` (the one commits go to) whose entries all have
+/// an epoch at or below `watermark`, which must be a watermark some
+/// *published* root carries. Replay applies only entries above the
+/// published root's watermark, and a replayed entry's records live in the
+/// same segment as the entry (`commit` never rolls mid-commit), so such a
+/// segment holds nothing any mount will read. A segment with no entry at
+/// all -- a commit torn before its entry -- is dead the same way.
+///
+/// Conservative where it cannot tell: a record that opens on no device may
+/// have been an entry of any epoch, so its segment is kept. Sealed records
+/// hide their kind, which is why this takes the pool's crypto.
+///
+/// Takes no lock: segments below `current` are never appended to again,
+/// and nothing but a mount reads them. Returns the ids deleted.
+pub fn truncate_through(
+    roots: &[PathBuf],
+    shard_id: u32,
+    current: u64,
+    watermark: u64,
+    crypto: &RecordCrypto,
+) -> io::Result<Vec<u64>> {
+    let mut ids: Vec<u64> = Vec::new();
+    for root in roots {
+        ids.extend(delta_segment_ids(root, shard_id)?);
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    let mut deleted = Vec::new();
+    for segment_id in ids.into_iter().filter(|&id| id < current) {
+        if !segment_is_dead(roots, shard_id, segment_id, watermark, crypto) {
+            continue;
+        }
+        for root in roots {
+            match std::fs::remove_file(crate::segment::delta_segment_path(root, shard_id, segment_id)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+        deleted.push(segment_id);
+    }
+    Ok(deleted)
+}
+
+/// Whether every entry in the segment is at or below `watermark`, judged
+/// from whichever device's copy reads each record.
+fn segment_is_dead(roots: &[PathBuf], shard_id: u32, segment_id: u64, watermark: u64, crypto: &RecordCrypto) -> bool {
+    let mut resolved: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut unresolved: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for root in roots {
+        let Ok(reader) = SegmentReader::open_delta(root, shard_id, segment_id) else {
+            continue;
+        };
+        for (header, offset) in reader.scan() {
+            if resolved.contains(&offset) {
+                continue;
+            }
+            let loc = ExtentLocation {
+                segment_id,
+                offset,
+                len: header.record_len,
+            };
+            let plain_object = !lchfs_format::is_sealed(&header) && header.kind != ExtentKind::DeltaLogEntry;
+            if plain_object {
+                // A plaintext object record: no entry, nothing to check.
+                resolved.insert(offset);
+                unresolved.remove(&offset);
+                continue;
+            }
+            match reader.read_record_with(loc, crypto) {
+                Ok((effective, bytes)) => {
+                    if effective.kind == ExtentKind::DeltaLogEntry {
+                        match lchfs_format::decode::<DeltaLogEntry>(&bytes) {
+                            Ok(entry) if entry.epoch <= watermark => {}
+                            _ => return false,
+                        }
+                    }
+                    resolved.insert(offset);
+                    unresolved.remove(&offset);
+                }
+                Err(_) => {
+                    unresolved.insert(offset);
+                }
+            }
+        }
+    }
+    unresolved.is_empty()
 }
 
 /// Every delta segment id present for `shard_id` under `vdev_root`;

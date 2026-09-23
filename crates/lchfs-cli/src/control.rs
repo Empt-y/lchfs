@@ -165,9 +165,11 @@ fn stripe_policy_json(pool: &Pool) -> Value {
 
 /// What a mount can say about its encryption without disclosing a key.
 fn encryption_json(pool: &Pool) -> Value {
+    let conversion = pool.conversion_status();
     match pool.keyring_config() {
         None => json!({ "encrypted": false }),
         Some(config) => json!({
+            "progress": conversion.progress,
             "encrypted": true,
             "keyring_generation": pool.keyring_generation(),
             "padding": format!("{:?}", config.padding),
@@ -341,6 +343,34 @@ pub fn handle(pool: &Pool, request: &Value) -> anyhow::Result<Value> {
             }))
         }
         "encryption-status" => Ok(encryption_json(pool)),
+        "start-encrypt" => {
+            let specs = arg(request, "slots")?
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("slots must be an array"))?
+                .iter()
+                .map(crate::keyops::NewSlotSpec::from_json)
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let padding = if request.get("no_padding").and_then(Value::as_bool) == Some(true) {
+                lchfs_crypto::keyring::Padding::None
+            } else {
+                lchfs_crypto::keyring::Padding::Padme
+            };
+            pool.start_encrypt(lchfs_store::EncryptionSetup {
+                padding,
+                slots: specs.iter().map(|s| s.as_new_slot()).collect(),
+            })?;
+            Ok(encryption_json(pool))
+        }
+        "start-rekey" => {
+            let proof = crate::unlock::Credential::from_json(arg(request, "proof")?)?;
+            pool.verify_key(&proof.as_unlock())?;
+            let epoch = pool.start_rekey()?;
+            Ok(json!({ "target_epoch": epoch }))
+        }
+        "set-conversion-rate" => {
+            pool.set_conversion_rate(request.get("bytes_per_sec").and_then(Value::as_u64));
+            Ok(json!({}))
+        }
         "key-list" => Ok(json!({
             "generation": pool.keyring_generation(),
             "slots": pool.keyring_slots(),

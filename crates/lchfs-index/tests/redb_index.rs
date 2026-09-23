@@ -184,3 +184,38 @@ fn delete_vdev_locations_forgets_one_slot_and_leaves_the_rest() {
     assert_eq!(all.len(), 5);
     assert!(all.iter().all(|(_, v, _)| *v == 0));
 }
+
+#[test]
+fn a_fresh_rewrite_keeps_locations_and_generation_and_drops_the_memo() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("INDEX.redb");
+    let mut index = RedbIndex::create(&path).unwrap();
+    let loc = ExtentLocation { segment_id: 7, offset: 4096, len: 100 };
+    let kept = Hash32([0x11; 32]);
+    // Only ever a memo key: its bytes must not survive the rewrite.
+    let old = Hash32([0xA7; 32]);
+    let new = Hash32([0x5C; 32]);
+    index.put_chunk_location(kept, 0, loc).unwrap();
+    index.put_rekey_memo(old, new).unwrap();
+    index.checkpoint(9).unwrap();
+    assert_eq!(index.get_rekey_memo(old).unwrap(), Some(new));
+    assert!(
+        std::fs::read(&path).unwrap().windows(32).any(|w| w == old.0),
+        "the check below means nothing unless the old file held the hash"
+    );
+
+    index.rewrite_fresh(&path).unwrap();
+    assert_eq!(index.get_rekey_memo(old).unwrap(), None);
+    assert_eq!(index.get_chunk_location(kept).unwrap(), Some(loc));
+    // Still writable through the moved handle.
+    index.put_chunk_location(Hash32([0x22; 32]), 0, loc).unwrap();
+    index.checkpoint(10).unwrap();
+    drop(index);
+
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(!bytes.windows(32).any(|w| w == old.0), "the memo's old hash survived in the file");
+    assert!(!dir.path().join("INDEX.redb.tmp").exists());
+    let index = RedbIndex::open(&path).unwrap();
+    assert_eq!(index.generation(), 10);
+    assert_eq!(index.get_chunk_location(kept).unwrap(), Some(loc));
+}

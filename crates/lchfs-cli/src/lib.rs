@@ -142,8 +142,6 @@ enum Command {
     Snapshot {
         #[command(subcommand)]
         action: SnapshotAction,
-        #[command(flatten)]
-        unlock: UnlockArgs,
     },
     /// An encrypted pool's key slots (ARCHITECTURE.md §18). On a mounted
     /// pool the change goes through the mount's control socket; on an
@@ -197,8 +195,36 @@ enum PoolAction {
     /// What erasure coding has done: the policy, striped segments, and
     /// bytes saved against a full mirror.
     StripeStatus { root: PathBuf },
-    /// Whether the pool is encrypted, its epochs, padding and slots.
+    /// Whether the pool is encrypted, its epochs, padding and slots, and
+    /// how far a conversion has got.
     EncryptionStatus { root: PathBuf },
+    /// Encrypt a plaintext pool in place (ARCHITECTURE.md §18). New writes
+    /// are sealed at once; existing content is rewritten, and the plaintext
+    /// then destroyed on every device. A mounted pool converts in the
+    /// background (watch `encryption-status`); an unmounted one converts
+    /// now, with progress.
+    Encrypt {
+        root: PathBuf,
+        #[command(flatten)]
+        devices: DeviceArgs,
+        #[command(flatten)]
+        slots: SlotArgs,
+        /// Rewrite at most this many bytes per second.
+        #[arg(long, value_name = "BYTES")]
+        rate: Option<u64>,
+    },
+    /// Rotate an encrypted pool's content key: a new epoch, everything
+    /// rewritten into it, and the old key destroyed. What to run after
+    /// revoking a key slot.
+    Rekey {
+        root: PathBuf,
+        #[command(flatten)]
+        devices: DeviceArgs,
+        #[command(flatten)]
+        unlock: UnlockArgs,
+        #[arg(long, value_name = "BYTES")]
+        rate: Option<u64>,
+    },
 }
 
 /// `create-pool`'s encryption options (ARCHITECTURE.md §18).
@@ -208,27 +234,77 @@ struct EncryptArgs {
     /// for a passphrase.
     #[arg(long)]
     encrypt: bool,
+    #[command(flatten)]
+    slots: SlotArgs,
+}
+
+/// The key slots a pool starts encrypted with (`create-pool --encrypt`,
+/// `pool encrypt`).
+#[derive(Args)]
+struct SlotArgs {
     /// The first passphrase slot's passphrase, from this file.
-    #[arg(long, value_name = "FILE", requires = "encrypt", conflicts_with = "passphrase_fd")]
+    #[arg(long, value_name = "FILE", conflicts_with = "passphrase_fd")]
     passphrase_file: Option<PathBuf>,
     /// ...or from this open file descriptor.
-    #[arg(long, value_name = "FD", requires = "encrypt")]
+    #[arg(long, value_name = "FD")]
     passphrase_fd: Option<i32>,
     /// Add a recipient slot for this public key (`key generate-recipient`);
     /// repeatable.
-    #[arg(long = "recipient", value_name = "FILE.pub", requires = "encrypt")]
+    #[arg(long = "recipient", value_name = "FILE.pub")]
     recipients: Vec<PathBuf>,
     /// Add a slot sealed to this machine's TPM. Never the only slot.
-    #[arg(long, requires = "encrypt")]
+    #[arg(long)]
     tpm: bool,
     #[command(flatten)]
     tpm_slot: TpmSlotArgs,
     /// Store record sizes exactly rather than padded (Padmé, <=12%):
     /// saves space, and tells an observer each record's exact size.
-    #[arg(long, requires = "encrypt")]
+    #[arg(long)]
     no_padding: bool,
     #[command(flatten)]
     kdf: KdfArgs,
+}
+
+impl SlotArgs {
+    fn any_given(&self) -> bool {
+        self.passphrase_file.is_some()
+            || self.passphrase_fd.is_some()
+            || !self.recipients.is_empty()
+            || self.tpm
+            || self.no_padding
+    }
+
+    /// Every secret the slots need, gathered before anything is created: a
+    /// pool must never end up half-keyed because a prompt was cancelled.
+    /// With no passphrase source and no recipient, a passphrase is asked for.
+    fn gather(&self) -> anyhow::Result<Vec<keyops::NewSlotSpec>> {
+        use keyops::NewSlotSpec;
+        let source = secrets::Source { file: self.passphrase_file.clone(), fd: self.passphrase_fd };
+        let mut specs = Vec::new();
+        if source.is_given() || self.recipients.is_empty() {
+            specs.push(NewSlotSpec::Passphrase {
+                passphrase: secrets::new_passphrase(&source)?,
+                cost: self.kdf.cost(),
+                label: "passphrase".into(),
+            });
+        }
+        for path in &self.recipients {
+            let label = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "recipient".into());
+            specs.push(NewSlotSpec::Recipient { recipient: Box::new(secrets::read_recipient(path)?), label });
+        }
+        if self.tpm {
+            specs.push(NewSlotSpec::Tpm {
+                pcrs: self.tpm_slot.tpm_pcrs.clone(),
+                pin: new_tpm_pin(&self.tpm_slot)?,
+                label: "tpm".into(),
+            });
+        }
+        Ok(specs)
+    }
+
+    fn padding(&self) -> lchfs_crypto::keyring::Padding {
+        if self.no_padding { lchfs_crypto::keyring::Padding::None } else { lchfs_crypto::keyring::Padding::Padme }
+    }
 }
 
 /// A new TPM slot's policy.
@@ -388,9 +464,23 @@ enum KeyAction {
 
 #[derive(Subcommand)]
 enum SnapshotAction {
-    Create { pool: PathBuf, name: String },
-    List { pool: PathBuf },
-    Delete { pool: PathBuf, name: String },
+    Create {
+        pool: PathBuf,
+        name: String,
+        #[command(flatten)]
+        unlock: UnlockArgs,
+    },
+    List {
+        pool: PathBuf,
+        #[command(flatten)]
+        unlock: UnlockArgs,
+    },
+    Delete {
+        pool: PathBuf,
+        name: String,
+        #[command(flatten)]
+        unlock: UnlockArgs,
+    },
 }
 
 pub fn run() -> anyhow::Result<()> {
@@ -439,8 +529,14 @@ pub fn run() -> anyhow::Result<()> {
             println!("vdev {id} detached; its segment files can be deleted.");
             Ok(())
         }
+        Command::Pool { action: PoolAction::Encrypt { root, devices, slots, rate } } => {
+            pool_encrypt(&root, &devices, &slots, rate)
+        }
+        Command::Pool { action: PoolAction::Rekey { root, devices, unlock, rate } } => {
+            pool_rekey(&root, &devices, &unlock, rate)
+        }
         Command::Pool { action } => pool_control(action),
-        Command::Snapshot { action, unlock } => snapshot(action, &unlock),
+        Command::Snapshot { action } => snapshot(action),
         Command::Key { action } => key(action),
         Command::Stats { pool } => stats(&pool),
     }
@@ -462,45 +558,19 @@ fn create_pool(
     stripe_m: Option<u8>,
     enc: &EncryptArgs,
 ) -> anyhow::Result<()> {
-    use lchfs_crypto::keyring::{NewSlot, Padding};
     let mut params = lchfs_format::PoolParams::default();
     if let (Some(k), Some(m)) = (stripe_k, stripe_m) {
         params.stripe_k = k;
         params.stripe_m = m;
     }
+    if !enc.encrypt && enc.slots.any_given() {
+        anyhow::bail!("key slot options need --encrypt");
+    }
     let pool = if enc.encrypt {
-        let source = secrets::Source { file: enc.passphrase_file.clone(), fd: enc.passphrase_fd };
-        // Every secret is in hand before anything is created: a pool must
-        // never exist half-keyed because a prompt was cancelled.
-        let passphrase = if source.is_given() || enc.recipients.is_empty() {
-            Some(secrets::new_passphrase(&source)?)
-        } else {
-            None
-        };
-        let recipients = enc
-            .recipients
-            .iter()
-            .map(|p| secrets::read_recipient(p).map(|r| (p, r)))
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        let tpm_pin = if enc.tpm { new_tpm_pin(&enc.tpm_slot)? } else { None };
-        let mut slots = Vec::new();
-        if let Some(p) = &passphrase {
-            slots.push(NewSlot::Passphrase { passphrase: p, cost: enc.kdf.cost(), label: "passphrase".into() });
-        }
-        for (path, r) in &recipients {
-            let label = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "recipient".into());
-            slots.push(NewSlot::Recipient { recipient: r, label });
-        }
-        if enc.tpm {
-            slots.push(NewSlot::Tpm {
-                pcrs: enc.tpm_slot.tpm_pcrs.clone(),
-                pin: tpm_pin.as_ref().map(|p| p.as_slice()),
-                label: "tpm".into(),
-            });
-        }
+        let specs = enc.slots.gather()?;
         let setup = lchfs_store::EncryptionSetup {
-            padding: if enc.no_padding { Padding::None } else { Padding::Padme },
-            slots,
+            padding: enc.slots.padding(),
+            slots: specs.iter().map(|s| s.as_new_slot()).collect(),
         };
         lchfs_store::Pool::create_encrypted(path, params, setup)?
     } else {
@@ -787,23 +857,127 @@ fn pool_control(action: PoolAction) -> anyhow::Result<()> {
         ),
         PoolAction::StripeStatus { root } => (root, json!({ "cmd": "stripe-status" })),
         PoolAction::EncryptionStatus { root } => (root, json!({ "cmd": "encryption-status" })),
+        PoolAction::Encrypt { .. } | PoolAction::Rekey { .. } => unreachable!("dispatched before"),
     };
     let reply = control::request(&root.join(control::SOCKET_NAME), &req)?;
     println!("{}", serde_json::to_string_pretty(&reply)?);
     Ok(())
 }
 
-fn snapshot(action: SnapshotAction, unlock: &UnlockArgs) -> anyhow::Result<()> {
-    let open = |pool: &Path| unlock::open_pool(pool, &DeviceArgs::default(), false, unlock);
+/// `pool encrypt`: through the mount if it is mounted, else in-process.
+fn pool_encrypt(root: &Path, devices: &DeviceArgs, slots: &SlotArgs, rate: Option<u64>) -> anyhow::Result<()> {
+    use serde_json::json;
+    let specs = slots.gather()?;
+    let socket = root.join(control::SOCKET_NAME);
+    if control::is_live(&socket) {
+        if let Some(r) = rate {
+            control::request(&socket, &json!({ "cmd": "set-conversion-rate", "bytes_per_sec": r }))?;
+        }
+        let slots_json: Vec<serde_json::Value> = specs.iter().map(|s| s.to_json()).collect();
+        let reply = control::request(
+            &socket,
+            &json!({ "cmd": "start-encrypt", "slots": slots_json, "no_padding": slots.no_padding }),
+        )?;
+        println!("encryption started on the mounted pool: new writes are sealed from now on.");
+        println!("existing content is being rewritten; follow it with `lchfs pool encryption-status {}`", root.display());
+        for slot in reply.get("slots").and_then(serde_json::Value::as_array).into_iter().flatten() {
+            println!("  key slot {}: {} ({})", slot["id"], slot["kind"].as_str().unwrap_or("?"), slot["label"].as_str().unwrap_or(""));
+        }
+        return Ok(());
+    }
+    let pool = unlock::open_pool(root, devices, false, &UnlockArgs::default())?;
+    pool.set_conversion_rate(rate);
+    pool.start_encrypt(lchfs_store::EncryptionSetup {
+        padding: slots.padding(),
+        slots: specs.iter().map(|s| s.as_new_slot()).collect(),
+    })?;
+    drive_conversion(&pool)?;
+    for slot in pool.keyring_slots() {
+        println!("  key slot {}: {} ({})", slot.id, slot.kind, slot.label);
+    }
+    println!("Back up the keyring (`lchfs key backup`): lose every copy and the pool cannot be opened.");
+    Ok(())
+}
+
+/// `pool rekey`: the proof is checked by whoever holds the keyring.
+fn pool_rekey(root: &Path, devices: &DeviceArgs, unlock_args: &UnlockArgs, rate: Option<u64>) -> anyhow::Result<()> {
+    use serde_json::json;
+    let socket = root.join(control::SOCKET_NAME);
+    if control::is_live(&socket) {
+        if let Some(r) = rate {
+            control::request(&socket, &json!({ "cmd": "set-conversion-rate", "bytes_per_sec": r }))?;
+        }
+        let reply = unlock::with_key(unlock_args, "the mounted pool", |key| {
+            let reply = control::request_raw(&socket, &json!({ "cmd": "start-rekey", "proof": key.to_json() }))?;
+            if reply.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+                return Ok(Some(reply.get("result").cloned().unwrap_or_default()));
+            }
+            if reply.get("code").and_then(serde_json::Value::as_str) == Some(control::KEY_REFUSED) {
+                return Ok(None);
+            }
+            anyhow::bail!("{}", reply.get("error").and_then(serde_json::Value::as_str).unwrap_or("unknown error"))
+        })?;
+        println!(
+            "key rotation to epoch {} started on the mounted pool; follow it with `lchfs pool encryption-status {}`",
+            reply.get("target_epoch").cloned().unwrap_or_default(),
+            root.display()
+        );
+        return Ok(());
+    }
+    let pool = unlock::open_pool(root, devices, false, unlock_args)?;
+    if !pool.is_encrypted() {
+        anyhow::bail!("{} is not encrypted; use `lchfs pool encrypt`", root.display());
+    }
+    pool.set_conversion_rate(rate);
+    let epoch = pool.start_rekey()?;
+    println!("rotating to key epoch {epoch}");
+    drive_conversion(&pool)
+}
+
+/// Runs an offline conversion to the end, one step at a time, saying how
+/// far each got.
+fn drive_conversion(pool: &lchfs_store::Pool) -> anyhow::Result<()> {
+    loop {
+        let more = pool.conversion_step()?;
+        let s = pool.conversion_status();
+        let p = &s.progress;
+        if !more || s.target_epoch.is_none() {
+            println!(
+                "done: epoch {} only; {} chunk(s) ({} bytes) rewritten; the old epoch's records and keys are gone",
+                s.current_epoch, p.chunks_rewritten, p.bytes_rewritten
+            );
+            return Ok(());
+        }
+        if !p.waiting_for_vdevs.is_empty() {
+            anyhow::bail!(
+                "retirement needs every device: vdevs {:?} are missing (pass them with --vdev); the conversion resumes on the next mount",
+                p.waiting_for_vdevs
+            );
+        }
+        println!(
+            "{}: {}/{} files, {}/{} snapshots, {} chunk(s) rewritten; old-epoch segments left {:?}",
+            s.phase.as_deref().unwrap_or("?"),
+            p.files_done,
+            p.files_total,
+            p.snapshots_done,
+            p.snapshots_total,
+            p.chunks_rewritten,
+            p.old_segments
+        );
+    }
+}
+
+fn snapshot(action: SnapshotAction) -> anyhow::Result<()> {
+    let open = |pool: &Path, unlock: &UnlockArgs| unlock::open_pool(pool, &DeviceArgs::default(), false, unlock);
     match action {
-        SnapshotAction::Create { pool, name } => {
-            let pool = open(&pool)?;
+        SnapshotAction::Create { pool, name, unlock } => {
+            let pool = open(&pool, &unlock)?;
             pool.create_snapshot(&name)?;
             println!("Created snapshot '{name}'.");
             Ok(())
         }
-        SnapshotAction::List { pool } => {
-            let pool = open(&pool)?;
+        SnapshotAction::List { pool, unlock } => {
+            let pool = open(&pool, &unlock)?;
             let snapshots = pool.list_snapshots()?;
             if snapshots.is_empty() {
                 println!("No snapshots.");
@@ -813,8 +987,8 @@ fn snapshot(action: SnapshotAction, unlock: &UnlockArgs) -> anyhow::Result<()> {
             }
             Ok(())
         }
-        SnapshotAction::Delete { pool, name } => {
-            let pool = open(&pool)?;
+        SnapshotAction::Delete { pool, name, unlock } => {
+            let pool = open(&pool, &unlock)?;
             pool.delete_snapshot(&name)?;
             println!("Deleted snapshot '{name}'.");
             Ok(())
@@ -935,7 +1109,7 @@ fn key(action: KeyAction) -> anyhow::Result<()> {
             run_key_op(&target, KeyOp::Revoke { slot, secrets: secrets_by_slot })?;
             println!(
                 "Slot {slot} revoked and the keyring key replaced. Anyone who held it also held the content keys: \
-                 rotate them with `lchfs pool rekey` (coming with conversion support)."
+                 rotate them with `lchfs pool rekey`."
             );
             Ok(())
         }

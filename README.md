@@ -59,15 +59,15 @@ in ARCHITECTURE.md §18; the short version:
 
   A pool always keeps one non-TPM slot.
 - **Status:**
-  - Milestones 1–3 are on `master`: the crypto core (keyring, slots,
+  - Milestones 1–4 are on `master`: the crypto core (keyring, slots,
     envelopes, fuzz targets, software-TPM tests in CI), the engine
-    integration, and the command line.
+    integration, the command line, and in-place conversion and key
+    rotation.
   - The whole test suite runs twice in CI, once plaintext and once with
     every pool encrypted, and a leakage test checks that no file content,
     name, xattr, symlink target or plaintext content hash reaches the disk.
-  - Still to come: in-place conversion of plaintext pools and key
-    rotation (`pool encrypt` / `pool rekey`), then hardening and
-    benchmarks.
+  - Still to come: memory hardening (mlock, non-dumpable), benchmarks,
+    and the full write-up in ARCHITECTURE.md §18.
 
 ### Using it
 
@@ -86,7 +86,22 @@ lchfs key add-passphrase /pool                      # proves with an existing ke
 lchfs key revoke 0 /pool                            # remove a slot *and* re-key the keyring
 lchfs fsck /pool                                    # asks for a key; without one (or with
                                                     # --structural) checks structure only
+
+lchfs pool encrypt /pool --recipient ~/.lchfs/recovery.pub   # encrypt an existing pool in place
+lchfs pool rekey /pool                              # rotate the content key (after a revoke)
+lchfs pool encryption-status /pool                  # a mounted pool's conversion progress
 ```
+
+`pool encrypt` and `pool rekey` work on a mounted pool (the conversion runs
+in the background while it stays in use) or an unmounted one (it runs to the
+end and prints progress). Either way new writes use the new key at once;
+existing content is rewritten; and then the old epoch -- for `encrypt`, the
+plaintext -- is removed from every device: data, metadata, delta logs, the
+index file and the superblock ring. That last step waits until every device
+of the pool is present, since an absent one still holds the old records.
+Space the underlying disk's own remapping kept is out of reach; for a
+guarantee that no plaintext survives anywhere, create a fresh encrypted
+pool and copy into it.
 
 Passphrases never go on the command line: they come from
 `--passphrase-file`, `--passphrase-fd`, a no-echo terminal prompt, or an

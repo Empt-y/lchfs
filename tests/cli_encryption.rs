@@ -262,3 +262,35 @@ fn a_tpm_slot_with_a_pin_unlocks_through_the_cli() {
     // toward the TPM's dictionary-attack lockout, even a software one's.
     ok(&["fsck", s(&pool), "--tpm", "--tpm-pin-file", s(&bad_pin), "--passphrase-file", s(&pass)]);
 }
+
+#[test]
+fn pool_encrypt_and_rekey_convert_an_unmounted_pool_in_place() {
+    if lchfs_crypto::testing::TEST_ENCRYPT_ALL {
+        return; // a test build has no plaintext pools to encrypt
+    }
+    let t = tempfile::tempdir().unwrap();
+    let pool = t.path().join("pool");
+    ok(&["create-pool", s(&pool)]);
+    // Something to convert: a snapshot of a pool with the marker in it.
+    ok(&["snapshot", "create", s(&pool), "before"]);
+    let pass = write_secret(t.path(), "pass", "converted");
+    let mut args = vec!["pool", "encrypt", s(&pool), "--passphrase-file", s(&pass)];
+    args.extend(KDF);
+    let out = ok(&args);
+    assert!(out.contains("done: epoch 1 only"), "{out}");
+    assert!(ok(&["stats", s(&pool)]).contains("encrypted: yes"));
+    fails(&["fsck", s(&pool), "--passphrase-file", s(&write_secret(t.path(), "bad", "nope"))]);
+    ok(&["fsck", s(&pool), "--passphrase-file", s(&pass)]);
+    let list = ok(&["snapshot", "list", s(&pool), "--passphrase-file", s(&pass)]);
+    assert!(list.contains("before"), "{list}");
+
+    let out = ok(&["pool", "rekey", s(&pool), "--passphrase-file", s(&pass)]);
+    assert!(out.contains("rotating to key epoch 2") && out.contains("done: epoch 2 only"), "{out}");
+    assert!(ok(&["key", "list", s(&pool)]).contains("current epoch 2, minimum epoch 2"));
+    ok(&["fsck", s(&pool), "--passphrase-file", s(&pass)]);
+    // Encrypting twice is refused, with the command that is wanted instead.
+    let mut again = vec!["pool", "encrypt", s(&pool), "--passphrase-file", s(&pass)];
+    again.extend(KDF);
+    let err = fails(&again);
+    assert!(err.contains("pool rekey") || err.contains("encrypted"), "{err}");
+}

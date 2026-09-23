@@ -219,3 +219,36 @@ fn a_credential_round_trips_through_json() {
     let op = KeyOp::Revoke { slot: 3, secrets: [(1, secret(b"a")), (2, secret(b"b"))].into_iter().collect() };
     assert_eq!(KeyOp::from_json(&op.to_json()).unwrap().to_json(), op.to_json());
 }
+
+#[test]
+fn a_mounted_pool_is_encrypted_and_rekeyed_over_the_socket() {
+    if lchfs_crypto::testing::TEST_ENCRYPT_ALL {
+        return; // a test build has no plaintext pools
+    }
+    let a = tempfile::tempdir().unwrap();
+    let pool = Arc::new(Pool::create(a.path(), small_params()).unwrap());
+    let ino = pool.create_file(1, "f", 0o644).unwrap();
+    pool.write(ino, 0, &vec![9u8; 30_000]).unwrap();
+    pool.checkpoint().unwrap();
+    let sock = socket_path(&pool);
+    let _server = ControlServer::start(Arc::clone(&pool), sock.clone()).unwrap();
+
+    let slot = NewSlotSpec::Passphrase { passphrase: secret(FIRST), cost: CHEAP, label: "first".into() };
+    let reply = request(&sock, &json!({ "cmd": "start-encrypt", "slots": [slot.to_json()] })).unwrap();
+    assert_eq!(reply["encrypted"], true, "{reply}");
+    assert_eq!(reply["conversion"]["phase"], "Rewriting", "{reply}");
+    pool.run_conversion_to_completion().unwrap();
+    let status = request(&sock, &json!({ "cmd": "encryption-status" })).unwrap();
+    assert_eq!((status["current_epoch"].as_u64(), status["min_epoch"].as_u64()), (Some(1), Some(1)), "{status}");
+    assert!(status["conversion"].is_null(), "{status}");
+
+    // A rotation needs proof, like any key operation.
+    let wrong = request_raw(&sock, &json!({ "cmd": "start-rekey", "proof": Credential::Passphrase(secret(b"no")).to_json() })).unwrap();
+    assert_eq!(wrong["code"], KEY_REFUSED, "{wrong}");
+    assert!(pool.conversion_status().target_epoch.is_none());
+    let right = request(&sock, &json!({ "cmd": "start-rekey", "proof": Credential::Passphrase(secret(FIRST)).to_json() })).unwrap();
+    assert_eq!(right["target_epoch"], 2);
+    pool.run_conversion_to_completion().unwrap();
+    assert_eq!(pool.conversion_status().min_epoch, 2);
+    assert_eq!(pool.read(ino, 0, 30_000).unwrap().as_ref(), vec![9u8; 30_000].as_slice());
+}

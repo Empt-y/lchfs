@@ -981,7 +981,7 @@ pub fn check_replicas_with(vdev_roots: &[&Path], key: Option<&lchfs_format::Reco
     // exactly what it fails to resolve). If the walk cannot be run at all,
     // nothing is filtered -- fewer findings is never the safe default for
     // a checker.
-    let reachable: Option<HashSet<Hash32>> = collect_live_roots(vdev_roots[0])
+    let reachable: Option<HashSet<Hash32>> = collect_live_roots_with(vdev_roots[0], key)
         .ok()
         .zip(scan_devices(vdev_roots).ok())
         .map(|(live_roots, scanned)| {
