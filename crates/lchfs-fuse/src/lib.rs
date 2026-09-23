@@ -89,7 +89,8 @@ fn errno_for(err: &PoolError) -> Errno {
         PoolError::UnsupportedFormatVersion { .. }
         | PoolError::LegacyFormatVersion { .. }
         | PoolError::KeyRequired
-        | PoolError::Keyring(_) => Errno::EINVAL,
+        | PoolError::Keyring(_)
+        | PoolError::KeyringChange(_) => Errno::EINVAL,
         PoolError::PoolLocked(_) => Errno::EBUSY,
         // A record that will not decrypt or authenticate -- wrong key
         // (only possible if the keyring itself was corrupted after

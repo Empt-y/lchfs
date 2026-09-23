@@ -56,10 +56,11 @@ jobs:
       - name: Clippy (every pool encrypted)
         run: cargo clippy --workspace --all-targets --features lchfs-crypto/test-encrypt-all -- -D warnings
 
-      # TPM2 key slots (the `tpm` feature, off by default because it links
-      # the system tpm2-tss) against a throwaway software TPM -- never a
-      # real one: the tests deliberately enter a wrong PIN, which counts
-      # toward a TPM's dictionary-attack lockout.
+      # TPM2 key slots (lchfs-crypto's `tpm` feature, which links the
+      # system tpm2-tss; the CLI turns it on, so the workspace steps above
+      # build it too) against a throwaway software TPM -- never a real one:
+      # the tests deliberately enter a wrong PIN, which counts toward a
+      # TPM's dictionary-attack lockout.
       - name: TPM slot tests (swtpm)
         run: |
           mkdir -p "$RUNNER_TEMP/swtpm"
@@ -70,3 +71,16 @@ jobs:
           LCHFS_TEST_TPM=1 LCHFS_TPM_TCTI="swtpm:host=127.0.0.1,port=2321" \
             cargo test -p lchfs-crypto --features tpm
           cargo clippy -p lchfs-crypto --all-targets --features tpm -- -D warnings
+
+      # The CLI's TPM unlock, against a second, fresh software TPM: the
+      # crypto tests' wrong PINs above already count toward the first
+      # one's lockout.
+      - name: CLI TPM unlock (swtpm)
+        run: |
+          mkdir -p "$RUNNER_TEMP/swtpm-cli"
+          swtpm socket --tpm2 --tpmstate dir="$RUNNER_TEMP/swtpm-cli" \
+            --server type=tcp,port=2331 --ctrl type=tcp,port=2332 \
+            --flags not-need-init,startup-clear &
+          sleep 1
+          LCHFS_TEST_TPM=1 LCHFS_TPM_TCTI="swtpm:host=127.0.0.1,port=2331" \
+            cargo test --test cli_encryption a_tpm

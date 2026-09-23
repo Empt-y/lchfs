@@ -279,6 +279,11 @@ pub enum PoolError {
     KeyRequired,
     #[error("keyring: {0}")]
     Keyring(#[from] lchfs_crypto::keyring::KeyringError),
+    /// A keyring change (`update_keyring`) that the keyring refused, after
+    /// the key given was accepted -- distinct from `Keyring`, so a caller
+    /// never mistakes "that change is not allowed" for "wrong key".
+    #[error("keyring change refused: {0}")]
+    KeyringChange(#[source] lchfs_crypto::keyring::KeyringError),
     /// A sealed record that could not be opened: wrong key, a modified
     /// record, an epoch this pool no longer holds, or a downgrade.
     #[error("{0}")]
@@ -2016,6 +2021,118 @@ impl Pool {
     /// to be built) reports from.
     pub fn keyring_config(&self) -> Option<lchfs_crypto::keyring::KeyringConfig> {
         self.0.keyring.lock().as_ref().map(|state| *state.ring.config())
+    }
+
+    /// The unlocked keyring's slots, as the mount holds them. Empty for a
+    /// plaintext pool.
+    pub fn keyring_slots(&self) -> Vec<SlotSummary> {
+        self.0
+            .keyring
+            .lock()
+            .as_ref()
+            .map(|state| state.ring.body().slots.iter().map(SlotSummary::of).collect())
+            .unwrap_or_default()
+    }
+
+    /// The keyring generation this mount last wrote or read; `None` for a
+    /// plaintext pool.
+    pub fn keyring_generation(&self) -> Option<u64> {
+        self.0.keyring.lock().as_ref().map(|state| state.ring.body().generation)
+    }
+
+    /// Changes a mounted pool's keyring: adds, removes or revokes a slot.
+    ///
+    /// `proof` must open a slot of the keyring this mount holds *and* yield
+    /// the keyring key the mount already has. Anyone who can reach the
+    /// control socket could otherwise add a slot of their own, and so gain
+    /// lasting offline access to a pool they could only touch while it was
+    /// mounted.
+    ///
+    /// The new keyring goes to every online device. It replaces the mount's
+    /// copy only if at least one device took it; the ones that did not are
+    /// returned, since they now hold an older generation (newest wins at
+    /// the next mount, which also repairs them).
+    pub fn update_keyring<T>(
+        &self,
+        proof: &Unlock<'_>,
+        f: impl FnOnce(&mut UnlockedKeyring) -> Result<T, lchfs_crypto::keyring::KeyringError>,
+    ) -> Result<(T, Vec<(PathBuf, std::io::Error)>), PoolError> {
+        // Held throughout, so a live attach (which copies `state.file` to
+        // its new device under this lock) sees the keyring before or after
+        // the change, never a device set that missed it.
+        let mut guard = self.0.keyring.lock();
+        let Some(state) = guard.as_mut() else {
+            return Err(PoolError::InvalidArgument("this pool is not encrypted".into()));
+        };
+        let proven = keyring::parse(&state.file)?.unlock(proof)?;
+        if proven.keyring_key() != state.ring.keyring_key() {
+            return Err(PoolError::Keyring(lchfs_crypto::keyring::KeyringError::NoMatchingSlot));
+        }
+        drop(proven);
+        let mut ring = state.ring.clone();
+        let value = f(&mut ring).map_err(PoolError::KeyringChange)?;
+        let file = ring.to_file();
+        let roots: Vec<PathBuf> = self
+            .vdev_status()
+            .into_iter()
+            .filter(|s| matches!(s.health, VdevHealth::Online | VdevHealth::CatchingUp))
+            .filter_map(|s| s.root)
+            .collect();
+        let root_refs: Vec<&Path> = roots.iter().map(|r| r.as_path()).collect();
+        let failed = keyring::write_all(&root_refs, &file);
+        if failed.len() == root_refs.len() {
+            let (root, e) = failed.into_iter().next().expect("a mounted pool has an online device");
+            return Err(PoolError::Format(format!(
+                "the keyring could not be written to any device (first: {}: {e}); nothing changed",
+                root.display()
+            )));
+        }
+        *state = KeyringState { ring, file };
+        Ok((value, failed))
+    }
+
+    /// `update_keyring` for a pool that is not mounted: takes every given
+    /// device's pool lock (a mounted pool refuses -- its in-memory keyring
+    /// would later hand the old generation to a device it attaches), unlocks
+    /// with `unlock`, applies `f`, and writes the result to every member.
+    /// Every member must be present unless `allow_missing`: one left out
+    /// keeps the old keyring, and would unlock with it if it were ever the
+    /// only device found.
+    pub fn update_keyring_offline<T>(
+        vdev_roots: &[&Path],
+        allow_missing: bool,
+        unlock: &Unlock<'_>,
+        f: impl FnOnce(&mut UnlockedKeyring) -> Result<T, lchfs_crypto::keyring::KeyringError>,
+    ) -> Result<(T, Vec<(PathBuf, std::io::Error)>), PoolError> {
+        let membership = check_membership(vdev_roots, allow_missing)?;
+        if !membership.missing_vdevs.is_empty() && !allow_missing {
+            return Err(PoolError::InvalidArgument(format!(
+                "vdevs {:?} are missing; they would keep the old keyring",
+                membership.missing_vdevs
+            )));
+        }
+        let member_roots: Vec<&Path> = membership.members.iter().map(|(_, r)| *r).collect();
+        let _locks = member_roots
+            .iter()
+            .map(|r| acquire_pool_lock(r))
+            .collect::<Result<Vec<_>, _>>()?;
+        let pool_uuid = membership.members[0].0.pool_uuid;
+        if !keyring_present(&member_roots, pool_uuid) {
+            return Err(PoolError::InvalidArgument("this pool is not encrypted".into()));
+        }
+        let (_, state) = unlock_pool(&member_roots, pool_uuid, Some(unlock))?;
+        let mut ring = state.expect("a keyring was present").ring;
+        let value = f(&mut ring).map_err(PoolError::KeyringChange)?;
+        let file = ring.to_file();
+        let failed = keyring::write_all(&member_roots, &file);
+        if failed.len() == member_roots.len() {
+            let (root, e) = failed.into_iter().next().expect("at least one member");
+            return Err(PoolError::Format(format!(
+                "the keyring could not be written to any device (first: {}: {e}); nothing changed",
+                root.display()
+            )));
+        }
+        Ok((value, failed))
     }
 
     /// True when this mount is running without some of the pool's devices
@@ -6233,6 +6350,38 @@ fn mount_read_delta(
         }
     }
     Err(first_err.expect("at least one vdev"))
+}
+
+/// True when any of `roots` holds a keyring for pool `pool_uuid` -- the
+/// question "does opening this pool need a key?", asked the same way
+/// `unlock_pool` asks it, so a keyring left behind by another pool never
+/// makes a plaintext pool prompt for one. A damaged keyring counts: it may
+/// be this pool's, and only a key can tell.
+pub fn keyring_present(roots: &[&Path], pool_uuid: [u8; 16]) -> bool {
+    roots.iter().any(|root| {
+        std::fs::read(keyring::path_on(root))
+            .is_ok_and(|bytes| keyring::parse(&bytes).map_or(true, |k| k.body().pool_uuid == pool_uuid))
+    })
+}
+
+/// What a caller may learn about one keyring slot: never its key material.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SlotSummary {
+    pub id: u16,
+    pub kind: &'static str,
+    pub label: String,
+    pub created_unix: i64,
+}
+
+impl SlotSummary {
+    pub fn of(slot: &lchfs_crypto::keyring::Slot) -> Self {
+        Self {
+            id: slot.id,
+            kind: slot.kind.type_name(),
+            label: slot.label.clone(),
+            created_unix: slot.created_unix,
+        }
+    }
 }
 
 /// How a pool being opened reads its records: plaintext if no device holds

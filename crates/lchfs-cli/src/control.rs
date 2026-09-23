@@ -17,6 +17,9 @@ use std::time::Duration;
 
 pub const SOCKET_NAME: &str = "control.sock";
 
+/// The reply code for a key the pool did not accept.
+pub const KEY_REFUSED: &str = "key-refused";
+
 /// Where a mounted pool's socket is: in its primary's root.
 pub fn socket_path(pool: &Pool) -> PathBuf {
     let primary = pool.primary_vdev();
@@ -49,6 +52,9 @@ impl ControlServer {
             std::fs::remove_file(&path)?;
         }
         let listener = UnixListener::bind(&path)?;
+        // Owner only. The peer check in `serve_one` is what enforces it --
+        // this just keeps the socket from being offered to anyone else.
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
         listener.set_nonblocking(true)?;
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
@@ -90,14 +96,39 @@ impl Drop for ControlServer {
     }
 }
 
+/// Only the mount's own user, or root, may drive it: a detach or an
+/// offline is destructive, and a key change grants access.
+fn peer_allowed(stream: &UnixStream) -> anyhow::Result<bool> {
+    let cred = nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::PeerCredentials)?;
+    Ok(cred.uid() == 0 || cred.uid() == nix::unistd::geteuid().as_raw())
+}
+
 fn serve_one(pool: &Pool, mut stream: UnixStream) -> anyhow::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    let mut line = String::new();
+    if !peer_allowed(&stream)? {
+        writeln!(stream, "{}", json!({ "ok": false, "error": "permission denied: not the mount's user" }))?;
+        return Ok(());
+    }
+    // The request may carry a passphrase: its buffer is zeroed after.
+    let mut line = zeroize::Zeroizing::new(String::new());
     BufReader::new(&stream).read_line(&mut line)?;
+    if line.is_empty() {
+        // A connection closed without a request: `is_live` probing.
+        return Ok(());
+    }
     let reply = match serde_json::from_str::<Value>(&line) {
         Ok(request) => match handle(pool, &request) {
             Ok(result) => json!({ "ok": true, "result": result }),
-            Err(e) => json!({ "ok": false, "error": e.to_string() }),
+            Err(e) => {
+                // A refused key is its own code, so a client can ask again
+                // rather than give up.
+                let refused = e.downcast_ref::<lchfs_store::PoolError>().is_some_and(crate::unlock::refused);
+                if refused {
+                    json!({ "ok": false, "error": e.to_string(), "code": KEY_REFUSED })
+                } else {
+                    json!({ "ok": false, "error": e.to_string() })
+                }
+            }
         },
         Err(e) => json!({ "ok": false, "error": format!("bad request: {e}") }),
     };
@@ -130,6 +161,25 @@ fn stripe_policy_json(pool: &Pool) -> Value {
         "min_age_segments": p.min_age_segments,
         "enabled": p.enabled(),
     })
+}
+
+/// What a mount can say about its encryption without disclosing a key.
+fn encryption_json(pool: &Pool) -> Value {
+    match pool.keyring_config() {
+        None => json!({ "encrypted": false }),
+        Some(config) => json!({
+            "encrypted": true,
+            "keyring_generation": pool.keyring_generation(),
+            "padding": format!("{:?}", config.padding),
+            "current_epoch": config.current_epoch,
+            "min_epoch": config.min_epoch,
+            "conversion": config.conversion.map(|c| json!({
+                "target_epoch": c.target_epoch,
+                "phase": format!("{:?}", c.phase),
+            })),
+            "slots": pool.keyring_slots(),
+        }),
+    }
 }
 
 fn resilver_json(r: &lchfs_store::ResilverReport) -> Value {
@@ -182,6 +232,7 @@ pub fn handle(pool: &Pool, request: &Value) -> anyhow::Result<Value> {
                     "promotions": stats.promotions,
                     "corruption_events": pool.corruption_events().len(),
                 },
+                "encryption": encryption_json(pool),
                 "mount_resilver": pool
                     .mount_resilver()
                     .iter()
@@ -289,6 +340,24 @@ pub fn handle(pool: &Pool, request: &Value) -> anyhow::Result<Value> {
                 "saved_bytes": s.mirrored_cost_bytes.saturating_sub(s.shard_bytes),
             }))
         }
+        "encryption-status" => Ok(encryption_json(pool)),
+        "key-list" => Ok(json!({
+            "generation": pool.keyring_generation(),
+            "slots": pool.keyring_slots(),
+        })),
+        "key-op" => {
+            let proof = crate::unlock::Credential::from_json(arg(request, "proof")?)?;
+            let op = crate::keyops::KeyOp::from_json(arg(request, "op")?)?;
+            let (result, unwritten) = pool.update_keyring(&proof.as_unlock(), |ring| op.apply(ring))?;
+            Ok(json!({
+                "result": result,
+                "generation": pool.keyring_generation(),
+                "unwritten": unwritten
+                    .iter()
+                    .map(|(root, e)| json!({ "root": root.display().to_string(), "error": e.to_string() }))
+                    .collect::<Vec<_>>(),
+            }))
+        }
         other => anyhow::bail!("unknown command {other:?}"),
     }
 }
@@ -306,15 +375,25 @@ fn path_arg(request: &Value) -> anyhow::Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
+/// Sends one request and returns the whole reply, `ok` or not.
+pub fn request_raw(socket: &Path, request: &Value) -> anyhow::Result<Value> {
+    let mut stream = UnixStream::connect(socket)
+        .map_err(|e| anyhow::anyhow!("cannot reach {} ({e}); is the pool mounted?", socket.display()))?;
+    writeln!(stream, "{}", *zeroize::Zeroizing::new(request.to_string()))?;
+    let mut line = String::new();
+    BufReader::new(&stream).read_line(&mut line)?;
+    Ok(serde_json::from_str(&line)?)
+}
+
+/// True when a mount is serving `socket` right now.
+pub fn is_live(socket: &Path) -> bool {
+    UnixStream::connect(socket).is_ok()
+}
+
 /// Sends one request to the socket at `socket` and returns the reply's
 /// `result`, or the error the mount reported.
 pub fn request(socket: &Path, request: &Value) -> anyhow::Result<Value> {
-    let mut stream = UnixStream::connect(socket)
-        .map_err(|e| anyhow::anyhow!("cannot reach {} ({e}); is the pool mounted?", socket.display()))?;
-    writeln!(stream, "{request}")?;
-    let mut line = String::new();
-    BufReader::new(&stream).read_line(&mut line)?;
-    let reply: Value = serde_json::from_str(&line)?;
+    let reply = request_raw(socket, request)?;
     if reply.get("ok").and_then(Value::as_bool) == Some(true) {
         Ok(reply.get("result").cloned().unwrap_or(Value::Null))
     } else {

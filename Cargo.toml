@@ -65,3 +65,7 @@ path = "src/main.rs"
 [dependencies]
 lchfs-cli = { workspace = true }
 anyhow = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+lchfs-crypto = { workspace = true }

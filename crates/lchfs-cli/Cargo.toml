@@ -5,7 +5,16 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 
+[features]
+default = ["tpm"]
+# TPM2 key slots: links the system tpm2-tss library.
+tpm = ["lchfs-crypto/tpm"]
+
 [dependencies]
+lchfs-crypto = { workspace = true }
+zeroize = { workspace = true }
+hex = { workspace = true }
+nix = { workspace = true, features = ["term", "socket", "user"] }
 lchfs-fuse = { workspace = true }
 lchfs-nfs = { path = "../lchfs-nfs" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }

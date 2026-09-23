@@ -87,6 +87,18 @@ pub enum FsckError {
     /// The pool is encrypted and this check was given no key for it.
     #[error("this pool is encrypted and no key was given; its records cannot be checked without one")]
     KeyRequired,
+    /// The key given does not unlock the pool's keyring, or the keyrings
+    /// cannot be reconciled.
+    #[error("keyring: {0}")]
+    Keyring(String),
+    #[error("vdev {vdev_id} has no keyring (a mount with the key restores it)")]
+    KeyringMissing { vdev_id: u16 },
+    #[error("vdev {vdev_id}'s keyring is generation {generation}, behind the newest {newest} (a mount with the key updates it)")]
+    KeyringStale { vdev_id: u16, generation: u64, newest: u64 },
+    #[error("vdev {vdev_id} holds a keyring for a different pool (a mount with the key replaces it)")]
+    KeyringForeign { vdev_id: u16 },
+    #[error("vdev {vdev_id}'s keyring is damaged: {detail}")]
+    KeyringDamaged { vdev_id: u16, detail: String },
     #[error("{stream} segment {segment_id}: bytes {from}..{to} are unparseable and were skipped over")]
     DamagedRegion { segment_id: u64, stream: &'static str, from: u32, to: u32 },
     #[error("striped segment {segment_id}: shard {shard_index} is missing from vdev {vdev_id}")]
@@ -103,6 +115,9 @@ pub enum FsckError {
 #[derive(Debug, Default)]
 pub struct FsckReport {
     pub errors: Vec<FsckError>,
+    /// Findings that lose no data and that the next mount repairs on its
+    /// own (a device's stale or missing keyring). Reported, not failed on.
+    pub warnings: Vec<FsckError>,
     pub objects_visited: u64,
 }
 
@@ -279,29 +294,76 @@ pub fn read_superblock(pool_root: &Path) -> Result<SuperblockSlot, FsckError> {
     best.ok_or_else(|| FsckError::NoValidSuperblock(pool_root.display().to_string()))
 }
 
-/// How this run reads sealed records: plaintext for a pool with no
-/// keyring. An encrypted pool needs its key, and fsck cannot yet be given
-/// one (that is the CLI's `--unlock`, still to come) -- except in a
+/// How to read an encrypted pool's sealed records: unlocks the newest
+/// genuine keyring on `vdev_roots` with `how`. A pool with no keyring reads
+/// as plaintext, whatever `how` is.
+///
+/// Uses `lchfs_crypto`'s keyring reader directly rather than the store's
+/// unlock: the keyring format is a documented primitive, and fsck must not
+/// need the engine to agree with itself before it can audit it. Unlike the
+/// engine's unlock it never repairs a stale device -- fsck reports.
+pub fn unlock(
+    vdev_roots: &[&Path],
+    how: &lchfs_crypto::keyring::Unlock<'_>,
+) -> Result<lchfs_format::RecordCrypto, lchfs_crypto::keyring::KeyringError> {
+    let ours = keyring_roots(vdev_roots);
+    if ours.is_empty() {
+        return Ok(lchfs_format::RecordCrypto::plaintext());
+    }
+    let found = lchfs_crypto::keyring::unlock_newest(&ours, how)?;
+    let config = found.ring.config();
+    Ok(lchfs_format::RecordCrypto::new(
+        found.ring.pool_uuid(),
+        config.current_epoch,
+        config.min_epoch,
+        config.padding,
+        found.ring.epoch_keys(),
+    ))
+}
+
+/// The roots whose keyring may be this pool's -- the first root's
+/// superblock names the pool, and a keyring left behind by another pool
+/// says nothing about it (the engine ignores it the same way).
+fn keyring_roots<'a>(vdev_roots: &[&'a Path]) -> Vec<&'a Path> {
+    let uuid = vdev_roots.first().and_then(|r| read_superblock(r).ok()).map(|s| s.pool_uuid);
+    vdev_roots
+        .iter()
+        .copied()
+        .filter(|r| {
+            std::fs::read(lchfs_crypto::keyring::path_on(r)).is_ok_and(|bytes| {
+                lchfs_crypto::keyring::parse(&bytes).map_or(true, |k| Some(k.body().pool_uuid) == uuid)
+            })
+        })
+        .collect()
+}
+
+/// True when `vdev_roots` hold this pool's keyring: whether a full check
+/// needs a key.
+pub fn is_encrypted(vdev_roots: &[&Path]) -> bool {
+    !keyring_roots(vdev_roots).is_empty()
+}
+
+/// How this run reads sealed records: the key the caller unlocked, or
+/// plaintext for a pool with no keyring. An encrypted pool with no key
+/// given is `KeyRequired`, reported up front -- reading it as plaintext
+/// would report every sealed record as corrupt, which looks like a
+/// destroyed pool rather than a missing key -- except in a
 /// `test-encrypt-all` build, whose pools all share one known passphrase,
-/// so the whole test suite gets a real fsck against encrypted pools. On any
-/// other encrypted pool this is `KeyRequired`, reported up front: reading
-/// it as plaintext would report every sealed record as corrupt, which looks
-/// like a destroyed pool rather than a missing key.
-fn pool_crypto(vdev_roots: &[&Path]) -> Result<lchfs_format::RecordCrypto, FsckError> {
-    if !vdev_roots.iter().any(|r| lchfs_crypto::keyring::exists_on(r)) {
+/// so the whole test suite gets a real fsck against encrypted pools.
+fn pool_crypto(
+    vdev_roots: &[&Path],
+    given: Option<&lchfs_format::RecordCrypto>,
+) -> Result<lchfs_format::RecordCrypto, FsckError> {
+    if let Some(c) = given {
+        return Ok(c.clone());
+    }
+    if !is_encrypted(vdev_roots) {
         return Ok(lchfs_format::RecordCrypto::plaintext());
     }
     if lchfs_crypto::testing::TEST_ENCRYPT_ALL {
         let how = lchfs_crypto::keyring::Unlock::Passphrase(lchfs_crypto::testing::TEST_PASSPHRASE);
-        if let Ok(found) = lchfs_crypto::keyring::unlock_newest(vdev_roots, &how) {
-            let config = found.ring.config();
-            return Ok(lchfs_format::RecordCrypto::new(
-                found.ring.pool_uuid(),
-                config.current_epoch,
-                config.min_epoch,
-                config.padding,
-                found.ring.epoch_keys(),
-            ));
+        if let Ok(c) = unlock(vdev_roots, &how) {
+            return Ok(c);
         }
     }
     Err(FsckError::KeyRequired)
@@ -313,9 +375,18 @@ fn pool_crypto(vdev_roots: &[&Path]) -> Result<lchfs_format::RecordCrypto, FsckE
 /// `check`/`verify_index`'s callers (the CLI) are expected to use, rather
 /// than each re-deriving this walk themselves.
 pub fn collect_live_roots(pool_root: &Path) -> Result<Vec<Hash32>, FsckError> {
+    collect_live_roots_with(pool_root, None)
+}
+
+/// `collect_live_roots` with the key from `unlock` (`None`: plaintext, or
+/// `KeyRequired`).
+pub fn collect_live_roots_with(
+    pool_root: &Path,
+    key: Option<&lchfs_format::RecordCrypto>,
+) -> Result<Vec<Hash32>, FsckError> {
     let slot = read_superblock(pool_root)?;
     let mut roots = vec![slot.root_hash];
-    let crypto = pool_crypto(&[pool_root])?;
+    let crypto = pool_crypto(&[pool_root], key)?;
 
     let reader = SegmentReader::open(pool_root, slot.root_location.segment_id, StreamKind::Meta)
         .map_err(|e| FsckError::Io(format!("opening root object segment: {e}")))?;
@@ -600,6 +671,15 @@ pub fn check(pool_root: &Path, live_roots: &[Hash32]) -> FsckReport {
 /// stripes reports each stripe as short of shards and its records as
 /// unreadable, which is the truth of what one device holds.
 pub fn check_devices(vdev_roots: &[&Path], live_roots: &[Hash32]) -> FsckReport {
+    check_devices_with(vdev_roots, live_roots, None)
+}
+
+/// `check_devices` with the key from `unlock`.
+pub fn check_devices_with(
+    vdev_roots: &[&Path],
+    live_roots: &[Hash32],
+    key: Option<&lchfs_format::RecordCrypto>,
+) -> FsckReport {
     let scanned = match scan_devices(vdev_roots) {
         Ok(m) => m,
         Err(e) => {
@@ -608,7 +688,7 @@ pub fn check_devices(vdev_roots: &[&Path], live_roots: &[Hash32]) -> FsckReport 
             return report;
         }
     };
-    let crypto = match pool_crypto(vdev_roots) {
+    let crypto = match pool_crypto(vdev_roots, key) {
         Ok(c) => c,
         Err(e) => {
             let mut report = FsckReport::default();
@@ -634,6 +714,15 @@ pub fn verify_index(pool_root: &Path, live_roots: &[Hash32]) -> FsckReport {
 /// `verify_index`, given every device, so striped records are walked and
 /// their `(hash, STRIPED)` entries checked like any other.
 pub fn verify_index_devices(vdev_roots: &[&Path], live_roots: &[Hash32]) -> FsckReport {
+    verify_index_devices_with(vdev_roots, live_roots, None)
+}
+
+/// `verify_index_devices` with the key from `unlock`.
+pub fn verify_index_devices_with(
+    vdev_roots: &[&Path],
+    live_roots: &[Hash32],
+    key: Option<&lchfs_format::RecordCrypto>,
+) -> FsckReport {
     let pool_root = vdev_roots[0];
     let scanned = match scan_devices(vdev_roots) {
         Ok(m) => m,
@@ -652,7 +741,7 @@ pub fn verify_index_devices(vdev_roots: &[&Path], live_roots: &[Hash32]) -> Fsck
         }
     };
 
-    let crypto = match pool_crypto(vdev_roots) {
+    let crypto = match pool_crypto(vdev_roots, key) {
         Ok(c) => c,
         Err(e) => {
             let mut report = FsckReport::default();
@@ -755,6 +844,11 @@ pub fn rebuild_index(pool_root: &Path, other_vdevs: &[&Path]) -> Result<(), Fsck
 /// the one compared, because that is the copy the engine's index points at
 /// after a heal.
 pub fn check_replicas(vdev_roots: &[&Path]) -> FsckReport {
+    check_replicas_with(vdev_roots, None)
+}
+
+/// `check_replicas` with the key from `unlock`.
+pub fn check_replicas_with(vdev_roots: &[&Path], key: Option<&lchfs_format::RecordCrypto>) -> FsckReport {
     let mut report = FsckReport::default();
     if vdev_roots.is_empty() {
         return report;
@@ -821,7 +915,7 @@ pub fn check_replicas(vdev_roots: &[&Path]) -> FsckReport {
 
     // Only once the devices are known to be one pool: a foreign device's
     // keyring would otherwise turn "wrong pool" into "key required".
-    let crypto = match pool_crypto(vdev_roots) {
+    let crypto = match pool_crypto(vdev_roots, key) {
         Ok(c) => c,
         Err(e) => {
             report.errors.push(e);
@@ -946,6 +1040,91 @@ pub fn check_replicas(vdev_roots: &[&Path]) -> FsckReport {
 
     report.objects_visited += striped.locations.len() as u64;
     report.errors.extend(striped.findings);
+    report
+}
+
+/// Every device's keyring against the others, without a key: each is
+/// present, parses and checksums, belongs to this pool, and is at the
+/// newest generation, and no two copies of one generation differ. The MAC
+/// and every epoch key are checked by `unlock`, which needs the key.
+/// A pool with no keyring anywhere is plaintext and yields nothing.
+pub fn check_keyrings(vdev_roots: &[&Path]) -> FsckReport {
+    use lchfs_crypto::keyring;
+    let mut report = FsckReport::default();
+    if !is_encrypted(vdev_roots) {
+        return report;
+    }
+    let devices = match device_ids(vdev_roots) {
+        Ok(d) => d,
+        Err(e) => {
+            report.errors.push(e);
+            return report;
+        }
+    };
+    let uuid = read_superblock(vdev_roots[0]).map(|s| s.pool_uuid).ok();
+    let mut ours: Vec<(u16, &Path, u64)> = Vec::new();
+    for &(vdev_id, root) in &devices {
+        let bytes = match std::fs::read(keyring::path_on(root)) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                report.warnings.push(FsckError::KeyringMissing { vdev_id });
+                continue;
+            }
+            Err(e) => {
+                report.errors.push(FsckError::KeyringDamaged { vdev_id, detail: e.to_string() });
+                continue;
+            }
+        };
+        report.objects_visited += 1;
+        match keyring::parse(&bytes) {
+            Ok(k) if Some(k.body().pool_uuid) != uuid => report.warnings.push(FsckError::KeyringForeign { vdev_id }),
+            Ok(k) => ours.push((vdev_id, root, k.body().generation)),
+            Err(e) => report.errors.push(FsckError::KeyringDamaged { vdev_id, detail: e.to_string() }),
+        }
+    }
+    let newest = ours.iter().map(|&(_, _, g)| g).max().unwrap_or(0);
+    for &(vdev_id, _, generation) in &ours {
+        if generation < newest {
+            report.warnings.push(FsckError::KeyringStale { vdev_id, generation, newest });
+        }
+    }
+    let roots: Vec<&Path> = ours.iter().map(|&(_, r, _)| r).collect();
+    if let Err(e) = keyring::read_all(&roots) {
+        report.errors.push(FsckError::Keyring(e.to_string()));
+    }
+    report
+}
+
+/// What can be checked on an encrypted pool without its key: every
+/// device's superblock ring, the framing and header checksum of every
+/// record (a sealed record's payload is only verifiable by opening it),
+/// every stripe's shards and parity (which cover the ciphertext), and the
+/// keyrings. Record contents and the DAG are not verified.
+pub fn structural_check(vdev_roots: &[&Path]) -> FsckReport {
+    let mut report = FsckReport::default();
+    for root in vdev_roots {
+        if let Err(e) = read_superblock(root) {
+            report.errors.push(e);
+        }
+    }
+    if !report.errors.is_empty() {
+        return report;
+    }
+    for root in vdev_roots {
+        match scan_all_segments_reporting(root) {
+            Ok(scanned) => {
+                report.objects_visited += scanned.locations.len() as u64;
+                report.errors.extend(scanned.damaged);
+            }
+            Err(e) => report.errors.push(e),
+        }
+    }
+    let stripes = check_stripes(vdev_roots);
+    report.objects_visited += stripes.objects_visited;
+    report.errors.extend(stripes.errors);
+    let keyrings = check_keyrings(vdev_roots);
+    report.errors.extend(keyrings.errors);
+    report.warnings.extend(keyrings.warnings);
     report
 }
 

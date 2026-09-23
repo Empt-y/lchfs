@@ -37,9 +37,9 @@ A FUSE3 filesystem where every chunk of every file is content-addressed: its BLA
 | Checkpoint interval | Every 5s by default, or on `fsync()`, ring backpressure, or unmount |
 | Crash recovery | Zero-replay base case; bounded, idempotent per-shard delta-log replay when the fast `fsync()` path has been used |
 
-## Encryption (in progress)
+## Encryption
 
-Native, per-pool encryption is being built in milestones. The design is
+Native, per-pool encryption, built in milestones. The design is
 in ARCHITECTURE.md §18; the short version:
 
 - **Content:** each chunk is addressed by a *keyed* BLAKE3 hash and sealed
@@ -59,17 +59,41 @@ in ARCHITECTURE.md §18; the short version:
 
   A pool always keeps one non-TPM slot.
 - **Status:**
-  - Milestones 1 and 2 are on `master`: the crypto core (keyring, slots,
-    envelopes, fuzz targets, software-TPM tests in CI) and the engine
-    integration. The library can create and open encrypted pools
-    (`Pool::create_encrypted`, `Pool::open_with`).
+  - Milestones 1–3 are on `master`: the crypto core (keyring, slots,
+    envelopes, fuzz targets, software-TPM tests in CI), the engine
+    integration, and the command line.
   - The whole test suite runs twice in CI, once plaintext and once with
     every pool encrypted, and a leakage test checks that no file content,
     name, xattr, symlink target or plaintext content hash reaches the disk.
-  - Not usable from the command line yet: `lchfs` has no flags to create,
-    unlock or manage an encrypted pool. That is next (milestone 3),
-    followed by in-place conversion of plaintext pools, key rotation, and
-    hardening.
+  - Still to come: in-place conversion of plaintext pools and key
+    rotation (`pool encrypt` / `pool rekey`), then hardening and
+    benchmarks.
+
+### Using it
+
+```sh
+# A passphrase slot (asked for twice), plus a post-quantum recipient key
+# and this machine's TPM with a PIN:
+lchfs key generate-recipient ~/.lchfs/recovery      # writes recovery + recovery.pub
+lchfs create-pool --encrypt --recipient ~/.lchfs/recovery.pub --tpm --with-pin /pool
+lchfs key backup /pool ~/pool-keyring.bak           # keep it: no keyring, no pool
+
+lchfs mount /pool /mnt --tpm --tpm-pin              # or --identity FILE, or a passphrase
+lchfs mount /pool /mnt --require-encryption         # refuse a plaintext pool swapped in
+
+lchfs key list /pool                                # needs no key
+lchfs key add-passphrase /pool                      # proves with an existing key first
+lchfs key revoke 0 /pool                            # remove a slot *and* re-key the keyring
+lchfs fsck /pool                                    # asks for a key; without one (or with
+                                                    # --structural) checks structure only
+```
+
+Passphrases never go on the command line: they come from
+`--passphrase-file`, `--passphrase-fd`, a no-echo terminal prompt, or an
+askpass helper (`LCHFS_ASKPASS`, then `SSH_ASKPASS`). `key` commands on a
+mounted pool go through its control socket (owner-only, and every change
+must be proven with a key the pool already has); on an unmounted pool they
+write every device's keyring directly, under the pool lock.
 
 ## Build
 
@@ -81,7 +105,7 @@ cargo build
 
 ```
 crates/
-  lchfs-crypto/     BLAKE3 + CRC32C
+  lchfs-crypto/     BLAKE3 + CRC32C, record envelopes, keyring and key slots
   lchfs-chunk/      FastCDC content-defined chunking
   lchfs-compress/   adaptive zstd
   lchfs-format/     on-disk schema (superblock, extent records, Merkle DAG objects)
@@ -89,6 +113,6 @@ crates/
   lchfs-store/      the engine — segments, ingress, checkpointing, GC
   lchfs-fuse/       FUSE3 frontend (fuser)
   lchfs-fsck/       DAG-walk verification
-  lchfs-cli/        create-pool / mount / fsck / snapshot commands
+  lchfs-cli/        create-pool / mount / fsck / snapshot / key commands
   lchfs-testkit/    reference model + proptest generators (dev-only)
 ```

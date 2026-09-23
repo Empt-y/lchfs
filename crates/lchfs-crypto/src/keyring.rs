@@ -214,7 +214,7 @@ pub struct LockedKeyring {
 }
 
 /// An unlocked keyring: KK in hand, every epoch key unwrapped and checked.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct UnlockedKeyring {
     body: KeyringBody,
     kk: Key32,

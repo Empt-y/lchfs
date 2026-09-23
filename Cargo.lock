@@ -916,6 +916,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "lchfs-cli",
+ "lchfs-crypto",
+ "tempfile",
 ]
 
 [[package]]
@@ -934,17 +936,21 @@ dependencies = [
  "anyhow",
  "clap",
  "fuser",
+ "hex",
+ "lchfs-crypto",
  "lchfs-format",
  "lchfs-fsck",
  "lchfs-fuse",
  "lchfs-index",
  "lchfs-nfs",
  "lchfs-store",
+ "nix",
  "serde_json",
  "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
