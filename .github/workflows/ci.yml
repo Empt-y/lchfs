@@ -47,8 +47,11 @@ jobs:
       # under a fixed test passphrase (lchfs-crypto's `test-encrypt-all`),
       # so every existing test also exercises sealed records, keyed
       # addressing and the keyring -- not just the tests written for them.
+      # Optimized: unoptimized XChaCha20/BLAKE3 is slow enough that the
+      # concurrency tests' checkpoint loop is starved in a debug build
+      # (~3x the plaintext run, too few checkpoints to race anything).
       - name: Test (every pool encrypted)
-        run: cargo test --workspace --features lchfs-crypto/test-encrypt-all
+        run: cargo test --workspace --release --features lchfs-crypto/test-encrypt-all
 
       - name: Clippy (every pool encrypted)
         run: cargo clippy --workspace --all-targets --features lchfs-crypto/test-encrypt-all -- -D warnings
