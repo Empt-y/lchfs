@@ -116,6 +116,12 @@ impl ShardDataWriter {
         };
         self.last_append = std::time::Instant::now();
         self.report_faults();
+        // A segment that has lost every replica is finished: the next
+        // append opens a fresh one on whatever is online by then, rather
+        // than failing against this one forever.
+        if result.is_err() && self.writer.as_ref().is_some_and(|w| w.vdev_ids().is_empty()) {
+            self.writer = None;
+        }
         Ok(Appended {
             location: result?,
             vdevs: Arc::clone(&self.vdev_ids),

@@ -351,6 +351,16 @@ impl SegmentWriter {
     /// fault model of §15.3 completed: synchronous to every *online*
     /// device, where a device that has just failed is no longer online.
     fn each_replica(&mut self, mut op: impl FnMut(&File) -> io::Result<()>) -> io::Result<()> {
+        // Every replica already failed: the operation reaches no device.
+        // Without this the loop below ran zero times and reported success,
+        // so an append to a writer that had lost its last device was
+        // acknowledged and stored nowhere.
+        if self.files.is_empty() {
+            return Err(io::Error::other(format!(
+                "segment {} has no replica left on any device",
+                self.segment_id
+            )));
+        }
         let mut last_err: Option<io::Error> = None;
         let mut i = 0;
         while i < self.files.len() {

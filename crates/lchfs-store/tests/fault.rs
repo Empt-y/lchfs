@@ -221,3 +221,25 @@ fn a_primary_whose_segments_vanish_still_serves_through_the_mirror() {
     assert_eq!(read_file(&pool, "f", 30_000), payload(7));
     assert!(!data_segments(a.path()).is_empty());
 }
+
+/// A segment writer whose last replica failed used to report every later
+/// append as a success -- with no device to write to, its loop over the
+/// replicas ran zero times -- so a write after losing every device was
+/// acknowledged and stored nowhere. (Seen as a committer panic indexing an
+/// empty device list when a test machine's disk filled up.)
+#[test]
+fn a_writer_with_no_replica_left_refuses_every_append() {
+    use lchfs_format::{CodecId, ExtentKind, Hash32, StreamKind};
+    use lchfs_store::segment::SegmentWriter;
+    let dir = tempfile::tempdir().unwrap();
+    // A real device: a superblock at its root.
+    drop(Pool::create(dir.path(), small_params()).unwrap());
+    let mut writer = SegmentWriter::create(&[dir.path()], 999, StreamKind::Data, 0).unwrap();
+    writer.append(ExtentKind::RawChunk, Hash32([1; 32]), CodecId::None, 4, b"abcd", Vec::new()).unwrap();
+    fault_injection::kill(dir.path());
+    assert!(writer.append(ExtentKind::RawChunk, Hash32([2; 32]), CodecId::None, 4, b"efgh", Vec::new()).is_err());
+    fault_injection::revive(dir.path());
+    let later = writer.append(ExtentKind::RawChunk, Hash32([3; 32]), CodecId::None, 4, b"ijkl", Vec::new());
+    assert!(later.is_err(), "an append with no replica left must fail, not report {later:?}");
+    assert!(writer.vdev_ids().is_empty());
+}

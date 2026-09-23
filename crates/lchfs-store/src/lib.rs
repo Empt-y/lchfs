@@ -3074,7 +3074,9 @@ impl PoolShared {
         let _table = self.snapshot_lock.lock();
         let mut table = self.current_snapshot_table()?;
         let before = table.entries.len();
-        table.entries.retain(|e| e.name != name);
+        // A conversion's staging entry for this snapshot goes with it.
+        let staging: Vec<String> = table.entries.iter().filter(|e| e.name == name).map(rekey::staging_name_for).collect();
+        table.entries.retain(|e| e.name != name && !staging.contains(&e.name));
         if table.entries.len() == before {
             return Err(PoolError::NotFound(name.to_string()));
         }
@@ -4603,6 +4605,16 @@ impl PoolShared {
         // set is untouched and the next failover pass retries, rather than
         // the slot being lost to neither set.
         self.seal_before_join(id, root)?;
+
+        // The keyring may have moved on while the device was out -- a new
+        // slot, a revoke, a conversion's new epoch, a finished retirement's
+        // raised minimum -- and records of an epoch it has no key for are
+        // about to be resilvered onto it. Without the current keyring it
+        // could not be mounted on its own, and a revoked secret would still
+        // open it. Before it joins, like an attach.
+        if let Some(state) = self.keyring.lock().as_ref() {
+            keyring::write_on(root, &state.file)?;
+        }
 
         let member = match self.vdevs.take_faulted(id) {
             Some(member) => member,

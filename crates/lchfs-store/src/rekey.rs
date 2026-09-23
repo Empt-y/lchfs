@@ -372,7 +372,17 @@ impl PoolShared {
     /// its inode lock -- whichever of its open session, `file_state` or
     /// ContentRef holds its chunk list.
     fn rekey_file(&self, ino: u64, target: u16) -> Result<(), PoolError> {
+        // Where the next batch starts looking: each batch rewrites the first
+        // FILE_BATCH old chunks from here, so a long file is scanned once,
+        // not once per batch. A last pass from 0 confirms nothing was left
+        // (a write between batches can change the list).
+        let mut resume = 0usize;
+        let mut owed = 0u64;
         loop {
+            // The rate limit is paid here, with the inode lock released: a
+            // sleep under it would hold up the checkpoint waiting on this
+            // file, and everything behind that.
+            self.throttle(std::mem::take(&mut owed));
             if self.cancelled() {
                 return Ok(());
             }
@@ -405,7 +415,8 @@ impl PoolShared {
             };
 
             let mut todo = Vec::new();
-            for (i, r) in refs.iter().enumerate() {
+            let start = resume.min(refs.len());
+            for (i, r) in refs.iter().enumerate().skip(start) {
                 if self.epoch_of(r.content_hash, StreamKind::Data)? != target {
                     todo.push(i);
                     if todo.len() == FILE_BATCH {
@@ -418,16 +429,23 @@ impl PoolShared {
                 _ => false,
             };
             if todo.is_empty() && !list_is_old {
-                return Ok(());
+                if start == 0 {
+                    return Ok(());
+                }
+                resume = 0;
+                continue;
             }
+            resume = todo.last().map_or(start, |&i| i + 1);
 
             // Before any chunk this commits exists: the next checkpoint
             // must capture the file, or the new chunks look like garbage.
             self.mark_dirty_before_commit(ino);
             let mut new_refs = refs.clone();
+            let before = self.conversion_progress.lock().bytes_rewritten;
             for &i in &todo {
                 new_refs[i] = self.rekey_chunk(ino, refs[i], None)?;
             }
+            owed = self.conversion_progress.lock().bytes_rewritten.saturating_sub(before);
             match source {
                 Source::Session => {
                     if let Some(s) = self.open_files.shard(ino).get_mut(&ino) {
@@ -498,7 +516,6 @@ impl PoolShared {
             p.chunks_rewritten += 1;
             p.bytes_rewritten += bytes.len() as u64;
         }
-        self.throttle(bytes.len() as u64);
         Ok(ChunkRef { content_hash: new, ..r })
     }
 
@@ -561,6 +578,7 @@ impl PoolShared {
 
     /// Rewrites every retained snapshot's tree into `target`.
     fn rekey_snapshots(&self, target: u16) -> Result<(), PoolError> {
+        self.drop_orphaned_staging()?;
         let table = self.current_snapshot_table()?;
         let names: Vec<String> = table
             .entries
@@ -584,14 +602,15 @@ impl PoolShared {
     }
 
     fn rekey_snapshot(&self, name: &str, target: u16) -> Result<(), PoolError> {
-        let staging_name = format!("{RESERVED_SNAPSHOT_PREFIX}{name}");
         let (entry, staging) = {
             let table = self.current_snapshot_table()?;
             let Some(entry) = table.entries.iter().find(|e| e.name == name).cloned() else {
                 return Ok(());
             };
+            let staging_name = staging_name_for(&entry);
             (entry, table.entries.iter().find(|e| e.name == staging_name).cloned())
         };
+        let staging_name = staging_name_for(&entry);
         if self.epoch_of(entry.root_hash, StreamKind::Meta)? == target {
             return Ok(());
         }
@@ -637,6 +656,30 @@ impl PoolShared {
         result
     }
 
+    /// Removes staging entries whose snapshot -- that name with that root --
+    /// is no longer in the table: left by a rewrite that a crash or an
+    /// unmount interrupted before its snapshot was deleted or replaced.
+    /// Kept, one would hold its space for good and, being old-epoch and
+    /// reachable, stop the next conversion from ever finishing.
+    fn drop_orphaned_staging(&self) -> Result<(), PoolError> {
+        let _table = self.snapshot_lock.lock();
+        let mut table = self.current_snapshot_table()?;
+        let live: HashSet<String> = table
+            .entries
+            .iter()
+            .filter(|e| !e.name.starts_with(RESERVED_SNAPSHOT_PREFIX))
+            .map(staging_name_for)
+            .collect();
+        let before = table.entries.len();
+        table
+            .entries
+            .retain(|e| !e.name.starts_with(RESERVED_SNAPSHOT_PREFIX) || live.contains(&e.name));
+        if table.entries.len() != before {
+            self.publish_snapshot_table(&table)?;
+        }
+        Ok(())
+    }
+
     /// A RootObject like `root` whose InoMap is exactly `entries`.
     fn put_partial_root(&self, root: &RootObject, entries: &BTreeMap<u64, Hash32>, table_hash: Hash32) -> Result<Hash32, PoolError> {
         let inomap = InoMap {
@@ -656,8 +699,11 @@ impl PoolShared {
 
     /// Publishes progress on snapshot `name`: as its hidden staging entry
     /// (`finished = false`), or, when done, as the snapshot itself with the
-    /// staging entry gone. If the user deleted the snapshot meanwhile, the
-    /// staging entry is dropped and `false` returned.
+    /// staging entry gone. "The snapshot" is the one this rewrite started
+    /// from -- same name *and* same root: if the user deleted it meanwhile,
+    /// or deleted it and made a new one under the same name, the new one is
+    /// left exactly as it is, this rewrite's staging entry is dropped, and
+    /// `false` returned.
     fn replace_snapshot_entry(
         &self,
         name: &str,
@@ -668,11 +714,18 @@ impl PoolShared {
     ) -> Result<bool, PoolError> {
         let _table = self.snapshot_lock.lock();
         let mut table = self.current_snapshot_table()?;
-        let still_there = table.entries.iter().any(|e| e.name == name);
+        let still_there = table
+            .entries
+            .iter()
+            .any(|e| e.name == name && e.root_hash == original.root_hash);
         table.entries.retain(|e| e.name != staging_name);
         if still_there {
             if finished {
-                if let Some(e) = table.entries.iter_mut().find(|e| e.name == name) {
+                if let Some(e) = table
+                    .entries
+                    .iter_mut()
+                    .find(|e| e.name == name && e.root_hash == original.root_hash)
+                {
                     e.root_hash = root_hash;
                 }
             } else {
@@ -708,14 +761,11 @@ impl PoolShared {
         if self.epoch_of(hash, StreamKind::Meta)? == target {
             return Ok(hash);
         }
-        // Meta records are never reclaimed while a conversion runs (only
-        // retirement compacts them, after it), so a memo'd meta object
-        // needs no pin -- only to still be indexed.
-        if let Some(new) = self.persisted_index.read().get_rekey_memo(hash)?
-            && self.dedup_index.get(new).is_some()
-        {
-            return Ok(new);
-        }
+        // No inode-level memo: reusing a rewritten InodeObject found through
+        // one would skip pinning the chunks under it, which only the root
+        // that first published it keeps alive -- and that snapshot may be
+        // deleted before this one publishes (found in review). The chunk
+        // memo below still spares re-reading their content.
         let mut inode: InodeObject = self.decode_meta(hash)?;
         match inode.content.clone() {
             ContentRef::DirEntries(d) => {
@@ -728,7 +778,10 @@ impl PoolShared {
                     if self.epoch_of(r.content_hash, StreamKind::Data)? == target {
                         chunks.push(r);
                     } else {
-                        chunks.push(self.rekey_chunk(ino, r, Some(ledger))?);
+                        let rewritten = self.rekey_chunk(ino, r, Some(ledger))?;
+                        // No lock is held on a snapshot's rewrite.
+                        self.throttle(u64::from(r.len));
+                        chunks.push(rewritten);
                     }
                 }
                 let (new_ihl, _) = self.put_meta_object(ExtentKind::IndirectHashList, &IndirectHashList { chunks })?;
@@ -736,9 +789,7 @@ impl PoolShared {
             }
             ContentRef::Inline(_) | ContentRef::SymlinkTarget(_) => {}
         }
-        let (new, _) = self.put_meta_object(ExtentKind::InodeObject, &inode)?;
-        self.persisted_index.write().put_rekey_memo(hash, new)?;
-        Ok(new)
+        Ok(self.put_meta_object(ExtentKind::InodeObject, &inode)?.0)
     }
 
     /// Published roots: the live one and every snapshot table entry's.
@@ -888,7 +939,21 @@ impl PoolShared {
         {
             let _checkpoints = self.checkpoint_lock.lock();
             self.committer_pool.flush_index()?;
-            self.persisted_index.write().rewrite_fresh(&index_path(&self.pool_root))?;
+            let online = self.vdevs.online();
+            let root_of = |id: u16| online.iter().find(|v| v.id == id).map(|v| v.root.clone());
+            let exists = |hash: Hash32, vdev: u16, loc: ExtentLocation| {
+                let _ = hash;
+                if vdev == stripe::STRIPED {
+                    return online.iter().any(|v| !stripe::shards_on(&v.root, loc.segment_id).is_empty());
+                }
+                root_of(vdev).is_none_or(|root| {
+                    segment::segment_path(&root, loc.segment_id, StreamKind::Data).exists()
+                        || segment::segment_path(&root, loc.segment_id, StreamKind::Meta).exists()
+                })
+            };
+            self.persisted_index
+                .write()
+                .rewrite_fresh_keeping(&index_path(&self.pool_root), exists)?;
         }
         // 8. Every superblock slot re-written, so none names a root whose
         // segments retirement deleted.
@@ -1114,4 +1179,13 @@ impl PoolShared {
         }
         Ok(census)
     }
+}
+
+/// The hidden entry a rewrite of `snapshot` publishes its progress as. It
+/// names the snapshot's root as well as its name, so it can only ever be
+/// resumed into, or published over, the very snapshot it was made from --
+/// never a later one that took the same name.
+pub(crate) fn staging_name_for(snapshot: &SnapshotEntry) -> String {
+    let root: String = snapshot.root_hash.0.iter().map(|b| format!("{b:02x}")).collect();
+    format!("{RESERVED_SNAPSHOT_PREFIX}{}/{root}", snapshot.name)
 }

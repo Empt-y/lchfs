@@ -380,3 +380,133 @@ fn retirement_waits_for_an_absent_device_and_finishes_when_it_is_back() {
     let _ = &mut p;
     assert_eq!(lchfs_crypto::keyring::unlock_newest(&[a.path(), b.path()], &unlock()).unwrap().ring.epochs(), vec![2]);
 }
+
+fn plain_setup() -> EncryptionSetup<'static> {
+    setup()
+}
+
+/// Waits (up to a minute) until the running conversion's progress
+/// satisfies `ready`.
+fn wait_for(pool: &Pool, what: &str, ready: impl Fn(&lchfs_store::rekey::Progress) -> bool) {
+    let start = std::time::Instant::now();
+    loop {
+        let p = pool.conversion_status().progress;
+        if ready(&p) {
+            return;
+        }
+        assert!(start.elapsed() < std::time::Duration::from_secs(60), "never reached {what}: {p:?}");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// Found in review: a rewritten InodeObject shared by two snapshots was
+/// reused for the second through a memo without pinning its chunks, which
+/// only the first snapshot's root reached -- delete that snapshot and let
+/// the sweep run, and the second published a root naming reclaimed chunks.
+#[test]
+fn a_snapshot_deleted_while_another_is_rewritten_takes_nothing_the_other_needs() {
+    if lchfs_crypto::testing::TEST_ENCRYPT_ALL {
+        return;
+    }
+    let a = tempfile::tempdir().unwrap();
+    let pool = Pool::create(a.path(), params()).unwrap();
+    let shared = marked("SHARED", 1, 64 * 1024);
+    let i = pool.create_file(1, "shared", 0o644).unwrap();
+    pool.write(i, 0, &shared).unwrap();
+    pool.checkpoint().unwrap();
+    pool.create_snapshot("a").unwrap();
+    let j = pool.create_file(1, "only-in-b", 0o644).unwrap();
+    pool.write(j, 0, &marked("ONLYB", 2, 256 * 1024)).unwrap();
+    pool.checkpoint().unwrap();
+    pool.create_snapshot("b").unwrap();
+    pool.unlink(1, "shared").unwrap();
+    pool.unlink(1, "only-in-b").unwrap();
+    pool.checkpoint().unwrap();
+
+    pool.start_encrypt(plain_setup()).unwrap();
+    pool.set_conversion_rate(Some(64 * 1024));
+    std::thread::scope(|s| {
+        let pass = s.spawn(|| pool.conversion_step());
+        wait_for(&pool, "snapshot a rewritten", |p| p.snapshots_done == 1);
+        pool.delete_snapshot("a").unwrap();
+        for _ in 0..4 {
+            pool.checkpoint().unwrap();
+        }
+        for _ in 0..3 {
+            pool.run_gc_and_coalesce_pass().unwrap();
+            pool.checkpoint().unwrap();
+        }
+        pass.join().unwrap().unwrap();
+    });
+    pool.set_conversion_rate(None);
+    pool.run_gc_and_coalesce_pass().unwrap();
+    pool.run_conversion_to_completion().unwrap();
+    assert_eq!(pool.conversion_status().min_epoch, 1);
+    drop(pool);
+    let key = lchfs_fsck::unlock(&[a.path()], &unlock()).unwrap();
+    let live = lchfs_fsck::collect_live_roots_with(a.path(), Some(&key)).unwrap();
+    let report = lchfs_fsck::check_devices_with(&[a.path()], &live, Some(&key));
+    assert!(report.is_clean(), "{:?}", report.errors);
+}
+
+/// Found in review: a snapshot deleted and re-created under the same name
+/// while the old one was being rewritten had its root replaced by the
+/// rewrite of the old one -- the new snapshot silently gone.
+#[test]
+fn a_snapshot_recreated_under_its_name_mid_rewrite_keeps_its_own_root() {
+    if lchfs_crypto::testing::TEST_ENCRYPT_ALL {
+        return;
+    }
+    let a = tempfile::tempdir().unwrap();
+    let pool = Pool::create(a.path(), params()).unwrap();
+    let f = pool.create_file(1, "f", 0o644).unwrap();
+    pool.write(f, 0, &marked("OLD", 3, 256 * 1024)).unwrap();
+    pool.checkpoint().unwrap();
+    pool.create_snapshot("s").unwrap();
+    pool.unlink(1, "f").unwrap();
+    pool.checkpoint().unwrap();
+
+    pool.start_encrypt(plain_setup()).unwrap();
+    pool.set_conversion_rate(Some(64 * 1024));
+    let new_root = std::thread::scope(|s| {
+        let pass = s.spawn(|| pool.conversion_step());
+        wait_for(&pool, "the snapshot rewrite", |p| p.snapshots_total == 1 && p.chunks_rewritten >= 10);
+        pool.delete_snapshot("s").unwrap();
+        let g = pool.create_file(1, "g", 0o644).unwrap();
+        pool.write(g, 0, &marked("NEW", 4, 8 * 1024)).unwrap();
+        pool.create_snapshot("s").unwrap();
+        let new_root = pool.list_snapshots().unwrap().into_iter().find(|e| e.name == "s").unwrap().root_hash;
+        pass.join().unwrap().unwrap();
+        new_root
+    });
+    let after = pool.list_snapshots().unwrap().into_iter().find(|e| e.name == "s").unwrap().root_hash;
+    assert_eq!(after, new_root, "the new snapshot 's' was overwritten by the old one's rewrite");
+    pool.set_conversion_rate(None);
+    pool.run_conversion_to_completion().unwrap();
+    assert_eq!(pool.list_snapshots().unwrap().len(), 1);
+}
+
+/// Found in review: a device that was out when a conversion started came
+/// back without the new keyring, so it could not have been mounted alone.
+#[test]
+fn a_device_that_rejoins_mid_conversion_gets_the_current_keyring() {
+    use lchfs_store::segment::fault_injection;
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let pool = Pool::create_replicated_encrypted(&[a.path(), b.path()], params(), setup()).unwrap();
+    let mut p = populate(&pool);
+    pool.checkpoint().unwrap();
+    pool.offline_vdev(1).unwrap();
+    pool.start_rekey().unwrap();
+    let _ = fault_injection::is_dead(b.path());
+    pool.online_vdev(b.path()).unwrap();
+    let on_b = lchfs_crypto::keyring::unlock_newest(&[b.path()], &unlock()).unwrap();
+    assert!(on_b.ring.epochs().contains(&2), "the rejoined device lacks the new epoch's key: {:?}", on_b.ring.epochs());
+    pool.run_conversion_to_completion().unwrap();
+    check(&pool, &p.shadow, "after the rotation");
+    drop(pool);
+    let _ = &mut p;
+    // b alone opens.
+    let pool = Pool::open_degraded_with(&[b.path()], &unlock()).unwrap();
+    assert_eq!(pool.conversion_status().current_epoch, 2);
+}

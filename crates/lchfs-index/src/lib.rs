@@ -452,6 +452,17 @@ impl RedbIndex {
     /// leaves one or the other whole. The open handle moves to the new
     /// file, which the rename does not disturb.
     pub fn rewrite_fresh(&mut self, path: &Path) -> Result<(), IndexError> {
+        self.rewrite_fresh_keeping(path, |_, _, _| true)
+    }
+
+    /// `rewrite_fresh`, copying only the chunk locations `keep` accepts --
+    /// so an entry left naming a segment that no longer exists does not
+    /// carry its hash into the new file.
+    pub fn rewrite_fresh_keeping(
+        &mut self,
+        path: &Path,
+        keep: impl Fn(Hash32, u16, ExtentLocation) -> bool,
+    ) -> Result<(), IndexError> {
         let tmp = path.with_extension("redb.tmp");
         let _ = std::fs::remove_file(&tmp);
         let fresh = Database::create(&tmp).map_err(err)?;
@@ -464,7 +475,10 @@ impl RedbIndex {
                 let mut to = txn.open_table(CHUNK_LOCATIONS).map_err(err)?;
                 for entry in from.iter().map_err(err)? {
                     let (k, v) = entry.map_err(err)?;
-                    to.insert(k.value(), v.value()).map_err(err)?;
+                    let (hash, vdev_id) = decode_chunk_key(k.value())?;
+                    if keep(hash, vdev_id, decode_location(v.value())?) {
+                        to.insert(k.value(), v.value()).map_err(err)?;
+                    }
                 }
             }
             {
