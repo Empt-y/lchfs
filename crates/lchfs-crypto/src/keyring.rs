@@ -23,6 +23,7 @@
 
 use crate::envelope;
 use crate::epoch::{self, EpochKeys, MAX_EPOCH, PLAINTEXT_EPOCH};
+use crate::locked::LockedBytes;
 use crate::secret::Key32;
 use crate::slots::passphrase::{self, KdfCost, PassphraseParams};
 use crate::slots::recipient::{self, Identity, Recipient, RecipientAlg};
@@ -604,7 +605,7 @@ impl UnlockedKeyring {
     pub fn revoke_slot(
         &mut self,
         id: u16,
-        secret_for: &mut dyn FnMut(&Slot) -> Result<Vec<u8>, KeyringError>,
+        secret_for: &mut dyn FnMut(&Slot) -> Result<LockedBytes, KeyringError>,
     ) -> Result<(), KeyringError> {
         // Everything is rebuilt aside and swapped in only on success, so a
         // wrong passphrase halfway through leaves the keyring -- including
@@ -619,15 +620,14 @@ impl UnlockedKeyring {
             for slot in &old_slots {
                 let new = match &slot.kind {
                     SlotKind::Passphrase(params) => {
-                        let mut pass = secret_for(slot)?;
+                        let pass = secret_for(slot)?;
                         let kek = passphrase::derive(&pass, params)?;
                         let proves = envelope::unwrap_key(&kek, &slot_aad(&self.body.pool_uuid, slot.id, &slot.kind), &slot.wrapped_kk)
                             .is_ok_and(|k| k == old_kk);
                         if !proves {
-                            zeroize::Zeroize::zeroize(&mut pass);
                             return Err(KeyringError::Refused(format!("wrong passphrase for slot {} ({})", slot.id, slot.label)));
                         }
-                        let made = self.make_slot(
+                        self.make_slot(
                             slot.id,
                             NewSlot::Passphrase {
                                 passphrase: &pass,
@@ -639,9 +639,7 @@ impl UnlockedKeyring {
                                 label: slot.label.clone(),
                             },
                             slot.created_unix,
-                        );
-                        zeroize::Zeroize::zeroize(&mut pass);
-                        made?
+                        )?
                     }
                     SlotKind::Recipient(r) => {
                         let recipient = Recipient::from_bytes(&r.encapsulation_key)
@@ -684,16 +682,16 @@ impl UnlockedKeyring {
         slot: &Slot,
         t: &TpmSlot,
         old_kk: &Key32,
-        secret_for: &mut dyn FnMut(&Slot) -> Result<Vec<u8>, KeyringError>,
+        secret_for: &mut dyn FnMut(&Slot) -> Result<LockedBytes, KeyringError>,
     ) -> Result<Slot, KeyringError> {
-        let mut pin = if t.pin { Some(secret_for(slot)?) } else { None };
+        let pin = if t.pin { Some(secret_for(slot)?) } else { None };
         let proven = crate::slots::tpm::unseal(t, pin.as_deref())
             .ok()
             .and_then(|kek| {
                 envelope::unwrap_key(&kek, &slot_aad(&self.body.pool_uuid, slot.id, &slot.kind), &slot.wrapped_kk).ok()
             })
             .is_some_and(|k| &k == old_kk);
-        let made = if proven {
+        if proven {
             self.make_slot(
                 slot.id,
                 NewSlot::Tpm {
@@ -710,11 +708,7 @@ impl UnlockedKeyring {
                 slot.label,
                 if t.pin { " with that PIN" } else { "" }
             )))
-        };
-        if let Some(p) = pin.as_mut() {
-            zeroize::Zeroize::zeroize(p);
         }
-        made
     }
 
     #[cfg(not(feature = "tpm"))]
@@ -723,7 +717,7 @@ impl UnlockedKeyring {
         slot: &Slot,
         _t: &TpmSlot,
         _old_kk: &Key32,
-        _secret_for: &mut dyn FnMut(&Slot) -> Result<Vec<u8>, KeyringError>,
+        _secret_for: &mut dyn FnMut(&Slot) -> Result<LockedBytes, KeyringError>,
     ) -> Result<Slot, KeyringError> {
         Err(KeyringError::Tpm(format!(
             "slot {} is a TPM slot and this build has no TPM support (the `tpm` feature)",
@@ -997,12 +991,12 @@ mod tests {
         let content_before: Vec<_> = ring.epoch_keys().iter().map(|k| k.address(b"c")).collect();
 
         // A wrong passphrase for the surviving slot aborts and changes nothing.
-        let err = ring.revoke_slot(leaked, &mut |_| Ok(b"nope".to_vec()));
+        let err = ring.revoke_slot(leaked, &mut |_| Ok(LockedBytes::from_slice(b"nope")));
         assert!(matches!(err, Err(KeyringError::Refused(_))));
         assert_eq!(ring.kk, old_kk);
         assert_eq!(ring.body.slots.len(), 3);
 
-        ring.revoke_slot(leaked, &mut |_| Ok(b"keep".to_vec())).unwrap();
+        ring.revoke_slot(leaked, &mut |_| Ok(LockedBytes::from_slice(b"keep"))).unwrap();
         assert_ne!(ring.kk, old_kk);
         let new_file = ring.to_file();
         let fresh = parse(&new_file).unwrap();

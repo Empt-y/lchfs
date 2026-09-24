@@ -2,6 +2,7 @@
 //! §18): which keys a command was given, trying them in a fixed order, and
 //! asking for a passphrase when it was given none.
 
+use crate::control::SecretJson;
 use crate::secrets::{self, Secret};
 use clap::Args;
 use lchfs_crypto::keyring::{KeyringError, Unlock};
@@ -9,7 +10,6 @@ use lchfs_crypto::slots::recipient::Identity;
 use lchfs_store::{Pool, PoolError};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
-use zeroize::Zeroizing;
 
 /// How many wrong passphrases a person gets before the command gives up.
 const PROMPT_ATTEMPTS: usize = 3;
@@ -65,7 +65,7 @@ impl Credential {
         match self {
             Credential::Passphrase(p) => Unlock::Passphrase(p),
             Credential::Identity(id) => Unlock::Identity(id),
-            Credential::Tpm(pin) => Unlock::Tpm { pin: pin.as_ref().map(|p| p.as_slice()) },
+            Credential::Tpm(pin) => Unlock::Tpm { pin: pin.as_deref() },
         }
     }
 
@@ -80,12 +80,12 @@ impl Credential {
     /// For the control socket. Secrets are hex so any byte string survives
     /// JSON; the identity goes as its own text, since the mount may not be
     /// able to read the caller's file.
-    pub fn to_json(&self) -> Value {
-        match self {
-            Credential::Passphrase(p) => json!({ "passphrase": hex::encode(p.as_slice()) }),
-            Credential::Identity(id) => json!({ "identity": *Zeroizing::new(id.to_text()) }),
-            Credential::Tpm(pin) => json!({ "tpm": { "pin": pin.as_ref().map(|p| hex::encode(p.as_slice())) } }),
-        }
+    pub fn to_json(&self) -> SecretJson {
+        SecretJson(match self {
+            Credential::Passphrase(p) => json!({ "passphrase": hex_secret(p) }),
+            Credential::Identity(id) => json!({ "identity": id.to_text() }),
+            Credential::Tpm(pin) => json!({ "tpm": { "pin": pin.as_deref().map(hex_secret) } }),
+        })
     }
 
     pub fn from_json(v: &Value) -> anyhow::Result<Self> {
@@ -107,8 +107,27 @@ impl Credential {
     }
 }
 
+/// Hex decoded straight into locked memory.
 pub fn unhex(s: &str) -> anyhow::Result<Secret> {
-    Ok(Zeroizing::new(hex::decode(s).map_err(|e| anyhow::anyhow!("bad hex: {e}"))?))
+    if !s.len().is_multiple_of(2) {
+        anyhow::bail!("bad hex: odd length");
+    }
+    let mut out = Secret::zeroed(s.len() / 2);
+    hex::decode_to_slice(s, &mut out).map_err(|e| anyhow::anyhow!("bad hex: {e}"))?;
+    Ok(out)
+}
+
+/// Hex for a secret, allocated once at its final size (so no reallocation
+/// leaves a partial copy behind). It ends up in a `SecretJson`, which
+/// zeroes it.
+pub fn hex_secret(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        s.push(DIGITS[usize::from(b >> 4)] as char);
+        s.push(DIGITS[usize::from(b & 0xf)] as char);
+    }
+    s
 }
 
 /// A TPM PIN, from its file or asked for.

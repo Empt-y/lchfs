@@ -10,6 +10,9 @@ license.workspace = true
 # test suite can build with one flag.
 test-encrypt-all = ["lchfs-crypto/test-encrypt-all"]
 
+[lints]
+workspace = true
+
 [dependencies]
 lchfs-store = { workspace = true }
 lchfs-index = { workspace = true }

@@ -11,6 +11,7 @@ use thiserror::Error;
 pub mod envelope;
 pub mod keyring;
 pub mod epoch;
+pub mod locked;
 pub mod padme;
 pub mod secret;
 pub mod slots;

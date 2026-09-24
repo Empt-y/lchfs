@@ -1,36 +1,72 @@
-//! Key material. Everything secret in lchfs is a `Key32`: it zeroes itself
-//! on drop, never prints its bytes, and is only ever copied on purpose.
+//! Key material. Everything secret in lchfs is a `Key32`: it lives in a
+//! locked, undumpable slot (`locked::Slot`), zeroes itself on drop, never
+//! prints its bytes, compares in constant time, and is only ever copied on
+//! purpose. Moving a `Key32` moves a pointer -- the key bytes themselves
+//! never get copied around the heap.
 
+use crate::locked::Slot;
 use std::fmt;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// A 256-bit secret: a keyring key, an epoch master key, a key derived
 /// from one, or a key-encryption key a slot produced.
-#[derive(Clone, Zeroize, ZeroizeOnDrop, PartialEq, Eq)]
-pub struct Key32([u8; 32]);
+pub struct Key32(Slot);
 
 impl Key32 {
-    /// Fresh key from the OS CSPRNG.
+    /// Fresh key from the OS CSPRNG, generated straight into its slot.
     pub fn random() -> Self {
-        Self(random_bytes())
+        let mut slot = Slot::new();
+        getrandom::fill(slot.bytes_mut()).expect("the OS random number generator failed");
+        Self(slot)
     }
 
-    pub fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self(bytes)
+    /// Copies `bytes` into a slot and zeroes the by-value copy it was given.
+    /// (The caller's own copy, if it kept one, is the caller's to zero.)
+    pub fn from_bytes(mut bytes: [u8; 32]) -> Self {
+        let mut slot = Slot::new();
+        slot.bytes_mut().copy_from_slice(&bytes);
+        bytes.zeroize();
+        Self(slot)
     }
 
     /// The raw bytes, for handing to a primitive. Deliberately not `Deref`:
     /// every place key bytes leave this type should be visible.
     pub fn expose(&self) -> &[u8; 32] {
-        &self.0
+        self.0.bytes()
     }
 
     /// `blake3::derive_key` with this key as the input keying material.
     /// `context` must be a fixed, versioned, globally unique string.
     pub fn derive(&self, context: &str) -> Key32 {
-        Key32(blake3::derive_key(context, &self.0))
+        Key32::from_bytes(blake3::derive_key(context, self.expose()))
     }
 }
+
+impl Clone for Key32 {
+    fn clone(&self) -> Self {
+        let mut slot = Slot::new();
+        slot.bytes_mut().copy_from_slice(self.expose());
+        Self(slot)
+    }
+}
+
+/// Constant time: an online key proof compares a key a caller presented
+/// with the one the pool holds.
+impl PartialEq for Key32 {
+    fn eq(&self, other: &Self) -> bool {
+        constant_time_eq::constant_time_eq_32(self.expose(), other.expose())
+    }
+}
+impl Eq for Key32 {}
+
+impl Zeroize for Key32 {
+    fn zeroize(&mut self) {
+        self.0.bytes_mut().zeroize();
+    }
+}
+
+/// Dropping the slot zeroes it.
+impl ZeroizeOnDrop for Key32 {}
 
 impl fmt::Debug for Key32 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -38,8 +74,9 @@ impl fmt::Debug for Key32 {
     }
 }
 
-/// `N` bytes from the OS CSPRNG. A failing OS RNG leaves nothing safe to
-/// do -- no key, nonce or salt may be made up -- so it is a panic.
+/// `N` bytes from the OS CSPRNG, for nonces and salts -- never for a key,
+/// which `Key32::random` generates straight into locked memory. A failing
+/// OS RNG leaves nothing safe to do, so it is a panic.
 pub fn random_bytes<const N: usize>() -> [u8; N] {
     let mut out = [0u8; N];
     getrandom::fill(&mut out).expect("the OS random number generator failed");

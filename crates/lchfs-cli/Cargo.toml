@@ -10,11 +10,14 @@ default = ["tpm"]
 # TPM2 key slots: links the system tpm2-tss library.
 tpm = ["lchfs-crypto/tpm"]
 
+[lints]
+workspace = true
+
 [dependencies]
 lchfs-crypto = { workspace = true }
 zeroize = { workspace = true }
 hex = { workspace = true }
-nix = { workspace = true, features = ["term", "socket", "user"] }
+nix = { workspace = true, features = ["term", "socket", "user", "process", "resource"] }
 lchfs-fuse = { workspace = true }
 lchfs-nfs = { path = "../lchfs-nfs" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
@@ -27,6 +30,7 @@ clap = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 serde_json = { workspace = true }
+serde = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]

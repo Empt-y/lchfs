@@ -304,10 +304,10 @@ mod tests {
 
         // Revoking reseals the TPM slot under the new keyring key, PIN kept.
         ring.revoke_slot(doomed, &mut |slot| {
-            Ok(match slot.kind.type_name() {
-                "tpm2" => b"1234".to_vec(),
-                _ => b"recovery".to_vec(),
-            })
+            Ok(crate::locked::LockedBytes::from_slice(match slot.kind.type_name() {
+                "tpm2" => b"1234",
+                _ => b"recovery",
+            }))
         })
         .unwrap();
         let fresh = parse(&ring.to_file()).unwrap();

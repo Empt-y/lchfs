@@ -8,6 +8,7 @@
 
 use lchfs_store::{Pool, VdevHealth};
 use serde_json::{Value, json};
+use lchfs_crypto::locked::LockedBytes;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -109,14 +110,14 @@ fn serve_one(pool: &Pool, mut stream: UnixStream) -> anyhow::Result<()> {
         writeln!(stream, "{}", json!({ "ok": false, "error": "permission denied: not the mount's user" }))?;
         return Ok(());
     }
-    // The request may carry a passphrase: its buffer is zeroed after.
-    let mut line = zeroize::Zeroizing::new(String::new());
-    BufReader::new(&stream).read_line(&mut line)?;
+    // The request may carry a passphrase or an identity: it is read into
+    // locked memory, and every string parsed out of it is zeroed after.
+    let line = read_line_locked(&stream)?;
     if line.is_empty() {
         // A connection closed without a request: `is_live` probing.
         return Ok(());
     }
-    let reply = match serde_json::from_str::<Value>(&line) {
+    let reply = match serde_json::from_slice::<Value>(&line).map(SecretJson) {
         Ok(request) => match handle(pool, &request) {
             Ok(result) => json!({ "ok": true, "result": result }),
             Err(e) => {
@@ -405,11 +406,87 @@ fn path_arg(request: &Value) -> anyhow::Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
+/// A JSON value that may carry secrets -- hex passphrases and PINs, an
+/// identity's text. JSON strings cannot live in locked memory, so this is
+/// the next best thing: every string in the tree is zeroed when it drops.
+pub struct SecretJson(pub Value);
+
+impl std::ops::Deref for SecretJson {
+    type Target = Value;
+    fn deref(&self) -> &Value {
+        &self.0
+    }
+}
+
+impl serde::Serialize for SecretJson {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(s)
+    }
+}
+
+impl Drop for SecretJson {
+    fn drop(&mut self) {
+        scrub(&mut self.0);
+    }
+}
+
+/// Zeroes every string (and object key) in `v`.
+pub fn scrub(v: &mut Value) {
+    use zeroize::Zeroize;
+    match v {
+        Value::String(s) => s.zeroize(),
+        Value::Array(items) => items.iter_mut().for_each(scrub),
+        Value::Object(map) => {
+            for (_, item) in map.iter_mut() {
+                scrub(item);
+            }
+            // Keys are names, never secrets; values are what matter.
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+/// Reads one `\n`-terminated line byte by byte into locked memory -- no
+/// `BufReader` holding a copy in its own buffer, no `String` reallocating.
+fn read_line_locked(mut stream: &UnixStream) -> anyhow::Result<LockedBytes> {
+    use std::io::Read;
+    let mut line = LockedBytes::with_capacity(LockedBytes::MAX);
+    let mut byte = [0u8; 1];
+    loop {
+        match stream.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) if byte[0] == b'\n' => break,
+            Ok(_) => line.push(byte[0]).map_err(|e| anyhow::anyhow!("request: {e}"))?,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    zeroize::Zeroize::zeroize(&mut byte);
+    Ok(line)
+}
+
+/// `io::Write` into a `LockedBytes`, for serializing a request that may
+/// carry secrets without passing it through a growing `String`.
+struct LockedWriter(LockedBytes);
+
+impl Write for LockedWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.try_extend_from_slice(buf).map_err(std::io::Error::other)?;
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Sends one request and returns the whole reply, `ok` or not.
 pub fn request_raw(socket: &Path, request: &Value) -> anyhow::Result<Value> {
     let mut stream = UnixStream::connect(socket)
         .map_err(|e| anyhow::anyhow!("cannot reach {} ({e}); is the pool mounted?", socket.display()))?;
-    writeln!(stream, "{}", *zeroize::Zeroizing::new(request.to_string()))?;
+    let mut out = LockedWriter(LockedBytes::with_capacity(LockedBytes::MAX));
+    serde_json::to_writer(&mut out, request)?;
+    out.write_all(b"\n")?;
+    stream.write_all(&out.0)?;
     let mut line = String::new();
     BufReader::new(&stream).read_line(&mut line)?;
     Ok(serde_json::from_str(&line)?)

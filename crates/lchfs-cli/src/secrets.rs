@@ -5,14 +5,25 @@
 //! readable by other processes (`ps`, `/proc/<pid>/environ`). It comes from
 //! a file, an inherited file descriptor, a no-echo prompt on the
 //! controlling terminal, or an askpass helper, in that order of preference.
-//! Every buffer holding one is zeroed when dropped.
+//! Every one is read straight into locked memory of a fixed capacity
+//! (`LockedBytes`), so no copy is left behind on the heap by a growing
+//! buffer, and it is zeroed when dropped.
 
-use std::io::{BufRead, BufReader, Write};
+use lchfs_crypto::locked::LockedBytes;
+use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
-pub type Secret = Zeroizing<Vec<u8>>;
+pub type Secret = LockedBytes;
+
+/// Everything `reader` yields, up to `LockedBytes::MAX`; more is refused
+/// rather than cut short.
+fn read_secret(mut reader: impl Read, from: &str) -> anyhow::Result<Secret> {
+    let mut s = LockedBytes::with_capacity(LockedBytes::MAX);
+    s.read_to_end_from(&mut reader).map_err(|e| anyhow::anyhow!("reading {from}: {e}"))?;
+    Ok(s)
+}
 
 /// Where a passphrase may be read from without asking anyone.
 #[derive(Debug, Clone, Default)]
@@ -28,20 +39,15 @@ impl Source {
 
     /// The passphrase from the file or descriptor, if one was named.
     pub fn read(&self) -> anyhow::Result<Option<Secret>> {
-        let (bytes, from) = match (&self.file, self.fd) {
-            (Some(path), _) => (
-                std::fs::read(path).map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?,
-                path.display().to_string(),
-            ),
+        let (path, from) = match (&self.file, self.fd) {
+            (Some(path), _) => (path.clone(), path.display().to_string()),
             // Through /dev/fd rather than adopting the raw descriptor: no
             // unsafe, and a pipe or a regular file reads the same way.
-            (None, Some(fd)) => (
-                std::fs::read(format!("/dev/fd/{fd}")).map_err(|e| anyhow::anyhow!("reading descriptor {fd}: {e}"))?,
-                format!("descriptor {fd}"),
-            ),
+            (None, Some(fd)) => (PathBuf::from(format!("/dev/fd/{fd}")), format!("descriptor {fd}")),
             (None, None) => return Ok(None),
         };
-        let secret = strip_newline(Zeroizing::new(bytes));
+        let file = std::fs::File::open(&path).map_err(|e| anyhow::anyhow!("reading {from}: {e}"))?;
+        let secret = strip_newline(read_secret(file, &from)?);
         if secret.is_empty() {
             anyhow::bail!("the passphrase from {from} is empty");
         }
@@ -96,7 +102,7 @@ pub fn prompt(prompt: &str) -> anyhow::Result<Secret> {
 pub fn prompt_new(what: &str) -> anyhow::Result<Secret> {
     let first = prompt(&format!("New {what}: "))?;
     let second = prompt(&format!("Repeat the new {what}: "))?;
-    if *first != *second {
+    if first != second {
         anyhow::bail!("the two entries of the new {what} differ");
     }
     Ok(first)
@@ -127,23 +133,41 @@ fn prompt_tty(tty: std::fs::File, prompt: &str) -> anyhow::Result<Secret> {
         }
     }
     let _restore = Restore(&tty, original);
-    let mut line = Zeroizing::new(Vec::new());
-    BufReader::new(&tty).read_until(b'\n', &mut line)?;
-    Ok(strip_newline(line))
+    // Byte by byte, unbuffered, so nothing is read past the line and no
+    // buffer but the locked one ever holds it.
+    let mut line = LockedBytes::with_capacity(LockedBytes::MAX);
+    let mut byte = [0u8; 1];
+    loop {
+        match (&tty).read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) if byte[0] == b'\n' => break,
+            Ok(_) => line.push(byte[0]).map_err(|e| anyhow::anyhow!("passphrase: {e}"))?,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    zeroize::Zeroize::zeroize(&mut byte);
+    // A line ending typed as `\r\n` loses its `\r` too.
+    if line.last() == Some(&b'\r') {
+        line.pop();
+    }
+    Ok(line)
 }
 
 fn prompt_askpass(program: &str, prompt: &str) -> anyhow::Result<Secret> {
-    let out = std::process::Command::new(program)
+    let mut child = std::process::Command::new(program)
         .arg(prompt)
         .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
-        .output()
+        .spawn()
         .map_err(|e| anyhow::anyhow!("running askpass helper {program}: {e}"))?;
-    let stdout = Zeroizing::new(out.stdout);
-    if !out.status.success() {
-        anyhow::bail!("askpass helper {program} was cancelled or failed ({})", out.status);
+    let read = read_secret(child.stdout.take().expect("stdout is piped"), &format!("askpass helper {program}"));
+    let status = child.wait()?;
+    if !status.success() {
+        anyhow::bail!("askpass helper {program} was cancelled or failed ({status})");
     }
-    Ok(strip_newline(stdout))
+    Ok(strip_newline(read?))
 }
 
 /// Reads a recipient identity (the secret half of a recipient key pair).
@@ -158,7 +182,9 @@ pub fn read_identity(path: &Path) -> anyhow::Result<lchfs_crypto::slots::recipie
             meta.permissions().mode() & 0o777
         );
     }
-    let text = Zeroizing::new(std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?);
+    let file = std::fs::File::open(path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+    let bytes = read_secret(file, &path.display().to_string())?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| anyhow::anyhow!("{} is not an lchfs identity", path.display()))?;
     lchfs_crypto::slots::recipient::Identity::parse(text.trim())
         .map_err(|e| anyhow::anyhow!("{} is not an lchfs identity: {e}", path.display()))
 }
@@ -199,10 +225,22 @@ mod tests {
 
     #[test]
     fn one_line_ending_is_stripped_and_nothing_else() {
-        let s = |b: &[u8]| strip_newline(Zeroizing::new(b.to_vec())).to_vec();
+        let s = |b: &[u8]| strip_newline(LockedBytes::from_slice(b)).to_vec();
         assert_eq!(s(b"pass\n"), b"pass");
         assert_eq!(s(b"pass\r\n"), b"pass");
         assert_eq!(s(b"pass\n\n"), b"pass\n");
         assert_eq!(s(b" pass "), b" pass ");
+    }
+
+    #[test]
+    fn a_secret_file_larger_than_the_limit_is_refused_not_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big");
+        std::fs::write(&path, vec![b'x'; LockedBytes::MAX + 1]).unwrap();
+        let err = Source { file: Some(path.clone()), fd: None }.read().unwrap_err();
+        assert!(err.to_string().contains("longer than"), "{err}");
+        std::fs::write(&path, vec![b'x'; LockedBytes::MAX]).unwrap();
+        let ok = Source { file: Some(path), fd: None }.read().unwrap().unwrap();
+        assert_eq!(ok.len(), LockedBytes::MAX);
     }
 }

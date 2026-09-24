@@ -15,6 +15,11 @@ tpm = ["dep:tss-esapi"]
 # it in a build anyone stores data with -- the "key" is in this source.
 test-encrypt-all = []
 
+# `unsafe` is denied crate-wide and allowed only in `locked` (the
+# workspace forbids it outright everywhere else).
+[lints.rust]
+unsafe_code = "deny"
+
 [dependencies]
 blake3 = { workspace = true }
 crc32fast = { workspace = true }
@@ -26,6 +31,8 @@ argon2 = { workspace = true }
 x-wing = { workspace = true }
 zeroize = { workspace = true }
 getrandom = { workspace = true }
+constant_time_eq = { workspace = true }
+nix = { workspace = true, features = ["mman", "feature"] }
 tss-esapi = { workspace = true, optional = true }
 
 [dev-dependencies]

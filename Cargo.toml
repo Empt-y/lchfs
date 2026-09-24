@@ -42,14 +42,20 @@ clap = { version = "4.6.4", features = ["derive"] }
 proptest = "1.11.0"
 tempfile = "3.27.0"
 criterion = "0.8.2"
-chacha20poly1305 = "0.11.0"
-argon2 = "0.6.0"
+chacha20poly1305 = { version = "0.11.0", features = ["zeroize"] }
+argon2 = { version = "0.6.0", features = ["zeroize"] }
 x-wing = { version = "0.1.0", features = ["getrandom", "zeroize"] }
 zeroize = { version = "1.9.0", features = ["derive"] }
 getrandom = "0.3.4"
 tss-esapi = "7.7.0"
 hex = "0.4"
 arc-swap = "1.9"
+constant_time_eq = "0.4.2"
+
+# No crate may use `unsafe` -- except lchfs-crypto's `locked` module,
+# which maps the pages secrets live in (lchfs-crypto sets its own lints).
+[workspace.lints.rust]
+unsafe_code = "forbid"
 
 [package]
 name = "lchfs"
@@ -57,6 +63,9 @@ description = "Log-Structured Cryptographic Hash File System"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+
+[lints]
+workspace = true
 
 [[bin]]
 name = "lchfs"

@@ -6,6 +6,9 @@ version.workspace = true
 license.workspace = true
 publish = false
 
+[lints]
+workspace = true
+
 [dependencies]
 lchfs-format = { workspace = true }
 lchfs-store = { workspace = true }

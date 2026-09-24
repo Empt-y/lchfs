@@ -8,7 +8,7 @@
 //! GPU or ASIC guess expensive.
 
 use crate::secret::{Key32, random_bytes};
-use argon2::{Algorithm, Argon2, Params, Version};
+use argon2::{Algorithm, Argon2, Block, Params, Version};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 
@@ -66,12 +66,20 @@ fn argon2(m_kib: u32, t: u32, p: u32) -> Result<Argon2<'static>, KdfError> {
     Ok(Argon2::new(Algorithm::Argon2id, Version::V0x13, params))
 }
 
+/// Runs Argon2 in working memory we own, so it can be zeroed afterwards:
+/// the `argon2` crate frees its own blocks without wiping them, and they
+/// are tens to thousands of MiB of state derived from the passphrase.
+fn hash_into(argon: &Argon2<'_>, passphrase: &[u8], salt: &[u8], out: &mut [u8; 32]) -> Result<(), KdfError> {
+    let mut blocks = zeroize::Zeroizing::new(vec![Block::default(); argon.params().block_count()]);
+    argon
+        .hash_password_into_with_memory(passphrase, salt, out, blocks.as_mut_slice())
+        .map_err(|e| KdfError::Params(e.to_string()))
+}
+
 /// The key-encryption key a passphrase yields under `params`.
 pub fn derive(passphrase: &[u8], params: &PassphraseParams) -> Result<Key32, KdfError> {
     let mut out = [0u8; 32];
-    argon2(params.m_kib, params.t, params.p)?
-        .hash_password_into(passphrase, &params.salt, &mut out)
-        .map_err(|e| KdfError::Params(e.to_string()))?;
+    hash_into(&argon2(params.m_kib, params.t, params.p)?, passphrase, &params.salt, &mut out)?;
     let key = Key32::from_bytes(out);
     zeroize::Zeroize::zeroize(&mut out);
     Ok(key)
@@ -97,9 +105,7 @@ fn calibrate() -> Result<u32, KdfError> {
     loop {
         let start = Instant::now();
         let mut out = [0u8; 32];
-        argon2(m, CALIBRATED_T, CALIBRATED_P)?
-            .hash_password_into(b"lchfs calibration", &[0u8; 16], &mut out)
-            .map_err(|e| KdfError::Params(e.to_string()))?;
+        hash_into(&argon2(m, CALIBRATED_T, CALIBRATED_P)?, b"lchfs calibration", &[0u8; 16], &mut out)?;
         let took = start.elapsed();
         if took >= CALIBRATION_TARGET || m >= MAX_CALIBRATED_M_KIB {
             return Ok(m.min(MAX_CALIBRATED_M_KIB));

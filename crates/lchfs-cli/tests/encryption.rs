@@ -13,7 +13,7 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
-use zeroize::Zeroizing;
+use lchfs_crypto::locked::LockedBytes;
 
 const FIRST: &[u8] = b"first passphrase";
 const SECOND: &[u8] = b"second passphrase";
@@ -41,8 +41,8 @@ fn setup() -> EncryptionSetup<'static> {
     }
 }
 
-fn secret(b: &[u8]) -> Zeroizing<Vec<u8>> {
-    Zeroizing::new(b.to_vec())
+fn secret(b: &[u8]) -> LockedBytes {
+    LockedBytes::from_slice(b)
 }
 
 fn add_second() -> KeyOp {
@@ -205,6 +205,15 @@ fn fsck_checks_structure_without_a_key_and_everything_with_one() {
 }
 
 #[test]
+fn secret_json_is_zeroed_when_dropped() {
+    let mut v = json!({ "proof": { "passphrase": "68756e74657232" }, "list": ["abc", 1, null] });
+    lchfs_cli::control::scrub(&mut v);
+    assert_eq!(v["proof"]["passphrase"], "", "zeroize empties the string after wiping it");
+    assert_eq!(v["list"][0], "");
+    assert_eq!(v["list"][1], 1);
+}
+
+#[test]
 fn a_credential_round_trips_through_json() {
     let identity = lchfs_crypto::slots::recipient::Identity::generate();
     for c in [
@@ -214,10 +223,10 @@ fn a_credential_round_trips_through_json() {
         Credential::Tpm(None),
     ] {
         let back = Credential::from_json(&c.to_json()).unwrap();
-        assert_eq!(back.to_json(), c.to_json());
+        assert_eq!(*back.to_json(), *c.to_json());
     }
     let op = KeyOp::Revoke { slot: 3, secrets: [(1, secret(b"a")), (2, secret(b"b"))].into_iter().collect() };
-    assert_eq!(KeyOp::from_json(&op.to_json()).unwrap().to_json(), op.to_json());
+    assert_eq!(*KeyOp::from_json(&op.to_json()).unwrap().to_json(), *op.to_json());
 }
 
 #[test]

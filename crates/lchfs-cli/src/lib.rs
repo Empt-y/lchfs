@@ -485,6 +485,7 @@ enum SnapshotAction {
 
 pub fn run() -> anyhow::Result<()> {
     init_logging();
+    harden_process();
     let cli = Cli::parse();
 
     match cli.command {
@@ -539,6 +540,32 @@ pub fn run() -> anyhow::Result<()> {
         Command::Snapshot { action } => snapshot(action),
         Command::Key { action } => key(action),
         Command::Stats { pool } => stats(&pool),
+    }
+}
+
+/// Set by whoever needs to debug or profile lchfs (gdb, perf, a core
+/// dump): turns `harden_process` off.
+pub const ALLOW_DEBUG_ENV: &str = "LCHFS_ALLOW_DEBUG";
+
+/// Keeps the keys this process will hold away from everyone but itself
+/// (ARCHITECTURE.md §18): not dumpable -- no core file, and other
+/// processes of the same user can neither ptrace it nor read its memory
+/// through /proc -- and a core size limit of zero for good measure. The
+/// pages keys live in are additionally locked and left out of dumps by
+/// `lchfs_crypto::locked`. Every subcommand gets this, not only the ones
+/// that unlock, so there is no path that forgets it.
+fn harden_process() {
+    if std::env::var_os(ALLOW_DEBUG_ENV).is_some_and(|v| v == "1") {
+        tracing::warn!(
+            "{ALLOW_DEBUG_ENV}=1: this process can be core-dumped and debugged, and any key it holds with it"
+        );
+        return;
+    }
+    if let Err(e) = nix::sys::prctl::set_dumpable(false) {
+        tracing::warn!("could not make the process non-dumpable: {e}");
+    }
+    if let Err(e) = nix::sys::resource::setrlimit(nix::sys::resource::Resource::RLIMIT_CORE, 0, 0) {
+        tracing::warn!("could not disable core dumps: {e}");
     }
 }
 
@@ -646,6 +673,12 @@ fn open_for_serving(
     }
     if pool.is_degraded() {
         eprintln!("WARNING: mounted degraded; vdevs {:?} are absent", pool.missing_vdevs());
+    }
+    if pool.is_encrypted() && lchfs_crypto::locked::status() == lchfs_crypto::locked::LockStatus::Unlocked {
+        eprintln!(
+            "WARNING: could not lock key memory into RAM (RLIMIT_MEMLOCK, see `ulimit -l`): \
+             keys may be written to swap. They are still kept out of core dumps."
+        );
     }
     for (id, report) in pool.mount_resilver() {
         eprintln!(
@@ -873,10 +906,10 @@ fn pool_encrypt(root: &Path, devices: &DeviceArgs, slots: &SlotArgs, rate: Optio
         if let Some(r) = rate {
             control::request(&socket, &json!({ "cmd": "set-conversion-rate", "bytes_per_sec": r }))?;
         }
-        let slots_json: Vec<serde_json::Value> = specs.iter().map(|s| s.to_json()).collect();
+        let slots_json: Vec<control::SecretJson> = specs.iter().map(|s| s.to_json()).collect();
         let reply = control::request(
             &socket,
-            &json!({ "cmd": "start-encrypt", "slots": slots_json, "no_padding": slots.no_padding }),
+            &control::SecretJson(json!({ "cmd": "start-encrypt", "slots": slots_json, "no_padding": slots.no_padding })),
         )?;
         println!("encryption started on the mounted pool: new writes are sealed from now on.");
         println!("existing content is being rewritten; follow it with `lchfs pool encryption-status {}`", root.display());
@@ -908,7 +941,8 @@ fn pool_rekey(root: &Path, devices: &DeviceArgs, unlock_args: &UnlockArgs, rate:
             control::request(&socket, &json!({ "cmd": "set-conversion-rate", "bytes_per_sec": r }))?;
         }
         let reply = unlock::with_key(unlock_args, "the mounted pool", |key| {
-            let reply = control::request_raw(&socket, &json!({ "cmd": "start-rekey", "proof": key.to_json() }))?;
+            let request = control::SecretJson(json!({ "cmd": "start-rekey", "proof": key.to_json() }));
+            let reply = control::request_raw(&socket, &request)?;
             if reply.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
                 return Ok(Some(reply.get("result").cloned().unwrap_or_default()));
             }
@@ -1194,11 +1228,11 @@ fn run_key_op_with(
     };
     let socket = target.pool.join(control::SOCKET_NAME);
     let (result, unwritten) = if control::is_live(&socket) {
-        // (The JSON carries hex secrets and cannot be zeroized; it lives
-        // only for this call. §18's memory hardening covers the process.)
+        // The JSON carries hex secrets: `SecretJson` zeroes every string
+        // in it when it drops.
         let op_json = op.to_json();
         let reply = with_key("the mounted pool", &mut |key| {
-            let request = json!({ "cmd": "key-op", "proof": key.to_json(), "op": op_json });
+            let request = control::SecretJson(json!({ "cmd": "key-op", "proof": key.to_json(), "op": op_json }));
             let reply = control::request_raw(&socket, &request)?;
             if reply.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
                 return Ok(Some(reply.get("result").cloned().unwrap_or_default()));

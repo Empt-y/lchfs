@@ -294,3 +294,97 @@ fn pool_encrypt_and_rekey_convert_an_unmounted_pool_in_place() {
     let err = fails(&again);
     assert!(err.contains("pool rekey") || err.contains("encrypted"), "{err}");
 }
+
+/// An askpass helper that records what its parent -- the `lchfs` asking --
+/// looks like from outside: who owns its /proc entries (root once it is
+/// not dumpable) and its core size limit. Then it answers.
+fn spying_askpass(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let report = dir.join("report");
+    let script = dir.join("askpass.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nstat -c %u /proc/$PPID/status > '{r}'\ngrep 'Max core file size' /proc/$PPID/limits >> '{r}'\necho spied-on\n",
+            r = report.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    (script, report)
+}
+
+fn lchfs_with_askpass(args: &[&str], askpass: &Path, allow_debug: bool) -> Output {
+    let mut cmd = Command::new("setsid");
+    cmd.arg("-w")
+        .arg(env!("CARGO_BIN_EXE_lchfs"))
+        .args(args)
+        .env_remove("SSH_ASKPASS")
+        .env("LCHFS_ASKPASS", askpass)
+        .env("RUST_LOG", "error")
+        .stdin(std::process::Stdio::null());
+    if allow_debug {
+        cmd.env("LCHFS_ALLOW_DEBUG", "1");
+    } else {
+        cmd.env_remove("LCHFS_ALLOW_DEBUG");
+    }
+    cmd.output().expect("setsid and the lchfs binary run")
+}
+
+#[test]
+fn the_process_holding_keys_is_not_dumpable_unless_debugging_is_allowed() {
+    use std::os::unix::fs::MetadataExt;
+    let t = tempfile::tempdir().unwrap();
+    let me = std::fs::metadata(t.path()).unwrap().uid();
+    let (askpass, report) = spying_askpass(t.path());
+    for (allow_debug, pool) in [(false, "hardened"), (true, "debuggable")] {
+        let pool = t.path().join(pool);
+        let mut args = vec!["create-pool", "--encrypt"];
+        args.extend(KDF);
+        args.push(s(&pool));
+        let out = lchfs_with_askpass(&args, &askpass, allow_debug);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let seen = std::fs::read_to_string(&report).unwrap();
+        let mut lines = seen.lines();
+        let owner: u32 = lines.next().unwrap().trim().parse().unwrap();
+        let core = lines.next().unwrap();
+        if allow_debug {
+            assert_eq!(owner, me, "LCHFS_ALLOW_DEBUG=1 leaves the process dumpable");
+        } else {
+            assert_eq!(owner, 0, "a non-dumpable process's /proc entries belong to root");
+            assert!(core.split_whitespace().nth(4) == Some("0"), "core dumps are off: {core}");
+        }
+        // And the passphrase the helper gave really is the pool's.
+        let pass = write_secret(t.path(), "spied", "spied-on\n");
+        ok(&["fsck", s(&pool), "--passphrase-file", s(&pass)]);
+    }
+}
+
+#[test]
+fn a_passphrase_through_a_pipe_unlocks() {
+    let t = tempfile::tempdir().unwrap();
+    let pool = t.path().join("pool");
+    create_with_passphrase(&pool, &write_secret(t.path(), "pass", "piped secret\n"));
+    let out = Command::new("sh")
+        .args(["-c", r#"printf 'piped secret\n' | setsid -w "$0" fsck "$1" --passphrase-fd 0"#])
+        .arg(env!("CARGO_BIN_EXE_lchfs"))
+        .arg(&pool)
+        .env_remove("SSH_ASKPASS")
+        .env_remove("LCHFS_ASKPASS")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("No errors found"));
+}
+
+#[test]
+fn a_passphrase_file_over_the_limit_is_refused() {
+    let t = tempfile::tempdir().unwrap();
+    let pool = t.path().join("pool");
+    let huge = write_secret(t.path(), "huge", &"x".repeat(64 * 1024 + 1));
+    let mut args = vec!["create-pool", "--encrypt", "--passphrase-file", s(&huge)];
+    args.extend(KDF);
+    args.push(s(&pool));
+    let err = fails(&args);
+    assert!(err.contains("longer than 65536 bytes"), "{err}");
+}

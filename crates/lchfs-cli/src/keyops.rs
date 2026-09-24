@@ -3,7 +3,9 @@
 //! which holds the keyring) and to an unmounted one (by the CLI, under
 //! every device's pool lock).
 
-use crate::unlock::unhex;
+use crate::control::SecretJson;
+use crate::unlock::{hex_secret, unhex};
+use lchfs_crypto::locked::LockedBytes;
 use crate::secrets::Secret;
 use lchfs_crypto::keyring::{KeyringError, NewSlot, SlotKind, UnlockedKeyring};
 use lchfs_crypto::slots::passphrase::KdfCost;
@@ -42,20 +44,20 @@ impl NewSlotSpec {
             },
             NewSlotSpec::Tpm { pcrs, pin, label } => NewSlot::Tpm {
                 pcrs: pcrs.clone(),
-                pin: pin.as_ref().map(|p| p.as_slice()),
+                pin: pin.as_deref(),
                 label: label.clone(),
             },
         }
     }
 
-    pub fn to_json(&self) -> Value {
-        match self {
+    pub fn to_json(&self) -> SecretJson {
+        SecretJson(match self {
             NewSlotSpec::Passphrase { passphrase, cost, label } => {
                 let cost = match cost {
                     KdfCost::Calibrate => Value::Null,
                     KdfCost::Explicit { m_kib, t, p } => json!({ "m_kib": m_kib, "t": t, "p": p }),
                 };
-                json!({ "type": "passphrase", "passphrase": hex::encode(passphrase.as_slice()), "cost": cost, "label": label })
+                json!({ "type": "passphrase", "passphrase": hex_secret(passphrase), "cost": cost, "label": label })
             }
             NewSlotSpec::Recipient { recipient, label } => {
                 json!({ "type": "recipient", "recipient": recipient.to_text(), "label": label })
@@ -63,10 +65,10 @@ impl NewSlotSpec {
             NewSlotSpec::Tpm { pcrs, pin, label } => json!({
                 "type": "tpm",
                 "pcrs": pcrs,
-                "pin": pin.as_ref().map(|p| hex::encode(p.as_slice())),
+                "pin": pin.as_deref().map(hex_secret),
                 "label": label,
             }),
-        }
+        })
     }
 
     pub fn from_json(v: &Value) -> anyhow::Result<Self> {
@@ -116,8 +118,8 @@ impl NewSlotSpec {
 }
 
 impl KeyOp {
-    pub fn to_json(&self) -> Value {
-        match self {
+    pub fn to_json(&self) -> SecretJson {
+        SecretJson(match self {
             KeyOp::Add(new) => json!({ "op": "add", "new": new.to_json() }),
             KeyOp::Remove(id) => json!({ "op": "remove", "slot": id }),
             KeyOp::Replace { old, new } => json!({ "op": "replace", "slot": old, "new": new.to_json() }),
@@ -126,10 +128,10 @@ impl KeyOp {
                 "slot": slot,
                 "secrets": secrets
                     .iter()
-                    .map(|(id, s)| (id.to_string(), Value::String(hex::encode(s.as_slice()))))
+                    .map(|(id, s)| (id.to_string(), Value::String(hex_secret(s))))
                     .collect::<serde_json::Map<_, _>>(),
             }),
-        }
+        })
     }
 
     pub fn from_json(v: &Value) -> anyhow::Result<Self> {
@@ -177,7 +179,7 @@ impl KeyOp {
             }
             KeyOp::Revoke { slot, secrets } => {
                 ring.revoke_slot(*slot, &mut |s| {
-                    secrets.get(&s.id).map(|v| v.to_vec()).ok_or_else(|| {
+                    secrets.get(&s.id).map(|v| LockedBytes::from_slice(v)).ok_or_else(|| {
                         KeyringError::Refused(format!("no passphrase or PIN was given for slot {} ({})", s.id, s.label))
                     })
                 })?;
