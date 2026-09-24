@@ -78,7 +78,14 @@ struct Region {
 impl Region {
     fn map(len: usize) -> Region {
         let page = page_size();
-        let data_len = len.max(1).div_ceil(page) * page;
+        // Checked: `cap` is a public input, and a wrapped length would map
+        // less than the slices later made over it claim.
+        let data_len = len
+            .max(1)
+            .checked_next_multiple_of(page)
+            .and_then(|d| d.checked_add(2 * page).map(|_| d))
+            .filter(|&d| d <= isize::MAX as usize / 2)
+            .unwrap_or_else(|| panic!("{len} bytes is too large for a secret"));
         let mapping_len = data_len + 2 * page;
         // SAFETY: a fresh anonymous private mapping at an address of the
         // kernel's choosing aliases nothing that exists.
@@ -330,7 +337,12 @@ impl LockedBytes {
             if self.len == self.cap {
                 // One more byte means too long; zero means we are done.
                 let mut probe = [0u8; 1];
-                let n = reader.read(&mut probe)?;
+                let n = loop {
+                    match reader.read(&mut probe) {
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        other => break other?,
+                    }
+                };
                 probe.zeroize();
                 if n == 0 {
                     return Ok(());
@@ -441,23 +453,12 @@ mod tests {
         let pages_before = SLAB.lock().unwrap().len();
         drop(held);
         let again: Vec<Slot> = (0..1000).map(|_| Slot::new()).collect();
+        // Whoever freed a slot -- this test or a parallel one -- `Drop`
+        // zeroed it first, so a reused slot must read back as zero.
         assert!(again.iter().all(|s| s.bytes() == &[0; SLOT]), "a reused slot comes back zeroed");
         // Other tests allocate in parallel, so allow a little growth -- but
         // not a whole second set of pages.
         assert!(SLAB.lock().unwrap().len() <= pages_before + 2, "freed slots were reused");
-    }
-
-    #[test]
-    fn a_freed_slot_is_zeroed_before_anyone_can_have_it() {
-        let mut s = Slot::new();
-        s.bytes_mut().fill(0xA5);
-        let ptr = s.0.as_ptr().cast::<u8>();
-        drop(s);
-        // SAFETY: the page stays mapped for the life of the process; a
-        // parallel test may since have been handed this slot, and a fresh
-        // slot is zero too, so the bytes are zero either way -- never 0xA5.
-        let after = unsafe { std::slice::from_raw_parts(ptr, SLOT) };
-        assert!(after.iter().all(|&b| b != 0xA5));
     }
 
     #[test]
@@ -472,6 +473,12 @@ mod tests {
                 assert!(flags.iter().any(|f| f == "lo"), "not locked: {flags:?}");
             }
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "too large for a secret")]
+    fn an_absurd_capacity_is_refused_not_wrapped() {
+        let _ = LockedBytes::with_capacity(usize::MAX - 10);
     }
 
     #[test]

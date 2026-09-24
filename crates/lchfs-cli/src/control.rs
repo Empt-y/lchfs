@@ -446,11 +446,15 @@ pub fn scrub(v: &mut Value) {
     }
 }
 
+/// The most a request may be: a secret of `LockedBytes::MAX` bytes travels
+/// as hex (twice its size), plus the JSON around it.
+const MAX_REQUEST: usize = 2 * LockedBytes::MAX + 4096;
+
 /// Reads one `\n`-terminated line byte by byte into locked memory -- no
 /// `BufReader` holding a copy in its own buffer, no `String` reallocating.
 fn read_line_locked(mut stream: &UnixStream) -> anyhow::Result<LockedBytes> {
     use std::io::Read;
-    let mut line = LockedBytes::with_capacity(LockedBytes::MAX);
+    let mut line = LockedBytes::with_capacity(MAX_REQUEST);
     let mut byte = [0u8; 1];
     loop {
         match stream.read(&mut byte) {
@@ -483,7 +487,7 @@ impl Write for LockedWriter {
 pub fn request_raw(socket: &Path, request: &Value) -> anyhow::Result<Value> {
     let mut stream = UnixStream::connect(socket)
         .map_err(|e| anyhow::anyhow!("cannot reach {} ({e}); is the pool mounted?", socket.display()))?;
-    let mut out = LockedWriter(LockedBytes::with_capacity(LockedBytes::MAX));
+    let mut out = LockedWriter(LockedBytes::with_capacity(MAX_REQUEST));
     serde_json::to_writer(&mut out, request)?;
     out.write_all(b"\n")?;
     stream.write_all(&out.0)?;

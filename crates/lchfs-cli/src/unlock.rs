@@ -82,9 +82,11 @@ impl Credential {
     /// able to read the caller's file.
     pub fn to_json(&self) -> SecretJson {
         SecretJson(match self {
-            Credential::Passphrase(p) => json!({ "passphrase": hex_secret(p) }),
-            Credential::Identity(id) => json!({ "identity": id.to_text() }),
-            Credential::Tpm(pin) => json!({ "tpm": { "pin": pin.as_deref().map(hex_secret) } }),
+            Credential::Passphrase(p) => json!({ "passphrase": secret_value(p) }),
+            // The bare key line: no newline, so nothing the receiving JSON
+            // parser has to unescape through a scratch buffer of its own.
+            Credential::Identity(id) => json!({ "identity": SecretJson(Value::String(std::mem::take(&mut *id.key_line()))) }),
+            Credential::Tpm(pin) => json!({ "tpm": { "pin": pin.as_deref().map(secret_value) } }),
         })
     }
 
@@ -115,6 +117,14 @@ pub fn unhex(s: &str) -> anyhow::Result<Secret> {
     let mut out = Secret::zeroed(s.len() / 2);
     hex::decode_to_slice(s, &mut out).map_err(|e| anyhow::anyhow!("bad hex: {e}"))?;
     Ok(out)
+}
+
+/// A secret as a JSON hex string that is zeroed when dropped. `json!`
+/// copies each value it is given (it serializes `&value`), so a secret
+/// must go in as one of these: the copy lands in the caller's `SecretJson`
+/// and this temporary scrubs itself.
+pub fn secret_value(bytes: &[u8]) -> SecretJson {
+    SecretJson(Value::String(hex_secret(bytes)))
 }
 
 /// Hex for a secret, allocated once at its final size (so no reallocation

@@ -261,3 +261,30 @@ fn a_mounted_pool_is_encrypted_and_rekeyed_over_the_socket() {
     assert_eq!(pool.conversion_status().min_epoch, 2);
     assert_eq!(pool.read(ino, 0, 30_000).unwrap().as_ref(), vec![9u8; 30_000].as_slice());
 }
+
+/// Review finding: a secret travels the socket as hex -- twice its size --
+/// so a request buffer the size of the largest secret refused anything over
+/// half of it, and a key file that worked unmounted failed mounted.
+#[test]
+fn the_largest_allowed_secret_works_over_the_socket_too() {
+    let a = tempfile::tempdir().unwrap();
+    let pool = Arc::new(Pool::create_encrypted(a.path(), small_params(), setup()).unwrap());
+    let sock = socket_path(&pool);
+    let _server = ControlServer::start(Arc::clone(&pool), sock.clone()).unwrap();
+    let big: Vec<u8> = (0..LockedBytes::MAX).map(|i| (i % 251) as u8).collect();
+    let op = KeyOp::Add(NewSlotSpec::Passphrase { passphrase: secret(&big), cost: CHEAP, label: "keyfile".into() });
+    let reply = key_op(&sock, FIRST, &op);
+    assert_eq!(reply["ok"], true, "{reply}");
+    // And it proves: the big secret is itself accepted as the key.
+    let reply = key_op(&sock, &big, &KeyOp::Remove(0));
+    assert_eq!(reply["ok"], true, "{reply}");
+}
+
+#[test]
+fn an_identity_crosses_the_socket_as_its_bare_key_line() {
+    let identity = lchfs_crypto::slots::recipient::Identity::generate();
+    let json = Credential::Identity(Box::new(identity)).to_json();
+    let line = json["identity"].as_str().unwrap();
+    assert!(!line.contains('\n') && !line.contains('#'), "{line}");
+    assert!(Credential::from_json(&json).is_ok());
+}

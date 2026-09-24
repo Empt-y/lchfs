@@ -13,15 +13,35 @@ use lchfs_crypto::locked::LockedBytes;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use zeroize::Zeroizing;
 
 pub type Secret = LockedBytes;
 
-/// Everything `reader` yields, up to `LockedBytes::MAX`; more is refused
-/// rather than cut short.
-fn read_secret(mut reader: impl Read, from: &str) -> anyhow::Result<Secret> {
-    let mut s = LockedBytes::with_capacity(LockedBytes::MAX);
-    s.read_to_end_from(&mut reader).map_err(|e| anyhow::anyhow!("reading {from}: {e}"))?;
+/// Locked memory is limited (RLIMIT_MEMLOCK), so buffers are sized to what
+/// they will hold where that is known: a regular file's length (one byte
+/// more, so growth since the stat is still caught), else the most allowed.
+fn capacity_for(file: &std::fs::File) -> usize {
+    match file.metadata() {
+        Ok(m) if m.is_file() => usize::try_from(m.len()).map_or(LockedBytes::MAX, |n| n.saturating_add(1).min(LockedBytes::MAX + 1)),
+        _ => LockedBytes::MAX,
+    }
+}
+
+/// A typed passphrase: generous for a person, small enough to lock.
+const TYPED_MAX: usize = 4096;
+
+/// Everything `reader` yields, up to `cap` bytes; more is refused rather
+/// than cut short.
+fn read_secret(mut reader: impl Read, cap: usize, from: &str) -> anyhow::Result<Secret> {
+    let mut s = LockedBytes::with_capacity(cap);
+    s.read_to_end_from(&mut reader).map_err(|e| {
+        // The limit a user can act on is the secret's, not this buffer's
+        // (sized one past a file's length to catch it growing).
+        if e.get_ref().is_some_and(|inner| inner.is::<lchfs_crypto::locked::TooLong>()) {
+            anyhow::anyhow!("reading {from}: secret is longer than {} bytes", cap.min(LockedBytes::MAX))
+        } else {
+            anyhow::anyhow!("reading {from}: {e}")
+        }
+    })?;
     Ok(s)
 }
 
@@ -47,7 +67,11 @@ impl Source {
             (None, None) => return Ok(None),
         };
         let file = std::fs::File::open(&path).map_err(|e| anyhow::anyhow!("reading {from}: {e}"))?;
-        let secret = strip_newline(read_secret(file, &from)?);
+        let cap = capacity_for(&file);
+        let secret = strip_newline(read_secret(file, cap, &from)?);
+        if secret.len() > LockedBytes::MAX {
+            anyhow::bail!("reading {from}: secret is longer than {} bytes", LockedBytes::MAX);
+        }
         if secret.is_empty() {
             anyhow::bail!("the passphrase from {from} is empty");
         }
@@ -135,7 +159,7 @@ fn prompt_tty(tty: std::fs::File, prompt: &str) -> anyhow::Result<Secret> {
     let _restore = Restore(&tty, original);
     // Byte by byte, unbuffered, so nothing is read past the line and no
     // buffer but the locked one ever holds it.
-    let mut line = LockedBytes::with_capacity(LockedBytes::MAX);
+    let mut line = LockedBytes::with_capacity(TYPED_MAX);
     let mut byte = [0u8; 1];
     loop {
         match (&tty).read(&mut byte) {
@@ -162,12 +186,15 @@ fn prompt_askpass(program: &str, prompt: &str) -> anyhow::Result<Secret> {
         .stderr(std::process::Stdio::inherit())
         .spawn()
         .map_err(|e| anyhow::anyhow!("running askpass helper {program}: {e}"))?;
-    let read = read_secret(child.stdout.take().expect("stdout is piped"), &format!("askpass helper {program}"));
+    let read = read_secret(child.stdout.take().expect("stdout is piped"), TYPED_MAX, &format!("askpass helper {program}"));
     let status = child.wait()?;
+    // A too-long answer is reported as such, not as the SIGPIPE the helper
+    // got when its pipe was closed on it.
+    let secret = read?;
     if !status.success() {
         anyhow::bail!("askpass helper {program} was cancelled or failed ({status})");
     }
-    Ok(strip_newline(read?))
+    Ok(strip_newline(secret))
 }
 
 /// Reads a recipient identity (the secret half of a recipient key pair).
@@ -183,7 +210,8 @@ pub fn read_identity(path: &Path) -> anyhow::Result<lchfs_crypto::slots::recipie
         );
     }
     let file = std::fs::File::open(path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
-    let bytes = read_secret(file, &path.display().to_string())?;
+    let cap = capacity_for(&file);
+    let bytes = read_secret(file, cap, &path.display().to_string())?;
     let text = std::str::from_utf8(&bytes).map_err(|_| anyhow::anyhow!("{} is not an lchfs identity", path.display()))?;
     lchfs_crypto::slots::recipient::Identity::parse(text.trim())
         .map_err(|e| anyhow::anyhow!("{} is not an lchfs identity: {e}", path.display()))
@@ -211,7 +239,7 @@ pub fn write_identity(out: &Path) -> anyhow::Result<PathBuf> {
         .mode(0o600)
         .open(out)
         .map_err(|e| anyhow::anyhow!("{}: {e}", out.display()))?;
-    let text = Zeroizing::new(identity.to_text());
+    let text = identity.to_text();
     f.write_all(text.as_bytes())?;
     f.write_all(b"\n")?;
     f.sync_all()?;

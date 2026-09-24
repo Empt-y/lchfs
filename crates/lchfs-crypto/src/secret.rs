@@ -29,6 +29,38 @@ impl Key32 {
         Self(slot)
     }
 
+    /// A key from 64 hex digits (either case), decoded straight into its
+    /// slot: no intermediate buffer ever holds the bytes.
+    pub fn from_hex(hex: &str) -> Option<Self> {
+        let digits = hex.as_bytes();
+        if digits.len() != 64 {
+            return None;
+        }
+        let nibble = |c: u8| match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        };
+        let mut slot = Slot::new();
+        for (out, pair) in slot.bytes_mut().iter_mut().zip(digits.chunks_exact(2)) {
+            *out = (nibble(pair[0])? << 4) | nibble(pair[1])?;
+        }
+        Some(Self(slot))
+    }
+
+    /// Lowercase hex of the key, in a string that zeroes itself and is
+    /// allocated once at its final size.
+    pub fn to_hex(&self) -> zeroize::Zeroizing<String> {
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        let mut s = zeroize::Zeroizing::new(String::with_capacity(64));
+        for &b in self.expose() {
+            s.push(DIGITS[usize::from(b >> 4)] as char);
+            s.push(DIGITS[usize::from(b & 0xf)] as char);
+        }
+        s
+    }
+
     /// The raw bytes, for handing to a primitive. Deliberately not `Deref`:
     /// every place key bytes leave this type should be visible.
     pub fn expose(&self) -> &[u8; 32] {

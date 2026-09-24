@@ -74,21 +74,33 @@ impl Identity {
         }
     }
 
-    /// One line, plus a comment line saying what it is.
-    pub fn to_text(&self) -> String {
-        format!(
-            "# lchfs recipient identity (X-Wing: X25519 + ML-KEM-768, draft 06). Keep this secret.\n{IDENTITY_PREFIX}{}\n",
-            hex_encode(self.seed.expose())
-        )
+    /// One line, plus a comment line saying what it is. Zeroes itself.
+    pub fn to_text(&self) -> zeroize::Zeroizing<String> {
+        const COMMENT: &str = "# lchfs recipient identity (X-Wing: X25519 + ML-KEM-768, draft 06). Keep this secret.\n";
+        let line = self.key_line();
+        let mut s = zeroize::Zeroizing::new(String::with_capacity(COMMENT.len() + line.len() + 1));
+        s.push_str(COMMENT);
+        s.push_str(&line);
+        s.push('\n');
+        s
+    }
+
+    /// Just the key line (no comment, no newline) -- what `parse` needs,
+    /// and nothing a JSON encoder would have to escape. Zeroes itself.
+    pub fn key_line(&self) -> zeroize::Zeroizing<String> {
+        let hex = self.seed.to_hex();
+        let mut s = zeroize::Zeroizing::new(String::with_capacity(IDENTITY_PREFIX.len() + hex.len()));
+        s.push_str(IDENTITY_PREFIX);
+        s.push_str(&hex);
+        s
     }
 
     pub fn parse(text: &str) -> Result<Self, RecipientError> {
         let line = key_line(text, IDENTITY_PREFIX).ok_or(RecipientError::BadIdentity)?;
-        let bytes = hex_decode(line).ok_or(RecipientError::BadIdentity)?;
-        let seed: [u8; DECAPSULATION_KEY_SIZE] = bytes.try_into().map_err(|_| RecipientError::BadIdentity)?;
-        Ok(Self {
-            seed: Key32::from_bytes(seed),
-        })
+        // Straight into locked memory (the seed is exactly a Key32's size).
+        const _: () = assert!(DECAPSULATION_KEY_SIZE == 32);
+        let seed = Key32::from_hex(line).ok_or(RecipientError::BadIdentity)?;
+        Ok(Self { seed })
     }
 }
 

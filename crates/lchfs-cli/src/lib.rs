@@ -564,7 +564,11 @@ fn harden_process() {
     if let Err(e) = nix::sys::prctl::set_dumpable(false) {
         tracing::warn!("could not make the process non-dumpable: {e}");
     }
-    if let Err(e) = nix::sys::resource::setrlimit(nix::sys::resource::Resource::RLIMIT_CORE, 0, 0) {
+    // The soft limit only: the hard one is inherited by what we exec
+    // (askpass, fusermount3), and could never be raised again there.
+    let core = nix::sys::resource::Resource::RLIMIT_CORE;
+    let hard = nix::sys::resource::getrlimit(core).map_or(nix::sys::resource::RLIM_INFINITY, |(_, hard)| hard);
+    if let Err(e) = nix::sys::resource::setrlimit(core, 0, hard) {
         tracing::warn!("could not disable core dumps: {e}");
     }
 }

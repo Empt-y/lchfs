@@ -4,7 +4,7 @@
 //! every device's pool lock).
 
 use crate::control::SecretJson;
-use crate::unlock::{hex_secret, unhex};
+use crate::unlock::{hex_secret, secret_value, unhex};
 use lchfs_crypto::locked::LockedBytes;
 use crate::secrets::Secret;
 use lchfs_crypto::keyring::{KeyringError, NewSlot, SlotKind, UnlockedKeyring};
@@ -57,7 +57,7 @@ impl NewSlotSpec {
                     KdfCost::Calibrate => Value::Null,
                     KdfCost::Explicit { m_kib, t, p } => json!({ "m_kib": m_kib, "t": t, "p": p }),
                 };
-                json!({ "type": "passphrase", "passphrase": hex_secret(passphrase), "cost": cost, "label": label })
+                json!({ "type": "passphrase", "passphrase": secret_value(passphrase), "cost": cost, "label": label })
             }
             NewSlotSpec::Recipient { recipient, label } => {
                 json!({ "type": "recipient", "recipient": recipient.to_text(), "label": label })
@@ -65,7 +65,7 @@ impl NewSlotSpec {
             NewSlotSpec::Tpm { pcrs, pin, label } => json!({
                 "type": "tpm",
                 "pcrs": pcrs,
-                "pin": pin.as_deref().map(hex_secret),
+                "pin": pin.as_deref().map(secret_value),
                 "label": label,
             }),
         })
@@ -126,10 +126,12 @@ impl KeyOp {
             KeyOp::Revoke { slot, secrets } => json!({
                 "op": "revoke",
                 "slot": slot,
-                "secrets": secrets
-                    .iter()
-                    .map(|(id, s)| (id.to_string(), Value::String(hex_secret(s))))
-                    .collect::<serde_json::Map<_, _>>(),
+                "secrets": SecretJson(Value::Object(
+                    secrets
+                        .iter()
+                        .map(|(id, s)| (id.to_string(), Value::String(hex_secret(s))))
+                        .collect::<serde_json::Map<_, _>>(),
+                )),
             }),
         })
     }
