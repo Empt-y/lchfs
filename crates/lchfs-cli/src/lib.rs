@@ -41,7 +41,7 @@ enum Command {
         /// Any one of the pool's devices (vdev 0 unless --scan is given).
         pool: PathBuf,
         mountpoint: PathBuf,
-        /// The pool's other vdev roots (ARCHITECTURE.md §15.10). A
+        /// The pool's other devices (ARCHITECTURE.md §15.10). A
         /// replicated pool must be given every device unless --degraded.
         #[arg(long = "vdev")]
         vdevs: Vec<PathBuf>,
@@ -89,7 +89,7 @@ enum Command {
     Fsck {
         /// vdev 0's root.
         pool: PathBuf,
-        /// The pool's other vdev roots, for a replica comparison
+        /// The pool's other devices, for a replica comparison
         /// (ARCHITECTURE.md §15.8). Any order; each device's superblock
         /// says which slot it is.
         #[arg(long = "vdev")]
@@ -768,7 +768,7 @@ struct FsckOptions {
 }
 
 fn fsck(roots: &[PathBuf], options: &FsckOptions, unlock: &UnlockArgs) -> anyhow::Result<()> {
-    // No `Pool::open` here: fsck deliberately reads the pool directory
+    // No `Pool::open` here: fsck deliberately reads the devices
     // directly (see lchfs-fsck's module doc comment) rather than going
     // through the live engine -- opening a `Pool` would also run mount-
     // time crash recovery and spawn its background checkpoint/coalesce/
@@ -788,7 +788,7 @@ fn fsck(roots: &[PathBuf], options: &FsckOptions, unlock: &UnlockArgs) -> anyhow
     }
     if options.rebuild_index {
         lchfs_fsck::rebuild_index(pool, other_vdevs)?;
-        println!("INDEX.redb rebuilt from {} vdev(s).", other_vdevs.len() + 1);
+        println!("Index rebuilt from {} vdev(s).", other_vdevs.len() + 1);
     }
 
     // An encrypted pool's records can only be verified with its key. With
