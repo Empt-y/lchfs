@@ -116,7 +116,7 @@ jobs:
       # deleted while open, a file replaced while open), which Wine only
       # approximates. Optimized, as on Linux, for the torture tests.
       - name: Engine tests on Windows
-        run: cargo test --release -p lchfs-crypto -p lchfs-format -p lchfs-index -p lchfs-store -p lchfs-fsck
+        run: cargo test --release --no-fail-fast -p lchfs-crypto -p lchfs-format -p lchfs-index -p lchfs-store -p lchfs-fsck
 
       - name: Clippy
         run: cargo clippy -p lchfs-winfsp -p lchfs-fsck --all-targets -- -D warnings

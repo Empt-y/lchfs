@@ -377,6 +377,7 @@ fn a_chunk_identical_to_a_meta_object_reads_back() {
 
 /// Open descriptors this process holds on files under `root` that have
 /// since been unlinked -- what the kernel shows as "(deleted)".
+#[cfg(target_os = "linux")]
 fn deleted_fds_under(root: &std::path::Path) -> usize {
     std::fs::read_dir("/proc/self/fd")
         .unwrap()
@@ -389,6 +390,7 @@ fn deleted_fds_under(root: &std::path::Path) -> usize {
 }
 
 #[test]
+#[cfg(target_os = "linux")] // counts descriptors through /proc/self/fd
 fn coalesce_closes_its_readers_on_segments_it_deleted() {
     // An open reader keeps an unlinked segment's space allocated and costs
     // a descriptor; the reader cache used to keep one for every segment
