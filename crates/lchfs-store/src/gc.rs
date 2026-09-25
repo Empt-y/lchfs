@@ -313,21 +313,7 @@ impl GcEngine {
     /// with the last `GRACE_WINDOW_SEGMENTS + extra_age` left out -- the
     /// ones old enough for the coalesce or stripe passes to touch.
     pub fn aged_sealed_segments(vdev_root: &Path, extra_age: usize) -> Vec<u64> {
-        let dir = vdev_root.join("segments").join("data");
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            return Vec::new();
-        };
-        let mut ids: Vec<u64> = entries
-            .flatten()
-            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("aseg"))
-            .filter_map(|e| {
-                e.path()
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .and_then(|s| s.parse::<u64>().ok())
-            })
-            .collect();
-        ids.sort_unstable();
+        let ids = crate::segment::segment_ids_on(vdev_root, StreamKind::Data);
         let sealed: Vec<u64> = ids
             .into_iter()
             .filter(|&id| {
@@ -376,14 +362,9 @@ impl GcEngine {
             // cannot tell those from dead ones. See `SealGenerations`.
             .filter(|&id| self.may_reclaim(id))
             .filter(|&id| {
-                let Ok(meta) = std::fs::metadata(crate::segment::segment_path(
-                    vdev_root,
-                    id,
-                    StreamKind::Data,
-                )) else {
+                let Ok(total) = crate::segment::segment_len(vdev_root, id, StreamKind::Data) else {
                     return false;
                 };
-                let total = meta.len();
                 if total == 0 {
                     return false;
                 }

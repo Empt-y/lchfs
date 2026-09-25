@@ -225,7 +225,7 @@ fn a_rebuilt_index_carries_the_striped_entries() {
     let roots = [a.path(), b.path(), c.path()];
     striped_pool(&roots);
 
-    std::fs::remove_file(a.path().join("INDEX.redb")).unwrap();
+    lchfs_index::RedbIndex::remove(a.path()).unwrap();
     lchfs_fsck::rebuild_index(a.path(), &[b.path(), c.path()]).unwrap();
     let live = lchfs_fsck::collect_live_roots(a.path()).unwrap();
     let report = lchfs_fsck::verify_index_devices(&roots, &live);

@@ -947,8 +947,8 @@ impl PoolShared {
                     return online.iter().any(|v| !stripe::shards_on(&v.root, loc.segment_id).is_empty());
                 }
                 root_of(vdev).is_none_or(|root| {
-                    segment::segment_path(&root, loc.segment_id, StreamKind::Data).exists()
-                        || segment::segment_path(&root, loc.segment_id, StreamKind::Meta).exists()
+                    segment::segment_exists(&root, loc.segment_id, StreamKind::Data)
+                        || segment::segment_exists(&root, loc.segment_id, StreamKind::Meta)
                 })
             };
             self.persisted_index
@@ -1112,10 +1112,9 @@ impl PoolShared {
             self.persisted_index.write().forget_segment_records(id, &entries)?;
         }
         for (vdev, id) in &candidates {
-            let path = segment::segment_path(&vdev.root, *id, StreamKind::Meta);
-            if path.exists() {
+            if segment::segment_exists(&vdev.root, *id, StreamKind::Meta) {
                 let _ = segment::mark_coalesced(&vdev.root, *id, StreamKind::Meta);
-                std::fs::remove_file(&path)?;
+                segment::remove_segment(&vdev.root, *id, StreamKind::Meta)?;
             }
             self.readers.evict_segment(*id);
         }
@@ -1143,24 +1142,13 @@ impl PoolShared {
                     }
                 }
             }
-            let delta_root = vdev.root.join("segments").join("delta");
-            for shard_dir in std::fs::read_dir(&delta_root).into_iter().flatten().flatten() {
-                let Some(shard_id) = shard_dir.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
-                    continue;
-                };
-                for file in std::fs::read_dir(shard_dir.path()).into_iter().flatten().flatten() {
-                    let path = file.path();
-                    if path.extension().is_none_or(|x| x != "dseg") {
-                        continue;
-                    }
-                    let Some(id) = path.file_stem().and_then(|s| s.to_str()).and_then(|s| s.parse::<u64>().ok()) else {
-                        continue;
-                    };
-                    if let Ok(reader) = SegmentReader::open_delta(&vdev.root, shard_id, id)
-                        && coalesce::holds_other_epoch(&reader, target)
-                    {
-                        census.delta += 1;
-                    }
+            let deltas = segment::device(&vdev.root).map(|d| d.segments()).unwrap_or_default();
+            for (kind, id) in deltas {
+                let lchfs_device::SegmentKind::Delta { shard: shard_id } = kind else { continue };
+                if let Ok(reader) = SegmentReader::open_delta(&vdev.root, shard_id, id)
+                    && coalesce::holds_other_epoch(&reader, target)
+                {
+                    census.delta += 1;
                 }
             }
         }

@@ -79,7 +79,7 @@ fn a_single_vdev_pool_becomes_a_mirror_by_attaching_a_blank_device() {
 
     // Everything -- resilvered and fanned out -- is on b alone.
     for f in data_segments(a.path()) {
-        std::fs::remove_file(f).unwrap();
+        lchfs_store::testing::remove_segment(a.path(), lchfs_store::testing::SegmentKind::Data, f).unwrap();
     }
     let pool = Pool::open_replicated(&[a.path(), b.path()]).unwrap();
     assert_eq!(read_file(&pool, "f", data.len()), data);
@@ -108,7 +108,7 @@ fn a_dead_device_is_replaced_by_attaching_a_blank_one_into_its_slot() {
     drop(pool);
 
     for f in data_segments(a.path()) {
-        std::fs::remove_file(f).unwrap();
+        lchfs_store::testing::remove_segment(a.path(), lchfs_store::testing::SegmentKind::Data, f).unwrap();
     }
     let pool = Pool::open_replicated(&[a.path(), b2.path()]).unwrap();
     assert_eq!(read_file(&pool, "f", data.len()), data, "the replacement should carry everything");
@@ -180,7 +180,7 @@ fn a_dead_primary_is_replaced_the_same_way() {
     assert_eq!(pool.mount_resilver().len(), 1);
     assert_eq!(pool.mount_resilver()[0].0, 0);
     assert_eq!(read_file(&pool, "f", data.len()), data);
-    assert!(a2.path().join("INDEX.redb").exists(), "the new primary built its own index");
+    assert!(lchfs_index::RedbIndex::exists(a2.path()), "the new primary built its own index");
     pool.checkpoint().unwrap();
     drop(pool);
 
@@ -225,7 +225,7 @@ fn a_device_attached_while_mounted_is_filled_and_then_written_to() {
     }
     // ...and it carries everything on its own.
     for f in data_segments(a.path()) {
-        std::fs::remove_file(f).unwrap();
+        lchfs_store::testing::remove_segment(a.path(), lchfs_store::testing::SegmentKind::Data, f).unwrap();
     }
     let pool = Pool::open_replicated(&[a.path(), b.path()]).unwrap();
     assert_eq!(read_file(&pool, "before", before.len()), before);
@@ -322,7 +322,7 @@ fn a_dead_device_is_replaced_while_mounted() {
     drop(pool);
 
     for f in data_segments(a.path()) {
-        std::fs::remove_file(f).unwrap();
+        lchfs_store::testing::remove_segment(a.path(), lchfs_store::testing::SegmentKind::Data, f).unwrap();
     }
     let pool = Pool::open_replicated(&[a.path(), b2.path()]).unwrap();
     assert!(pool.mount_resilver().is_empty(), "{:?}", pool.mount_resilver());
@@ -372,7 +372,7 @@ fn opening_a_wrong_path_leaves_nothing_behind() {
     let empty = nowhere.path().join("empty");
     std::fs::create_dir(&empty).unwrap();
     assert!(Pool::open(&empty).is_err());
-    assert!(!empty.join("SUPERBLOCK").exists(), "open created a superblock ring in an empty dir");
+    assert!(!lchfs_store::testing::ring_written(empty), "open created a superblock ring in an empty dir");
 }
 
 /// An attach interrupted after some members were rewritten with the new
@@ -390,10 +390,10 @@ fn an_attach_interrupted_between_members_is_recoverable() {
         pool.write(ino, 0, &data).unwrap();
         pool.checkpoint().unwrap();
     }
-    let b_ring = std::fs::read(b.path().join("SUPERBLOCK")).unwrap();
+    let b_ring = lchfs_store::testing::read_ring(b.path());
     Pool::attach_vdev(&[a.path(), b.path()], c.path()).unwrap();
     // "Crash": b never got the new count, and c never got its ring.
-    std::fs::write(b.path().join("SUPERBLOCK"), &b_ring).unwrap();
+    lchfs_store::testing::write_ring(b.path(), 0, &b_ring);
     std::fs::remove_dir_all(c.path()).unwrap();
 
     {

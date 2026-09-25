@@ -151,7 +151,7 @@ impl CoalesceDaemon {
                     persisted_index,
                     next_segment_id,
                 )?;
-                if segment::segment_path(&vdev.root, segment_id, StreamKind::Data).exists() {
+                if segment::segment_exists(&vdev.root, segment_id, StreamKind::Data) {
                     held_back += 1;
                 }
             }
@@ -316,9 +316,8 @@ impl CoalesceDaemon {
             if !stripe::shards_on(&primary.root, segment_id).is_empty() {
                 continue;
             }
-            let path = segment::segment_path(&primary.root, segment_id, StreamKind::Data);
-            let Ok(meta) = std::fs::metadata(&path) else { continue };
-            let total = meta.len().saturating_sub(segment::SEGMENT_HEADER_PAGE_SIZE);
+            let Ok(len) = segment::segment_len(&primary.root, segment_id, StreamKind::Data) else { continue };
+            let total = len.saturating_sub(segment::SEGMENT_HEADER_PAGE_SIZE);
             if total == 0 {
                 continue;
             }
@@ -354,7 +353,7 @@ impl CoalesceDaemon {
                 tracing::warn!("stripe: segment {segment_id}'s primary copy does not verify end to end; not converting it");
                 continue;
             }
-            let mut body = std::fs::read(&path)?;
+            let mut body = segment::read_segment(&primary.root, segment_id, StreamKind::Data)?;
             body.drain(..segment::SEGMENT_HEADER_PAGE_SIZE as usize);
             // A sealed segment ends in its footer, which is not part of any
             // record; the stripe keeps the whole body as written so record
@@ -363,7 +362,7 @@ impl CoalesceDaemon {
             stripe::write_stripe(&body, segment_id, k, m, &devices)?;
 
             // Index first, then the cache, then the mirrors go: a crash
-            // before the index write leaves orphan shard files (cleaned
+            // before the index write leaves orphan shards (cleaned
             // up by a later pass); after it, the mirrors are spare copies
             // until deleted.
             let forget: Vec<u16> = online.iter().map(|v| v.id).collect();
@@ -375,10 +374,9 @@ impl CoalesceDaemon {
                 self.gc_locations().put_striped(*hash, *loc);
             }
             for vdev in &online {
-                let mirror = segment::segment_path(&vdev.root, segment_id, StreamKind::Data);
-                if mirror.exists() {
+                if segment::segment_exists(&vdev.root, segment_id, StreamKind::Data) {
                     let _ = segment::mark_coalesced(&vdev.root, segment_id, StreamKind::Data);
-                    std::fs::remove_file(&mirror)?;
+                    segment::remove_segment(&vdev.root, segment_id, StreamKind::Data)?;
                     self.removed_segments.push(segment_id);
                 }
             }
@@ -542,7 +540,7 @@ impl CoalesceDaemon {
         };
         if !proceed {
             for vdev in &online {
-                let _ = std::fs::remove_file(segment::segment_path(&vdev.root, new_id, StreamKind::Data));
+                let _ = segment::remove_segment(&vdev.root, new_id, StreamKind::Data);
             }
             tracing::info!("stripe: segment {segment_id} not repacked; a checkpoint or a dedup hit landed mid-pass");
             return Ok(None);
@@ -560,7 +558,7 @@ impl CoalesceDaemon {
         }
         for vdev in &online {
             for i in stripe::shards_on(&vdev.root, segment_id) {
-                std::fs::remove_file(stripe::shard_path(&vdev.root, segment_id, i))?;
+                stripe::remove_shard(&vdev.root, segment_id, i)?;
             }
         }
         tracing::info!(
@@ -646,7 +644,7 @@ impl CoalesceDaemon {
                 return Ok(());
             }
             segment::mark_coalesced(root, old_id, StreamKind::Data)?;
-            std::fs::remove_file(segment::segment_path(root, old_id, StreamKind::Data))?;
+            segment::remove_segment(root, old_id, StreamKind::Data)?;
             self.removed_segments.push(old_id);
             return Ok(());
         }
@@ -704,7 +702,7 @@ impl CoalesceDaemon {
         }
 
         segment::mark_coalesced(root, old_id, StreamKind::Data)?;
-        std::fs::remove_file(segment::segment_path(root, old_id, StreamKind::Data))?;
+        segment::remove_segment(root, old_id, StreamKind::Data)?;
         self.removed_segments.push(old_id);
         Ok(())
     }
@@ -786,8 +784,8 @@ impl CoalesceDaemon {
         entries.iter().any(|&(v, l)| {
             v == vdev.id
                 && (l.segment_id, l.offset) != (segment_id, offset)
-                && (segment::segment_path(&vdev.root, l.segment_id, StreamKind::Data).exists()
-                    || segment::segment_path(&vdev.root, l.segment_id, StreamKind::Meta).exists())
+                && (segment::segment_exists(&vdev.root, l.segment_id, StreamKind::Data)
+                    || segment::segment_exists(&vdev.root, l.segment_id, StreamKind::Meta))
         })
     }
 

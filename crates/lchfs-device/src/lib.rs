@@ -288,6 +288,9 @@ struct Inner {
     label: RwLock<DeviceLabel>,
     zones: Mutex<Vec<Zone>>,
     segments: Mutex<BTreeMap<(SegmentKind, u64), Arc<SegInner>>>,
+    /// Test support: refuse to claim zones, as a device that has gone
+    /// away refuses to create anything.
+    allocation_blocked: AtomicBool,
 }
 
 /// An open LCHFS device. Cheap to clone; every clone is the same device.
@@ -340,6 +343,7 @@ impl Device {
             zones: Mutex::new(Vec::new()),
             segments: Mutex::new(BTreeMap::new()),
             label: RwLock::new(label),
+            allocation_blocked: AtomicBool::new(false),
         });
         let device = Device(inner);
         device.scan_zones()?;
@@ -663,6 +667,9 @@ impl Device {
     /// first if it is not known zero, and makes the claim durable before
     /// anything is written into it.
     fn claim_zone(&self, kind: SegmentKind, id: u64, ordinal: u32) -> io::Result<u64> {
+        if self.0.allocation_blocked.load(Ordering::Relaxed) {
+            return Err(io::Error::other(format!("{}: the device is gone", self.0.path.display())));
+        }
         let label = self.label();
         let zone = {
             let mut zones = self.0.zones.lock();
@@ -729,7 +736,7 @@ impl Device {
             removed: AtomicBool::new(false),
         });
         self.0.segments.lock().insert((kind, id), Arc::clone(&seg));
-        Ok(SegmentFile(seg))
+        Ok(SegmentFile { dev: Arc::clone(&self.0), seg })
     }
 
     /// Opens an existing segment. `NotFound` if there is none.
@@ -738,7 +745,7 @@ impl Device {
             .segments
             .lock()
             .get(&(kind, id))
-            .map(|s| SegmentFile(Arc::clone(s)))
+            .map(|s| SegmentFile { dev: Arc::clone(&self.0), seg: Arc::clone(s) })
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::NotFound,
@@ -807,6 +814,14 @@ impl Device {
         (label.zone_count * payload, free * payload)
     }
 
+    /// Test support: while blocked, nothing new can be claimed on the
+    /// device -- no segment created, none grown past its zones -- while
+    /// what is already open keeps working: a device that is going away.
+    #[doc(hidden)]
+    pub fn block_allocation(&self, blocked: bool) {
+        self.0.allocation_blocked.store(blocked, Ordering::Relaxed);
+    }
+
     /// Zones in use by segments, or still being freed.
     pub fn zones_in_use(&self) -> u64 {
         self.0.zones.lock().iter().filter(|z| matches!(z, Zone::Owned | Zone::Freeing)).count() as u64
@@ -856,36 +871,36 @@ impl Drop for SegInner {
 }
 
 /// An open segment: positional reads and writes in its own byte space,
-/// like a file's. Cheap to clone.
+/// like a file's. Cheap to clone. Keeps its device open, as an open file
+/// keeps its filesystem mounted.
 #[derive(Clone)]
-pub struct SegmentFile(Arc<SegInner>);
+pub struct SegmentFile {
+    dev: Arc<Inner>,
+    seg: Arc<SegInner>,
+}
 
 impl std::fmt::Debug for SegmentFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SegmentFile").field("kind", &self.0.kind).field("id", &self.0.id).finish()
+        f.debug_struct("SegmentFile").field("kind", &self.seg.kind).field("id", &self.seg.id).finish()
     }
 }
 
 impl SegmentFile {
     fn device(&self) -> io::Result<Device> {
-        self.0
-            .device
-            .upgrade()
-            .map(Device)
-            .ok_or_else(|| io::Error::other("the device this segment is on was closed"))
+        Ok(Device(Arc::clone(&self.dev)))
     }
 
     pub fn kind(&self) -> SegmentKind {
-        self.0.kind
+        self.seg.kind
     }
 
     pub fn id(&self) -> u64 {
-        self.0.id
+        self.seg.id
     }
 
     /// Bytes written so far, like a file's length.
     pub fn len(&self) -> u64 {
-        self.0.len.load(Ordering::Acquire)
+        self.seg.len.load(Ordering::Acquire)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -901,13 +916,13 @@ impl SegmentFile {
         let end = offset + len as u64;
         if grow && end > 0 {
             let needed = end.div_ceil(payload) as usize;
-            let mut zones = self.0.zones.write();
+            let mut zones = self.seg.zones.write();
             while zones.len() < needed {
-                let z = device.claim_zone(self.0.kind, self.0.id, zones.len() as u32)?;
+                let z = device.claim_zone(self.seg.kind, self.seg.id, zones.len() as u32)?;
                 zones.push(z);
             }
         }
-        let zones = self.0.zones.read();
+        let zones = self.seg.zones.read();
         let mut at = offset;
         while at < end {
             let ordinal = (at / payload) as usize;
@@ -938,7 +953,7 @@ impl SegmentFile {
     pub fn write_all_at(&self, data: &[u8], offset: u64) -> io::Result<()> {
         let device = self.device()?;
         self.map(offset, data.len(), true, |at, range| device.0.file.write_all_at(&data[range], at))?;
-        self.0.len.fetch_max(offset + data.len() as u64, Ordering::AcqRel);
+        self.seg.len.fetch_max(offset + data.len() as u64, Ordering::AcqRel);
         Ok(())
     }
 
@@ -947,9 +962,9 @@ impl SegmentFile {
     pub fn sync_all(&self) -> io::Result<()> {
         let device = self.device()?;
         let len = self.len();
-        if self.0.synced_len.load(Ordering::Acquire) != len && !self.0.removed.load(Ordering::Acquire) {
+        if self.seg.synced_len.load(Ordering::Acquire) != len && !self.seg.removed.load(Ordering::Acquire) {
             let label = device.label();
-            let first = self.0.zones.read()[0];
+            let first = self.seg.zones.read()[0];
             device.write_zone_header(
                 &label,
                 first,
@@ -957,8 +972,8 @@ impl SegmentFile {
                     magic: ZONE_HEADER_MAGIC,
                     device_uuid: label.device_uuid,
                     state: ZoneState::Owned,
-                    kind: self.0.kind,
-                    segment_id: self.0.id,
+                    kind: self.seg.kind,
+                    segment_id: self.seg.id,
                     ordinal: 0,
                     written_len: len,
                     checksum: 0,
@@ -966,7 +981,7 @@ impl SegmentFile {
             )?;
         }
         device.sync()?;
-        self.0.synced_len.fetch_max(len, Ordering::AcqRel);
+        self.seg.synced_len.fetch_max(len, Ordering::AcqRel);
         Ok(())
     }
 }

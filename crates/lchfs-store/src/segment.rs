@@ -16,9 +16,8 @@ use lchfs_format::{
     finalize_segment_header_checksum, validate_header, RecordCrypto, SealError,
 };
 use crate::backend::Vdev;
-use std::fs::{File, OpenOptions};
+use lchfs_device::{Device, SegmentFile, SegmentKind};
 use std::io;
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 /// Fixed-size reserved page at the start of every segment file for its
@@ -103,59 +102,57 @@ pub enum SegmentError {
     },
 }
 
-pub(crate) fn segment_dir(pool_root: &Path, kind: StreamKind) -> PathBuf {
-    let sub = match kind {
-        StreamKind::Data => "data",
-        StreamKind::Meta => "meta",
-        StreamKind::Delta => unreachable!("Delta streams are shard-scoped, use delta_segment_dir"),
-    };
-    pool_root.join("segments").join(sub)
+/// The device a vdev root names (see `lchfs-device`).
+pub(crate) fn device(root: &Path) -> io::Result<Device> {
+    Device::open(root)
 }
 
-pub(crate) fn segment_path(pool_root: &Path, segment_id: u64, kind: StreamKind) -> PathBuf {
-    segment_dir(pool_root, kind).join(format!("{segment_id}.{}", stream_extension(kind)))
-}
-
-fn stream_extension(kind: StreamKind) -> &'static str {
+/// The device's name for a Data or Meta segment. Delta streams are
+/// shard-scoped: `SegmentKind::Delta { shard }`.
+pub(crate) fn device_kind(kind: StreamKind) -> SegmentKind {
     match kind {
-        StreamKind::Data => "aseg",
-        StreamKind::Meta => "mseg",
-        StreamKind::Delta => unreachable!("Delta streams are shard-scoped, use delta_segment_path"),
+        StreamKind::Data => SegmentKind::Data,
+        StreamKind::Meta => SegmentKind::Meta,
+        StreamKind::Delta => unreachable!("Delta streams are shard-scoped, use SegmentKind::Delta"),
     }
 }
 
-/// Every segment id with a file of `kind` under a device root (the
-/// stream's own extension only; a shard file `<id>.ec<i>` is a stripe's).
+/// Every segment id of `kind` on a device, ascending (a stripe shard of a
+/// data segment is the stripe's, not the stream's).
 pub fn segment_ids_on(root: &Path, kind: StreamKind) -> Vec<u64> {
-    let ext = stream_extension(kind);
-    let mut out = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(segment_dir(root, kind)) {
-        for e in rd.flatten() {
-            let path = e.path();
-            if path.extension().and_then(|x| x.to_str()) == Some(ext)
-                && let Some(id) = path.file_stem().and_then(|s| s.to_str()).and_then(|s| s.parse::<u64>().ok())
-            {
-                out.push(id);
-            }
-        }
-    }
-    out.sort_unstable();
-    out
+    device(root).map(|d| d.segment_ids(device_kind(kind))).unwrap_or_default()
 }
 
-/// Per-shard Delta stream directory (ARCHITECTURE.md §3, Phase E): each
-/// logical shard's delta segments live in their own subdirectory so
-/// mount-time recovery (§7) can discover exactly one shard's delta history
-/// without scanning any other shard's or the global Data/Meta streams.
-pub(crate) fn delta_segment_dir(pool_root: &Path, shard_id: u32) -> PathBuf {
-    pool_root
-        .join("segments")
-        .join("delta")
-        .join(format!("{shard_id:05}"))
+/// Whether segment `segment_id` of `kind` is on the device.
+pub(crate) fn segment_exists(root: &Path, segment_id: u64, kind: StreamKind) -> bool {
+    device(root).is_ok_and(|d| d.segment_exists(device_kind(kind), segment_id))
 }
 
-pub(crate) fn delta_segment_path(pool_root: &Path, shard_id: u32, segment_id: u64) -> PathBuf {
-    delta_segment_dir(pool_root, shard_id).join(format!("{segment_id}.dseg"))
+/// Deletes a segment from a device (`NotFound` if it is not there).
+pub(crate) fn remove_segment(root: &Path, segment_id: u64, kind: StreamKind) -> io::Result<()> {
+    device(root)?.remove_segment(device_kind(kind), segment_id)
+}
+
+/// A segment's written length, as a file's length was.
+pub(crate) fn segment_len(root: &Path, segment_id: u64, kind: StreamKind) -> io::Result<u64> {
+    Ok(device(root)?.open_segment(device_kind(kind), segment_id)?.len())
+}
+
+/// A segment's whole contents.
+pub(crate) fn read_segment(root: &Path, segment_id: u64, kind: StreamKind) -> io::Result<Vec<u8>> {
+    device(root)?.read_segment(device_kind(kind), segment_id)
+}
+
+/// Every segment id of shard `shard_id`'s Delta stream on a device,
+/// ascending (ARCHITECTURE.md §3, Phase E: one shard's delta history is
+/// found without touching any other shard's or the Data/Meta streams).
+pub(crate) fn delta_segment_ids(root: &Path, shard_id: u32) -> Vec<u64> {
+    device(root).map(|d| d.segment_ids(SegmentKind::Delta { shard: shard_id })).unwrap_or_default()
+}
+
+/// Deletes one of shard `shard_id`'s delta segments from a device.
+pub(crate) fn remove_delta_segment(root: &Path, shard_id: u32, segment_id: u64) -> io::Result<()> {
+    device(root)?.remove_segment(SegmentKind::Delta { shard: shard_id }, segment_id)
 }
 
 /// Append-only writer for one segment, owned exclusively by one logical
@@ -170,7 +167,7 @@ pub struct SegmentWriter {
     /// operation; per-vdev locations exist for what happens *after* a
     /// repair, when heal appends recovered bytes at a fresh offset on one
     /// device only.
-    files: Vec<File>,
+    files: Vec<SegmentFile>,
     /// The slot each of `files` belongs to, in the same order. What the
     /// index records a new record under: the devices this segment actually
     /// fans out to -- which after a live attach is not every device the
@@ -222,10 +219,7 @@ impl SegmentWriter {
     ) -> io::Result<Self> {
         Self::create_at(
             vdevs,
-            |vdev| {
-                std::fs::create_dir_all(segment_dir(&vdev.root, kind))?;
-                Ok(segment_path(&vdev.root, segment_id, kind))
-            },
+            |vdev| device(&vdev.root)?.create_segment(device_kind(kind), segment_id),
             segment_id,
             kind,
             owner_shard,
@@ -256,10 +250,7 @@ impl SegmentWriter {
     pub fn create_delta_on(vdevs: &[Vdev], shard_id: u32, segment_id: u64) -> io::Result<Self> {
         Self::create_at(
             vdevs,
-            |vdev| {
-                std::fs::create_dir_all(delta_segment_dir(&vdev.root, shard_id))?;
-                Ok(delta_segment_path(&vdev.root, shard_id, segment_id))
-            },
+            |vdev| device(&vdev.root)?.create_segment(SegmentKind::Delta { shard: shard_id }, segment_id),
             segment_id,
             StreamKind::Delta,
             shard_id,
@@ -283,8 +274,7 @@ impl SegmentWriter {
     pub fn reopen_open_replicas(vdevs: &[Vdev], segment_id: u64, kind: StreamKind) -> Vec<(Self, u64)> {
         let mut out = Vec::new();
         for vdev in vdevs {
-            let path = segment_path(&vdev.root, segment_id, kind);
-            if !path.exists() {
+            if !segment_exists(&vdev.root, segment_id, kind) {
                 continue;
             }
             let reader = match SegmentReader::open(&vdev.root, segment_id, kind) {
@@ -312,7 +302,7 @@ impl SegmentWriter {
                 record_count += 1;
                 cursor = cursor.max(offset as u64 + record.record_len as u64);
             }
-            let file = match OpenOptions::new().read(true).write(true).open(&path) {
+            let file = match device(&vdev.root).and_then(|d| d.open_segment(device_kind(kind), segment_id)) {
                 Ok(file) => file,
                 Err(e) => {
                     tracing::error!("vdev {}: cannot reopen segment {segment_id} ({e}); leaving it open", vdev.id);
@@ -350,7 +340,7 @@ impl SegmentWriter {
     /// as a whole fails only when no replica succeeded. That is the
     /// fault model of §15.3 completed: synchronous to every *online*
     /// device, where a device that has just failed is no longer online.
-    fn each_replica(&mut self, mut op: impl FnMut(&File) -> io::Result<()>) -> io::Result<()> {
+    fn each_replica(&mut self, mut op: impl FnMut(&SegmentFile) -> io::Result<()>) -> io::Result<()> {
         // Every replica already failed: the operation reaches no device.
         // Without this the loop below ran zero times and reported success,
         // so an append to a writer that had lost its last device was
@@ -409,14 +399,14 @@ impl SegmentWriter {
         &self.roots
     }
 
-    /// Opens the segment on every device `path_for` can place it on. A
-    /// device where the directory or the file cannot be created -- gone
-    /// from the filesystem, read-only, full -- is left out and recorded in
-    /// `faulted` for the owner to report, exactly as a failed append is.
-    /// Creation fails only if no device could take the segment.
+    /// Creates the segment on every device `create_on` can place it on. A
+    /// device where it cannot be created -- gone, not a formatted device,
+    /// out of zones -- is left out and recorded in `faulted` for the owner
+    /// to report, exactly as a failed append is. Creation fails only if no
+    /// device could take the segment.
     fn create_at(
         vdevs: &[Vdev],
-        path_for: impl Fn(&Vdev) -> io::Result<PathBuf>,
+        create_on: impl Fn(&Vdev) -> io::Result<SegmentFile>,
         segment_id: u64,
         kind: StreamKind,
         owner_shard: u32,
@@ -436,24 +426,10 @@ impl SegmentWriter {
             let injected = fault_injection::is_dead(&vdev.root);
             #[cfg(not(feature = "fault-injection"))]
             let injected = false;
-            // A device is where its ring is. Creating a segment tree on a
-            // path whose ring is gone -- a device pulled, a mountpoint
-            // with nothing mounted -- would write into an impostor, so
-            // that device is dropped from this segment instead.
-            let opened = if injected {
-                Err(io::Error::other("fault injected"))
-            } else if !crate::backend::superblock_path(&vdev.root).is_file() {
-                Err(io::Error::new(io::ErrorKind::NotFound, "device has no superblock at its root"))
-            } else {
-                path_for(vdev).and_then(|path| {
-                    OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .create(true)
-                        .truncate(true)
-                        .open(path)
-                })
-            };
+            // A device that is gone, or is not a formatted LCHFS device,
+            // fails to open, so it is dropped from this segment instead of
+            // anything being written into an impostor.
+            let opened = if injected { Err(io::Error::other("fault injected")) } else { create_on(vdev) };
             match opened {
                 Ok(file) => {
                     files.push(file);
@@ -760,8 +736,7 @@ pub mod fault_injection {
 /// mount-time recovery, which can treat a `Coalesced` segment as
 /// definitely-not-live).
 pub(crate) fn mark_coalesced(pool_root: &Path, segment_id: u64, kind: StreamKind) -> io::Result<()> {
-    let path = segment_path(pool_root, segment_id, kind);
-    let file = OpenOptions::new().read(true).write(true).open(&path)?;
+    let file = device(pool_root)?.open_segment(device_kind(kind), segment_id)?;
     let mut page = vec![0u8; SEGMENT_HEADER_PAGE_SIZE as usize];
     file.read_exact_at(&mut page, 0)?;
     let header_len = u32::from_le_bytes(page[0..4].try_into().unwrap()) as usize;
@@ -780,7 +755,7 @@ pub(crate) fn mark_coalesced(pool_root: &Path, segment_id: u64, kind: StreamKind
     file.sync_all()
 }
 
-fn write_header_page(file: &File, header: &SegmentHeader) -> io::Result<()> {
+fn write_header_page(file: &SegmentFile, header: &SegmentHeader) -> io::Result<()> {
     let encoded = lchfs_format::encode(header).expect("SegmentHeader encoding is infallible");
     assert!(
         encoded.len() as u64 + 4 <= SEGMENT_HEADER_PAGE_SIZE,
@@ -838,15 +813,15 @@ pub fn decompress(codec_id: CodecId, uncompressed_len: u32, payload: Vec<u8>) ->
 
 /// Random-access reader for a sealed or open segment.
 pub struct SegmentReader {
-    file: File,
+    file: SegmentFile,
     segment_id: u64,
     stream: StreamKind,
 }
 
 impl SegmentReader {
     pub fn open(pool_root: &Path, segment_id: u64, kind: StreamKind) -> io::Result<Self> {
-        let path = segment_path(pool_root, segment_id, kind);
-        Self::open_at(&path, segment_id, kind)
+        let file = device(pool_root)?.open_segment(device_kind(kind), segment_id)?;
+        Ok(Self { file, segment_id, stream: kind })
     }
 
     /// `open` for reading a record at a known location, which may be in
@@ -882,13 +857,17 @@ impl SegmentReader {
     /// Open a reader for shard `shard_id`'s own Delta stream segment
     /// `segment_id`. See `SegmentWriter::create_delta`.
     pub fn open_delta(pool_root: &Path, shard_id: u32, segment_id: u64) -> io::Result<Self> {
-        let path = delta_segment_path(pool_root, shard_id, segment_id);
-        Self::open_at(&path, segment_id, StreamKind::Delta)
+        let file = device(pool_root)?.open_segment(SegmentKind::Delta { shard: shard_id }, segment_id)?;
+        Ok(Self { file, segment_id, stream: StreamKind::Delta })
     }
 
-    fn open_at(path: &Path, segment_id: u64, stream: StreamKind) -> io::Result<Self> {
-        let file = OpenOptions::new().read(true).open(path)?;
-        Ok(Self { file, segment_id, stream })
+    /// The segment's written length (what its file's length was).
+    pub fn len(&self) -> u64 {
+        self.file.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.file.is_empty()
     }
 
     /// Reads and validates the segment's own header page. Not required for
@@ -1158,7 +1137,7 @@ impl SegmentReader {
         Scan {
             reader: self,
             offset: SEGMENT_HEADER_PAGE_SIZE as u32,
-            len: self.file.metadata().map(|m| m.len()).unwrap_or(0),
+            len: self.file.len(),
             damaged: Vec::new(),
             end: None,
         }

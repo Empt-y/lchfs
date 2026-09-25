@@ -4,7 +4,8 @@
 
 use lchfs_format::PoolParams;
 use lchfs_store::Pool;
-use std::path::{Path, PathBuf};
+use lchfs_store::testing::{self as t, SegmentKind};
+use std::path::Path;
 
 fn small_params() -> PoolParams {
     PoolParams {
@@ -27,12 +28,8 @@ fn payload(seed: u32) -> Vec<u8> {
         .collect()
 }
 
-fn data_segments(root: &Path) -> Vec<PathBuf> {
-    let mut v: Vec<_> = std::fs::read_dir(root.join("segments/data"))
-        .map(|rd| rd.flatten().map(|e| e.path()).collect())
-        .unwrap_or_default();
-    v.sort();
-    v
+fn data_segments(root: &Path) -> Vec<u64> {
+    t::segment_ids(root, SegmentKind::Data)
 }
 
 fn read_file(pool: &Pool, name: &str, len: usize) -> Vec<u8> {
@@ -55,7 +52,7 @@ fn a_mirror_shrinks_back_to_a_single_device() {
     assert_eq!(Pool::detach_vdev(&[a.path(), b.path()]).unwrap(), 1);
 
     // b is no longer a member in any sense.
-    assert!(!b.path().join("SUPERBLOCK").exists());
+    assert!(!lchfs_store::testing::ring_written(b.path()));
     let err = Pool::open_replicated(&[a.path(), b.path()]).unwrap_err().to_string();
     assert!(err.contains("no valid superblock"), "{err}");
 
@@ -82,14 +79,14 @@ fn detach_first_fills_the_survivors_from_the_leaving_device() {
         pool.checkpoint().unwrap();
     }
     // a's copies rot; b's are the good ones -- and b is the one leaving.
-    for path in data_segments(a.path()) {
-        let mut bytes = std::fs::read(&path).unwrap();
+    for id in data_segments(a.path()) {
+        let mut bytes = t::read_segment(a.path(), SegmentKind::Data, id);
         if bytes.len() > 8192 {
             let mid = bytes.len() / 2;
             for x in &mut bytes[mid..mid + 64] {
                 *x ^= 0xff;
             }
-            std::fs::write(&path, &bytes).unwrap();
+            t::write_segment(a.path(), SegmentKind::Data, id, &bytes);
         }
     }
 
@@ -112,13 +109,13 @@ fn detach_refuses_when_a_record_would_lose_its_last_good_copy() {
     }
     // Both copies of the data are gone: nothing can be proven complete.
     for root in [a.path(), b.path()] {
-        for f in data_segments(root) {
-            std::fs::remove_file(f).unwrap();
+        for id in data_segments(root) {
+            t::remove_segment(root, SegmentKind::Data, id).unwrap();
         }
     }
     let err = Pool::detach_vdev(&[a.path(), b.path()]).unwrap_err().to_string();
     assert!(err.contains("refusing to detach"), "{err}");
-    assert!(b.path().join("SUPERBLOCK").exists(), "the leaving device must be untouched");
+    assert!(lchfs_store::testing::ring_written(b.path()), "the leaving device must be untouched");
     assert!(Pool::open_replicated(&[a.path(), b.path()]).is_ok(), "the set must still be coherent");
 }
 
@@ -159,8 +156,8 @@ fn a_pool_can_grow_and_shrink_repeatedly() {
         assert_eq!(pool.mount_resilver().len(), 1);
         pool.checkpoint().unwrap();
     }
-    for f in data_segments(a.path()) {
-        std::fs::remove_file(f).unwrap();
+    for id in data_segments(a.path()) {
+        t::remove_segment(a.path(), SegmentKind::Data, id).unwrap();
     }
     let pool = Pool::open_replicated(&[a.path(), c.path()]).unwrap();
     assert_eq!(read_file(&pool, "one", one.len()), one);
@@ -183,9 +180,9 @@ fn a_detach_interrupted_between_survivors_is_recoverable() {
         pool.checkpoint().unwrap();
     }
     // Simulate the crash: c's ring gone, a rewritten to 2, b still says 3.
-    let b_ring = std::fs::read(b.path().join("SUPERBLOCK")).unwrap();
+    let b_ring = lchfs_store::testing::read_ring(b.path());
     Pool::detach_vdev(&[a.path(), b.path(), c.path()]).unwrap();
-    std::fs::write(b.path().join("SUPERBLOCK"), &b_ring).unwrap();
+    lchfs_store::testing::write_ring(b.path(), 0, &b_ring);
 
     // Highest count wins: the pool is 3 wide with slot 2 empty.
     let err = Pool::open_replicated(&[a.path(), b.path()]).unwrap_err().to_string();
@@ -220,7 +217,7 @@ fn a_device_leaves_a_mounted_pool() {
     assert_eq!(pool.detach_vdev_live().unwrap(), 1);
     assert_eq!(pool.vdev_status().len(), 1, "{:?}", pool.vdev_status());
     assert!(!pool.is_degraded());
-    assert!(!b.path().join("SUPERBLOCK").exists());
+    assert!(!lchfs_store::testing::ring_written(b.path()));
 
     let ino2 = pool.create_file(1, "two", 0o644).unwrap();
     pool.write(ino2, 0, &two).unwrap();

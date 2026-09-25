@@ -172,7 +172,7 @@ fn a_two_vdev_pool_replicates_real_file_content() {
     assert!(!sa.is_empty(), "no segments were written at all");
     assert_eq!(sa.keys().collect::<Vec<_>>(), sb.keys().collect::<Vec<_>>());
     assert_eq!(sa, sb, "vdev b's segments differ from vdev a's");
-    assert!(!b.path().join("INDEX.redb").exists(), "the index should not be replicated");
+    assert!(!lchfs_index::RedbIndex::exists(b.path()), "the index should not be replicated");
 
     // And it reopens from the set with content intact.
     let pool = Pool::open_replicated(&[a.path(), b.path()]).unwrap();

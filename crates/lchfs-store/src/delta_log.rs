@@ -15,29 +15,25 @@
 //! same objects naturally dedups against this via content-addressing
 //! (same bytes -> same hash -> no-op).
 
-use crate::segment::{SegmentReader, SegmentWriter, delta_segment_dir};
+use crate::segment::{SegmentReader, SegmentWriter, device};
 use crate::vdevs::VdevSet;
 use std::sync::Arc;
 use lchfs_format::{
     DeltaLogEntry, ExtentKind, ExtentLocation, Hash32, RecordCrypto, SHARD_SUPERBLOCK_MAGIC, ShardSuperblockSlot,
     compute_shard_superblock_slot_checksum, finalize_shard_superblock_slot_checksum,
 };
-use std::fs::OpenOptions;
 use std::io;
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
-const SHARD_SUPERBLOCK_FILE_SIZE: u64 = 4096;
+/// A shard superblock is one 4 KiB slot in the device's shard superblock
+/// region (see `lchfs-device`).
+const SHARD_SUPERBLOCK_FILE_SIZE: u64 = lchfs_device::DEVICE_BLOCK;
 
 /// A shard's delta segment is rolled once it passes this, so that there
 /// are sealed segments for `truncate_through` to reclaim. Without a roll a
 /// long mount appended every fsync of its lifetime to one segment, which
 /// nothing could ever delete and every mount replayed from the start.
 pub const DELTA_ROLL_BYTES: u64 = 16 * 1024 * 1024;
-
-fn shard_superblock_path(pool_root: &Path, shard_id: u32) -> PathBuf {
-    delta_segment_dir(pool_root, shard_id).join("superblock.sblk")
-}
 
 fn decode_error(e: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e.to_string())
@@ -286,7 +282,7 @@ impl ShardDeltaLog {
         let encoded = lchfs_format::encode(&slot).map_err(decode_error)?;
         assert!(
             encoded.len() as u64 + 4 <= SHARD_SUPERBLOCK_FILE_SIZE,
-            "ShardSuperblockSlot must fit in the reserved shard superblock file"
+            "ShardSuperblockSlot must fit in its reserved slot"
         );
 
         let mut buf = vec![0u8; SHARD_SUPERBLOCK_FILE_SIZE as usize];
@@ -299,18 +295,7 @@ impl ShardDeltaLog {
         let mut last_err = None;
         let online = self.vdevs.online();
         for root in &self.vdev_roots {
-            let write = (|| -> io::Result<()> {
-                let path = shard_superblock_path(root, self.shard_id);
-                std::fs::create_dir_all(path.parent().unwrap())?;
-                let file = OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .truncate(false)
-                    .open(&path)?;
-                file.write_all_at(&buf, 0)?;
-                file.sync_all()
-            })();
+            let write = device(root).and_then(|d| d.write_shard_superblock(self.shard_id, &buf));
             match write {
                 Ok(()) => wrote_one = true,
                 Err(e) => {
@@ -485,7 +470,7 @@ pub fn truncate_through(
             continue;
         }
         for root in roots {
-            match std::fs::remove_file(crate::segment::delta_segment_path(root, shard_id, segment_id)) {
+            match crate::segment::remove_delta_segment(root, shard_id, segment_id) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e),
@@ -541,38 +526,18 @@ fn segment_is_dead(roots: &[PathBuf], shard_id: u32, segment_id: u64, watermark:
     unresolved.is_empty()
 }
 
-/// Every delta segment id present for `shard_id` under `vdev_root`;
-/// empty if the shard has no directory there.
+/// Every delta segment id present for `shard_id` on the device at
+/// `vdev_root`; empty if the device is not there.
 fn delta_segment_ids(vdev_root: &Path, shard_id: u32) -> io::Result<Vec<u64>> {
-    let dir = delta_segment_dir(vdev_root, shard_id);
-    if !dir.is_dir() {
-        return Ok(Vec::new());
-    }
-    let mut ids = Vec::new();
-    for entry in std::fs::read_dir(&dir)? {
-        let file_name = entry?.file_name();
-        if let Some(id) = Path::new(&file_name)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .and_then(|s| s.parse::<u64>().ok())
-        {
-            ids.push(id);
-        }
-    }
-    Ok(ids)
+    Ok(crate::segment::delta_segment_ids(vdev_root, shard_id))
 }
 
 fn read_shard_superblock_file(
     pool_root: &Path,
     shard_id: u32,
 ) -> io::Result<Option<ShardSuperblockSlot>> {
-    let path = shard_superblock_path(pool_root, shard_id);
-    if !path.is_file() {
-        return Ok(None);
-    }
-    let file = OpenOptions::new().read(true).open(&path)?;
-    let mut buf = vec![0u8; SHARD_SUPERBLOCK_FILE_SIZE as usize];
-    file.read_exact_at(&mut buf, 0)?;
+    let Ok(dev) = device(pool_root) else { return Ok(None) };
+    let buf = dev.read_shard_superblock(shard_id)?;
     if buf.len() < 4 {
         return Ok(None);
     }

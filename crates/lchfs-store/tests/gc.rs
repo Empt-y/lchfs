@@ -44,7 +44,7 @@ fn deterministic_bytes(seed: u64, len: usize) -> Vec<u8> {
 /// Loads a fresh `ChunkLocationCache` straight from the pool's persisted
 /// `INDEX.redb` -- the same source `Pool::open`'s fast path uses.
 fn load_locations(pool_root: &std::path::Path) -> Arc<ChunkLocationCache> {
-    let index = RedbIndex::open(&pool_root.join("INDEX.redb")).unwrap();
+    let index = RedbIndex::open(pool_root).unwrap();
     let cache = ChunkLocationCache::new();
     cache.extend(index.iter_preferred_locations().unwrap());
     Arc::new(cache)
@@ -279,18 +279,8 @@ fn grace_window_protects_most_recently_sealed_segments() {
     // Enumerate every *sealed* data segment directly (bypassing
     // sweep_candidates) to know what the full universe of low-liveness
     // segments would be without the grace window.
-    let data_dir = dir.path().join("segments/data");
-    let mut all_ids: Vec<u64> = std::fs::read_dir(&data_dir)
-        .unwrap()
-        .filter_map(|e| {
-            e.ok()?
-                .path()
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .and_then(|s| s.parse::<u64>().ok())
-        })
-        .collect();
-    all_ids.sort_unstable();
+    let all_ids: Vec<u64> =
+        lchfs_store::testing::segment_ids(dir.path(), lchfs_store::testing::SegmentKind::Data);
     assert!(
         all_ids.len() >= 3,
         "test setup should force at least 3 segments; got {}",

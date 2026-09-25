@@ -130,7 +130,7 @@ fn rebuild_index_produces_a_pool_that_reopens_correctly() {
     let pool = setup_populated_pool(dir.path());
     drop(pool);
 
-    std::fs::remove_file(dir.path().join("INDEX.redb")).unwrap();
+    lchfs_index::RedbIndex::remove(dir.path()).unwrap();
     lchfs_fsck::rebuild_index(dir.path(), &[]).unwrap();
 
     let pool2 = Pool::open(dir.path()).unwrap();
@@ -193,7 +193,7 @@ fn a_record_missing_from_one_vdev_is_reported_against_that_vdev() {
     let b = tempfile::tempdir().unwrap();
     setup_replicated_pool(a.path(), b.path());
     for f in data_segments(b.path()) {
-        std::fs::remove_file(f).unwrap();
+        lchfs_store::testing::remove_segment(b.path(), lchfs_store::testing::SegmentKind::Data, f).unwrap();
     }
     let report = lchfs_fsck::check_replicas(&[a.path(), b.path()]);
     let missing_on_b = report
@@ -318,12 +318,12 @@ fn rebuild_index_records_every_vdevs_replicas() {
     let a = tempfile::tempdir().unwrap();
     let b = tempfile::tempdir().unwrap();
     setup_replicated_pool(a.path(), b.path());
-    std::fs::remove_file(a.path().join("INDEX.redb")).unwrap();
+    lchfs_index::RedbIndex::remove(a.path()).unwrap();
 
     lchfs_fsck::rebuild_index(a.path(), &[b.path()]).unwrap();
 
     for f in data_segments(a.path()) {
-        std::fs::remove_file(f).unwrap();
+        lchfs_store::testing::remove_segment(a.path(), lchfs_store::testing::SegmentKind::Data, f).unwrap();
     }
     let pool = Pool::open_replicated(&[a.path(), b.path()]).unwrap();
     let ino = pool.lookup(1, "chunked.bin").unwrap().unwrap();

@@ -95,7 +95,7 @@ fn cold_segments_become_stripes_and_read_back_from_any_path() {
     drop(pool);
 
     // And with the index gone, the slow path reassembles the stripes.
-    std::fs::remove_file(a.path().join("INDEX.redb")).unwrap();
+    lchfs_index::RedbIndex::remove(a.path()).unwrap();
     let pool = Pool::open_replicated(&[a.path(), b.path(), c.path()]).unwrap();
     for i in 0..14u32 {
         assert_eq!(read_file(&pool, &format!("f{i}"), 30_000), payload(i));
@@ -230,7 +230,7 @@ fn detach_repacks_the_stripes_that_name_the_leaving_device() {
     for root in [a.path(), b.path()] {
         assert!(segment_ids_with_shards(root).is_empty(), "every 2+1 stripe named vdev 2 and must be a mirror again");
     }
-    assert!(!c.path().join("SUPERBLOCK").exists());
+    assert!(!lchfs_store::testing::ring_written(c.path()));
 
     let pool = Pool::open_replicated(&[a.path(), b.path()]).unwrap();
     for i in 0..14u32 {
@@ -305,7 +305,7 @@ fn detach_refuses_when_a_stripe_cannot_be_read_back() {
     }
     let err = Pool::detach_vdev(&[a.path(), b.path(), c.path()]).unwrap_err().to_string();
     assert!(err.contains("refusing to detach"), "{err}");
-    assert!(c.path().join("SUPERBLOCK").exists(), "nothing was changed");
+    assert!(lchfs_store::testing::ring_written(c.path()), "nothing was changed");
 }
 
 #[test]

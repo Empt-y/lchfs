@@ -214,7 +214,7 @@ fn generation_change_mid_pass_blocks_deletion_even_without_a_pin() {
     let root = pool.debug_root_hash();
     drop(pool);
 
-    let index = RedbIndex::open(&dir.path().join("INDEX.redb")).unwrap();
+    let index = RedbIndex::open(dir.path()).unwrap();
     let cache = ChunkLocationCache::new();
     cache.extend(index.iter_preferred_locations().unwrap());
     let locations = Arc::new(cache);

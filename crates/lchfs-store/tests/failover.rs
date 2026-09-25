@@ -170,7 +170,7 @@ fn resilver_recreates_replicas_a_device_never_received() {
     // never arrived, and the index never learned of a replica there.
     std::fs::remove_dir_all(b.path().join("segments")).unwrap();
     let expected_missing = {
-        let mut index = RedbIndex::open(&a.path().join("INDEX.redb")).unwrap();
+        let mut index = RedbIndex::open(a.path()).unwrap();
         let all = index.iter_all_chunk_locations().unwrap();
         let mut n = 0;
         for (hash, vdev_id, _) in all {

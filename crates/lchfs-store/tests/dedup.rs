@@ -113,7 +113,7 @@ fn loser_becomes_reclaimable_by_gc_after_convergence() {
     let root = pool.debug_root_hash();
     drop(pool);
 
-    let index = lchfs_index::RedbIndex::open(&dir.path().join("INDEX.redb")).unwrap();
+    let index = lchfs_index::RedbIndex::open(dir.path()).unwrap();
     let cache = lchfs_index::ChunkLocationCache::new();
     cache.extend(index.iter_preferred_locations().unwrap());
     let locations = std::sync::Arc::new(cache);
