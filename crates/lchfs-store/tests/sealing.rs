@@ -221,7 +221,9 @@ fn copy_dir(from: &Path, to: &Path) {
         let target = to.join(entry.file_name());
         if entry.file_type().unwrap().is_dir() {
             copy_dir(&entry.path(), &target);
-        } else {
+        } else if entry.file_name() != "LOCK" {
+            // The pool's LOCK file is empty, and on Windows the live
+            // pool's lock covers it whole, so it cannot be read.
             std::fs::copy(entry.path(), &target).unwrap();
         }
     }
