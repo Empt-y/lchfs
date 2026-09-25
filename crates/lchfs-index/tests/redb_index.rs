@@ -199,10 +199,15 @@ fn a_fresh_rewrite_keeps_locations_and_generation_and_drops_the_memo() {
     index.put_rekey_memo(old, new).unwrap();
     index.checkpoint(9).unwrap();
     assert_eq!(index.get_rekey_memo(old).unwrap(), Some(new));
+    // Closed while its bytes are read: Windows locks part of an open redb
+    // file against other readers.
+    drop(index);
     assert!(
         std::fs::read(&path).unwrap().windows(32).any(|w| w == old.0),
         "the check below means nothing unless the old file held the hash"
     );
+    let mut index = RedbIndex::open(&path).unwrap();
+    assert_eq!(index.get_rekey_memo(old).unwrap(), Some(new));
 
     index.rewrite_fresh(&path).unwrap();
     assert_eq!(index.get_rekey_memo(old).unwrap(), None);
