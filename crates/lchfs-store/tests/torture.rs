@@ -208,9 +208,11 @@ fn drain_coalesce(pool: &Pool, roots: &[std::path::PathBuf]) {
         roots
             .iter()
             .map(|r| {
-                std::fs::read_dir(r.join("segments").join("data"))
-                    .map(|d| d.count())
-                    .unwrap_or(0)
+                use lchfs_store::testing::{SegmentKind, segments};
+                segments(r)
+                    .into_iter()
+                    .filter(|(k, _)| matches!(k, SegmentKind::Data | SegmentKind::StripeShard { .. }))
+                    .count()
             })
             .sum()
     };
@@ -553,7 +555,7 @@ fn run_mirror_fault_storm(convert: bool) {
         // index claims per device, and what each device's own scan finds.
         // (This is what found the rejoin footer race.)
         drop(pool);
-        let index = lchfs_index::RedbIndex::open(&a.path().join("INDEX.redb")).unwrap();
+        let index = lchfs_index::RedbIndex::open(a.path()).unwrap();
         for e in &report.errors {
             if let lchfs_fsck::FsckError::ReplicaMissing { hash, vdev_id } = e {
                 use lchfs_index::IndexStore;
@@ -565,10 +567,10 @@ fn run_mirror_fault_storm(convert: bool) {
                 if let Ok(entries) = index.chunk_locations(*hash) {
                     for (v, loc) in entries {
                         let root = if v == 0 { a.path() } else { b.path() };
-                        let path = root.join("segments").join("data").join(format!("{}.aseg", loc.segment_id));
-                        let meta_path = root.join("segments").join("meta").join(format!("{}.mseg", loc.segment_id));
-                        eprintln!("replica diag:   vdev {v} seg {}: data file {:?} meta file {:?}", loc.segment_id,
-                            std::fs::metadata(&path).map(|m| m.len()).ok(), std::fs::metadata(&meta_path).map(|m| m.len()).ok());
+                        use lchfs_store::testing::{SegmentKind, segment_exists, segment_len};
+                        let len = |k| segment_exists(root, k, loc.segment_id).then(|| segment_len(root, k, loc.segment_id));
+                        eprintln!("replica diag:   vdev {v} seg {}: data {:?} meta {:?}", loc.segment_id,
+                            len(SegmentKind::Data), len(SegmentKind::Meta));
                         if let Ok(r) = lchfs_store::segment::SegmentReader::open_either(root, loc.segment_id, lchfs_format::StreamKind::Data) {
                             let mut scan = r.scan();
                             let offs: Vec<u32> = (&mut scan).map(|(_, o)| o).collect();

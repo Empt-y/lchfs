@@ -9,6 +9,7 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 lchfs-crypto = { path = "crates/lchfs-crypto" }
+lchfs-device = { path = "crates/lchfs-device" }
 lchfs-chunk = { path = "crates/lchfs-chunk" }
 lchfs-compress = { path = "crates/lchfs-compress" }
 lchfs-format = { path = "crates/lchfs-format" }
@@ -77,4 +78,5 @@ anyhow = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+lchfs-store = { workspace = true }
 lchfs-crypto = { workspace = true }

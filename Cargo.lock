@@ -920,6 +920,7 @@ dependencies = [
  "anyhow",
  "lchfs-cli",
  "lchfs-crypto",
+ "lchfs-store",
  "tempfile",
 ]
 
@@ -941,6 +942,7 @@ dependencies = [
  "fuser",
  "hex",
  "lchfs-crypto",
+ "lchfs-device",
  "lchfs-format",
  "lchfs-fsck",
  "lchfs-fuse",
@@ -979,6 +981,7 @@ dependencies = [
  "criterion",
  "getrandom 0.3.4",
  "hex",
+ "lchfs-device",
  "nix",
  "serde",
  "serde_json",
@@ -987,6 +990,21 @@ dependencies = [
  "tss-esapi",
  "x-wing",
  "zeroize",
+]
+
+[[package]]
+name = "lchfs-device"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "crc32fast",
+ "getrandom 0.3.4",
+ "nix",
+ "parking_lot 0.12.5",
+ "redb",
+ "serde",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]
@@ -1005,6 +1023,7 @@ name = "lchfs-fsck"
 version = "0.1.0"
 dependencies = [
  "lchfs-crypto",
+ "lchfs-device",
  "lchfs-format",
  "lchfs-index",
  "lchfs-store",
@@ -1034,6 +1053,7 @@ name = "lchfs-index"
 version = "0.1.0"
 dependencies = [
  "lchfs-crypto",
+ "lchfs-device",
  "lchfs-format",
  "redb",
  "tempfile",
@@ -1065,6 +1085,7 @@ dependencies = [
  "lchfs-chunk",
  "lchfs-compress",
  "lchfs-crypto",
+ "lchfs-device",
  "lchfs-format",
  "lchfs-fsck",
  "lchfs-index",

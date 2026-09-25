@@ -44,29 +44,14 @@ fn data_segments(root: &Path) -> Vec<(u64, SegmentState, u64)> {
 }
 
 fn segments(root: &Path, kind: StreamKind) -> Vec<(u64, SegmentState, u64)> {
-    let (sub, ext) = match kind {
-        StreamKind::Data => ("data", "aseg"),
-        StreamKind::Meta => ("meta", "mseg"),
-        StreamKind::Delta => unreachable!(),
-    };
-    let mut out: Vec<_> = std::fs::read_dir(root.join("segments").join(sub))
-        .map(|rd| {
-            rd.flatten()
-                .filter(|e| e.path().extension().is_some_and(|x| x == ext))
-                .map(|e| {
-                    let id: u64 = e.path().file_stem().unwrap().to_str().unwrap().parse().unwrap();
-                    let state = SegmentReader::open(root, id, kind)
-                        .unwrap()
-                        .read_header()
-                        .unwrap()
-                        .state;
-                    (id, state, e.metadata().unwrap().len())
-                })
-                .collect()
+    let dev_kind = lchfs_store::testing::kind(kind);
+    lchfs_store::testing::segment_ids(root, dev_kind)
+        .into_iter()
+        .map(|id| {
+            let state = SegmentReader::open(root, id, kind).unwrap().read_header().unwrap().state;
+            (id, state, lchfs_store::testing::segment_len(root, dev_kind, id))
         })
-        .unwrap_or_default();
-    out.sort_by_key(|(id, _, _)| *id);
-    out
+        .collect()
 }
 
 fn write_files(pool: &Pool, n: u32) {
@@ -163,7 +148,6 @@ fn a_segment_left_open_by_a_crash_is_sealed_at_the_next_mount() {
     // segments and all still Open. The lock file does not carry over.
     let crashed = image.path().join("a");
     copy_dir(a.path(), &crashed);
-    std::fs::remove_file(crashed.join("LOCK")).ok();
     drop(pool);
     assert!(data_segments(&crashed).iter().any(|(_, s, _)| *s == SegmentState::Open), "the image has open segments");
 
@@ -215,16 +199,9 @@ fn idle_segments_seal_at_checkpoint_and_only_then_become_cold() {
     }
 }
 
+/// A crash image of a device, as it is right now.
 fn copy_dir(from: &Path, to: &Path) {
-    std::fs::create_dir_all(to).unwrap();
-    for entry in std::fs::read_dir(from).unwrap().flatten() {
-        let target = to.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
-            copy_dir(&entry.path(), &target);
-        } else {
-            std::fs::copy(entry.path(), &target).unwrap();
-        }
-    }
+    lchfs_store::testing::copy_device(from, to);
 }
 
 /// One replica's header page rotted must not stop the pool mounting:
@@ -240,16 +217,13 @@ fn a_rotted_header_page_on_one_replica_does_not_fail_the_mount() {
     copy_dir(a.path(), &ia);
     copy_dir(b.path(), &ib);
     drop(pool);
-    for root in [&ia, &ib] {
-        std::fs::remove_file(root.join("LOCK")).ok();
-    }
     let (id, _, _) = data_segments(&ib)[0];
-    let p = ib.join(format!("segments/data/{id}.aseg"));
-    let mut bytes = std::fs::read(&p).unwrap();
-    for x in &mut bytes[..64] {
+    let data = lchfs_store::testing::SegmentKind::Data;
+    let mut head = lchfs_store::testing::read_segment(&ib, data, id)[..64].to_vec();
+    for x in &mut head {
         *x ^= 0xff;
     }
-    std::fs::write(&p, &bytes).unwrap();
+    lchfs_store::testing::write_at(&ib, data, id, 0, &head);
 
     let pool = Pool::open_replicated(&[&ia, &ib]).unwrap();
     for i in 0..4u32 {

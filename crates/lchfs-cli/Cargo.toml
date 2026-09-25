@@ -24,6 +24,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 lchfs-fsck = { workspace = true }
 lchfs-store = { workspace = true }
 lchfs-index = { workspace = true }
+lchfs-device = { workspace = true }
 lchfs-format = { workspace = true }
 fuser = { workspace = true }
 clap = { workspace = true }

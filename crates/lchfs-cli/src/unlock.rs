@@ -226,7 +226,7 @@ pub fn with_key<T>(
 /// The `--vdev`/`--scan` pair: a pool's other devices, named or found.
 #[derive(Args, Debug, Clone, Default)]
 pub struct DeviceArgs {
-    /// The pool's other vdev roots (ARCHITECTURE.md §15.10).
+    /// The pool's other devices (ARCHITECTURE.md §15.10).
     #[arg(long = "vdev")]
     pub vdevs: Vec<PathBuf>,
     /// Find the pool's other devices under these directories instead of

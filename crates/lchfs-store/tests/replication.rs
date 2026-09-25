@@ -43,7 +43,7 @@ fn every_vdev_receives_a_byte_identical_segment() {
     w.fsync().unwrap();
     w.seal().unwrap();
 
-    let read = |root: &std::path::Path| std::fs::read(root.join("segments/data/42.aseg")).unwrap();
+    let read = |root: &std::path::Path| lchfs_store::testing::read_segment(root, lchfs_store::testing::SegmentKind::Data, 42);
     let va = read(a.path());
     assert!(!va.is_empty());
     assert_eq!(va, read(b.path()), "vdev b diverged from vdev a");
@@ -81,12 +81,9 @@ fn delta_segments_fan_out_too() {
     append_records(&mut w, &[b"delta entry"]);
     w.fsync().unwrap();
 
-    let p = "segments/delta/00003/0.dseg";
-    assert_eq!(
-        std::fs::read(a.path().join(p)).unwrap(),
-        std::fs::read(b.path().join(p)).unwrap(),
-        "delta replicas diverged"
-    );
+    use lchfs_store::testing::{SegmentKind, read_segment};
+    let delta = SegmentKind::Delta { shard: 3 };
+    assert_eq!(read_segment(a.path(), delta, 0), read_segment(b.path(), delta, 0), "delta replicas diverged");
 }
 
 /// A segment with nowhere to go is a programming error, not a silently
@@ -128,26 +125,10 @@ fn small_params() -> PoolParams {
     }
 }
 
-/// Every file under `dir`, relative path -> bytes.
-fn tree(dir: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
-    let mut out = std::collections::BTreeMap::new();
-    fn walk(
-        base: &std::path::Path,
-        d: &std::path::Path,
-        out: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
-    ) {
-        let Ok(entries) = std::fs::read_dir(d) else { return };
-        for e in entries.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                walk(base, &p, out);
-            } else if let Ok(bytes) = std::fs::read(&p) {
-                out.insert(p.strip_prefix(base).unwrap().to_path_buf(), bytes);
-            }
-        }
-    }
-    walk(dir, dir, &mut out);
-    out
+/// Every segment on a device, by name -> bytes.
+fn tree(dev: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    use lchfs_store::testing::{read_segment, segments};
+    segments(dev).into_iter().map(|(k, id)| (format!("{k:?} {id}"), read_segment(dev, k, id))).collect()
 }
 
 /// The whole point: real file content written through `Pool` lands on every
@@ -167,12 +148,12 @@ fn a_two_vdev_pool_replicates_real_file_content() {
 
     // Segment trees must match exactly. INDEX.redb is deliberately excluded:
     // §15.10 keeps it on vdev 0 only, as a rebuildable cache.
-    let sa = tree(&a.path().join("segments"));
-    let sb = tree(&b.path().join("segments"));
+    let sa = tree(a.path());
+    let sb = tree(b.path());
     assert!(!sa.is_empty(), "no segments were written at all");
     assert_eq!(sa.keys().collect::<Vec<_>>(), sb.keys().collect::<Vec<_>>());
     assert_eq!(sa, sb, "vdev b's segments differ from vdev a's");
-    assert!(!b.path().join("INDEX.redb").exists(), "the index should not be replicated");
+    assert!(!lchfs_index::RedbIndex::exists(b.path()), "the index should not be replicated");
 
     // And it reopens from the set with content intact.
     let pool = Pool::open_replicated(&[a.path(), b.path()]).unwrap();
@@ -233,7 +214,6 @@ fn opening_a_two_vdev_pool_with_one_device_is_refused() {
 #[test]
 fn a_scan_recovers_the_records_behind_a_damaged_stretch() {
     use lchfs_store::segment::ScanEnd;
-    use std::io::{Seek, SeekFrom, Write};
 
     let dir = device();
     let payloads: Vec<Vec<u8>> = (0..12u8).map(|i| vec![i; 3000 + i as usize * 7]).collect();
@@ -242,14 +222,9 @@ fn a_scan_recovers_the_records_behind_a_damaged_stretch() {
     w.seal().unwrap();
 
     // Scribble over records 4 and 5 entirely, header and all.
-    let path = dir.path().join("segments/data/7.aseg");
     let from = locs[4].offset as u64;
     let to = locs[6].offset as u64;
-    {
-        let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-        f.seek(SeekFrom::Start(from)).unwrap();
-        f.write_all(&vec![0xAB; (to - from) as usize]).unwrap();
-    }
+    lchfs_store::testing::write_at(dir.path(), lchfs_store::testing::SegmentKind::Data, 7, from, &vec![0xAB; (to - from) as usize]);
 
     let reader = SegmentReader::open(dir.path(), 7, StreamKind::Data).unwrap();
 
@@ -302,9 +277,9 @@ fn a_clean_tail_is_not_mistaken_for_damage() {
     assert_eq!(scan.end, Some(ScanEnd::Eof));
 
     // Tear the last record in half.
-    let path = dir.path().join("segments/data/8.aseg");
-    let len = std::fs::metadata(&path).unwrap().len();
-    std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(len - 5).unwrap();
+    use lchfs_store::testing::{SegmentKind, segment_len, truncate_segment};
+    let len = segment_len(dir.path(), SegmentKind::Data, 8);
+    truncate_segment(dir.path(), SegmentKind::Data, 8, len - 5);
     let reader = SegmentReader::open(dir.path(), 8, StreamKind::Data).unwrap();
     let mut scan = reader.scan();
     assert_eq!((&mut scan).count(), 2, "the torn record is dropped, the rest kept");
@@ -343,8 +318,8 @@ fn a_forged_uncompressed_len_is_refused_rather_than_allocated() {
 
     // Rewrite the header in place with a huge uncompressed_len and a
     // matching checksum.
-    let path = dir.path().join("segments/data/5.aseg");
-    let mut bytes = std::fs::read(&path).unwrap();
+    let data = lchfs_store::testing::SegmentKind::Data;
+    let mut bytes = lchfs_store::testing::read_segment(dir.path(), data, 5);
     let off = loc.offset as usize;
     let header_len = u32::from_le_bytes(bytes[off..off + 4].try_into().unwrap()) as usize;
     let mut header: ExtentRecordHeader =
@@ -354,7 +329,7 @@ fn a_forged_uncompressed_len_is_refused_rather_than_allocated() {
     let encoded = lchfs_format::encode(&header).unwrap();
     assert_eq!(encoded.len(), header_len, "same header layout, same length");
     bytes[off + 4..off + 4 + header_len].copy_from_slice(&encoded);
-    std::fs::write(&path, &bytes).unwrap();
+    lchfs_store::testing::write_segment(dir.path(), data, 5, &bytes);
 
     let reader = SegmentReader::open(dir.path(), 5, StreamKind::Data).unwrap();
     let err = reader.read_record(loc).unwrap_err().to_string();
@@ -365,22 +340,21 @@ fn a_forged_uncompressed_len_is_refused_rather_than_allocated() {
 /// window of memory and a bounded amount of time, not the garbage's size.
 #[test]
 fn a_resync_through_megabytes_of_garbage_is_bounded() {
-    use std::io::Write;
     let dir = device();
     let mut w = SegmentWriter::create(&[dir.path()], 6, StreamKind::Data, 0).unwrap();
     let first = append_records(&mut w, &[b"before the garbage"]);
     drop(w);
-    let path = dir.path().join("segments/data/6.aseg");
     {
         // 8 MiB of bytes dense with fake magics and huge fake header lengths.
-        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        use lchfs_store::testing::{SegmentKind, segment_len, write_at};
         let mut junk = Vec::with_capacity(8 << 20);
         let magic = lchfs_format::EXTENT_RECORD_MAGIC.to_le_bytes();
         while junk.len() < 8 << 20 {
             junk.extend_from_slice(&(16u32 * 1024 * 1024 - 1).to_le_bytes());
             junk.extend_from_slice(&magic);
         }
-        f.write_all(&junk).unwrap();
+        let end = segment_len(dir.path(), SegmentKind::Data, 6);
+        write_at(dir.path(), SegmentKind::Data, 6, end, &junk);
     }
     // Then one real record after it all, appended by a fresh writer at
     // the right offset would need the writer's cursor; instead check that

@@ -44,6 +44,8 @@ pub mod prep;
 pub mod rekey;
 pub mod segment;
 pub mod stripe;
+#[doc(hidden)]
+pub mod testing;
 pub mod vdevs;
 
 use bytes::Bytes;
@@ -464,18 +466,27 @@ fn device_answers(root: &Path) -> bool {
     if !ring_ok {
         return false;
     }
-    let segments = root.join("segments");
-    if !segments.is_dir() {
-        return false;
-    }
-    let probe = segments.join(".lchfs-probe");
-    let writable = std::fs::write(&probe, b"probe").is_ok();
-    let _ = std::fs::remove_file(&probe);
-    writable
+    // The device's scratch sector exists to be overwritten by this.
+    segment::device(root).and_then(|d| d.probe_write()).is_ok()
 }
 
+/// Where a pool's index lives: the index region of its primary device.
 fn index_path(pool_root: &Path) -> PathBuf {
-    pool_root.join("INDEX.redb")
+    pool_root.to_path_buf()
+}
+
+/// Gets a device ready to join a new pool: a path that does not exist
+/// yet becomes a directory for an image (tests and development), and a
+/// device with no LCHFS layout is formatted. One that is already
+/// formatted is left as it is, for `require_blank_device` to judge.
+fn prepare_device(root: &Path) -> Result<(), PoolError> {
+    if !root.exists() {
+        std::fs::create_dir_all(root)?;
+    }
+    if !lchfs_device::is_formatted(root) {
+        lchfs_device::format(root, lchfs_device::FormatOptions::default())?;
+    }
+    Ok(())
 }
 
 /// Open readers keyed by `(vdev_id, segment_id, stream)`. A segment_id is
@@ -1012,7 +1023,7 @@ impl Pool {
         let pool_root = vdev_roots[0];
         let mut members = Vec::with_capacity(vdev_roots.len());
         for (id, root) in vdev_roots.iter().enumerate() {
-            std::fs::create_dir_all(root)?;
+            prepare_device(root)?;
             let lock = acquire_pool_lock(root)?;
             // None of them may already hold a pool or a segment tree --
             // checked for every device, not just vdev 0, so a half-built
@@ -1296,7 +1307,7 @@ impl Pool {
         for root in vdev_roots {
             locks.push(acquire_pool_lock(root)?);
         }
-        std::fs::create_dir_all(new_root)?;
+        prepare_device(new_root)?;
         locks.push(acquire_pool_lock(new_root)?);
         require_blank_device(new_root)?;
         let new_backend = FileBackend::open(new_root)?;
@@ -1306,7 +1317,7 @@ impl Pool {
         // the state a rerun handles as a replacement.
         if new_count != membership.vdev_count {
             for (slot, root) in &membership.members {
-                let backend = FileBackend::open(root)?;
+                let backend = FileBackend::open_existing(root)?;
                 let mut updated = *slot;
                 updated.vdev_count = new_count;
                 finalize_superblock_slot_checksum(&mut updated);
@@ -1319,7 +1330,7 @@ impl Pool {
         // every hash as already present and copy nothing. No index at all
         // is fine: the next mount rebuilds one from every device it has.
         let index_file = index_path(vdev_roots[0]);
-        if index_file.exists()
+        if RedbIndex::exists(&index_file)
             && let Ok(mut index) = RedbIndex::open(&index_file)
         {
             let dropped = index.delete_vdev_locations(new_id)?;
@@ -1439,24 +1450,23 @@ impl Pool {
             locks.push(acquire_pool_lock(root)?);
         }
         if let Some(root) = &leaving_root {
-            std::fs::remove_file(backend::superblock_path(root))?;
-            let keys = keyring::path_on(root);
-            if keys.exists() {
-                std::fs::remove_file(keys)?;
+            backend::clear_ring(root)?;
+            if keyring::exists_on(root) {
+                keyring::remove_on(root)?;
             }
         }
         for (slot, root) in &membership.members {
             if slot.vdev_id == leaving {
                 continue;
             }
-            let backend = FileBackend::open(root)?;
+            let backend = FileBackend::open_existing(root)?;
             let mut updated = *slot;
             updated.vdev_count = leaving;
             finalize_superblock_slot_checksum(&mut updated);
             write_superblock_slot(&backend, &updated)?;
         }
         let index_file = index_path(membership.members[0].1);
-        if index_file.exists()
+        if RedbIndex::exists(&index_file)
             && let Ok(mut index) = RedbIndex::open(&index_file)
         {
             index.delete_vdev_locations(leaving)?;
@@ -1477,14 +1487,14 @@ impl Pool {
         // a child of a directory also named -- and must count once.
         let mut seen: HashSet<PathBuf> = HashSet::new();
         let mut probe = |dir: &Path| -> Result<(), PoolError> {
-            if !backend::superblock_path(dir).exists() {
+            if !lchfs_device::is_formatted(dir) || !backend::ring_written(dir) {
                 return Ok(());
             }
             let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
             if !seen.insert(canonical) {
                 return Ok(());
             }
-            let backend = FileBackend::open(dir)?;
+            let backend = FileBackend::open_existing(dir)?;
             match read_superblock(&backend) {
                 Ok(Some(slot)) => found.push((
                     slot.pool_uuid,
@@ -1498,17 +1508,22 @@ impl Pool {
             }
             Ok(())
         };
+        // A candidate is a device, or a directory whose entries may be
+        // devices: `/dev`, say, or a directory of device images.
         for candidate in candidates {
             probe(candidate)?;
-            if let Ok(children) = std::fs::read_dir(candidate) {
-                let mut dirs: Vec<PathBuf> = children
+            if candidate.is_dir()
+                && !candidate.join(lchfs_device::IMAGE_NAME).exists()
+                && let Ok(children) = std::fs::read_dir(candidate)
+            {
+                let mut entries: Vec<PathBuf> = children
                     .flatten()
                     .map(|e| e.path())
-                    .filter(|p| p.is_dir())
+                    .filter(|p| p.is_dir() || lchfs_device::is_block_device(p))
                     .collect();
-                dirs.sort();
-                for dir in dirs {
-                    probe(&dir)?;
+                entries.sort();
+                for entry in entries {
+                    probe(&entry)?;
                 }
             }
         }
@@ -1602,7 +1617,7 @@ impl Pool {
         let mut set_members = Vec::with_capacity(members.len());
         for (slot, root) in &members {
             let lock = acquire_pool_lock(root)?;
-            let backend = FileBackend::open(root)?;
+            let backend = FileBackend::open_existing(root)?;
             set_members.push(VdevSet::member(Vdev::new(slot.vdev_id, root.to_path_buf()), backend, lock));
         }
         let vdev_set = Arc::new(VdevSet::new(set_members, vdev_count));
@@ -2672,14 +2687,14 @@ impl Pool {
             .into_iter()
             .filter_map(|s| s.root)
             .map(|root| {
-                std::fs::read_dir(root.join("segments").join("delta"))
-                    .into_iter()
-                    .flatten()
-                    .flatten()
-                    .map(|shard| std::fs::read_dir(shard.path()).into_iter().flatten().flatten()
-                        .filter(|f| f.path().extension().is_some_and(|x| x == "dseg"))
-                        .count())
-                    .sum::<usize>()
+                segment::device(&root)
+                    .map(|d| {
+                        d.segments()
+                            .into_iter()
+                            .filter(|(k, _)| matches!(k, lchfs_device::SegmentKind::Delta { .. }))
+                            .count()
+                    })
+                    .unwrap_or(0)
             })
             .sum()
     }
@@ -2789,10 +2804,9 @@ impl PoolShared {
                 for (writer, records) in SegmentWriter::reopen_open_replicas(devices, id, kind) {
                     let vdev_id = writer.vdev_ids()[0];
                     if records == 0 {
-                        let root = &writer.vdev_roots()[0];
-                        let path = segment::segment_path(root, id, kind);
+                        let root = writer.vdev_roots()[0].clone();
                         drop(writer);
-                        match std::fs::remove_file(path) {
+                        match segment::remove_segment(&root, id, kind) {
                             Ok(()) => removed += 1,
                             Err(e) => {
                                 tracing::error!("vdev {vdev_id}: cannot remove empty segment {id} ({e})");
@@ -3751,16 +3765,15 @@ impl PoolShared {
         }
         self.persisted_index.write().delete_vdev_locations(leaving)?;
         if let Some(member) = member {
-            let ring = backend::superblock_path(&member.vdev.root);
-            let keys = keyring::path_on(&member.vdev.root);
+            let root = member.vdev.root.clone();
             drop(member);
-            if ring.exists() {
-                std::fs::remove_file(ring)?;
+            if backend::ring_written(&root) {
+                backend::clear_ring(&root)?;
             }
             // The keyring goes with the superblock: a detached device must
             // not carry this pool's keys into whatever it is used for next.
-            if keys.exists() {
-                std::fs::remove_file(keys)?;
+            if keyring::exists_on(&root) {
+                keyring::remove_on(&root)?;
             }
         }
         self.run_checkpoint()?;
@@ -4183,7 +4196,7 @@ impl PoolShared {
         let root = self.vdev_root(vdev_id).ok()?;
         [StreamKind::Data, StreamKind::Meta]
             .into_iter()
-            .find(|&k| segment::segment_path(&root, segment_id, k).exists())
+            .find(|&k| segment::segment_exists(&root, segment_id, k))
     }
 
     /// A striped read that had to reconstruct is the cold-data failover
@@ -4481,7 +4494,7 @@ impl PoolShared {
                 )));
             }
         };
-        std::fs::create_dir_all(new_root)?;
+        prepare_device(new_root)?;
         let lock = acquire_pool_lock(new_root)?;
         require_blank_device(new_root)?;
         let backend = FileBackend::open(new_root)?;
@@ -4527,13 +4540,13 @@ impl PoolShared {
     /// they are acquired now.
     fn online_vdev(&self, root: &Path) -> Result<(u16, ResilverReport), PoolError> {
         let _one_at_a_time = self.attach_lock.lock();
-        if !backend::superblock_path(root).exists() {
+        if !backend::ring_written(root) {
             return Err(PoolError::Format(format!(
                 "{} holds no superblock; a blank device is attached, not brought online",
                 root.display()
             )));
         }
-        let probe = FileBackend::open(root)?;
+        let probe = FileBackend::open_existing(root)?;
         let slot = read_superblock(&probe)?.ok_or_else(|| {
             PoolError::Format(format!("no valid superblock found at {}", root.display()))
         })?;
@@ -4620,7 +4633,7 @@ impl PoolShared {
             Some(member) => member,
             None => {
                 let lock = acquire_pool_lock(root)?;
-                let backend = FileBackend::open(root)?;
+                let backend = FileBackend::open_existing(root)?;
                 VdevSet::member(Vdev::new(id, root.to_path_buf()), backend, lock)
             }
         };
@@ -5786,24 +5799,32 @@ impl PoolShared {
     }
 
     /// Filesystem-wide usage stats for `statfs` (ARCHITECTURE.md §9).
-    /// Block-level numbers come straight from the underlying filesystem at
-    /// `pool_root` (`nix::sys::statvfs`) -- a pool has no fixed capacity of
-    /// its own, it just grows on-disk, so the host filesystem's free space
-    /// *is* the meaningful "how much more can I write" answer. Inode counts
-    /// come from `Pool` itself: `files` is the live inode count, `ffree` a
-    /// generous constant since `next_ino` is a monotonic in-memory counter
-    /// with no real ceiling, not a fixed-size table.
+    /// Block-level numbers are the devices' segment space (their zones):
+    /// every online device holds a copy of what is written, so the pool
+    /// can take what its fullest device can, and holds what its smallest
+    /// does. Inode counts come from `Pool` itself: `files` is the live
+    /// inode count, `ffree` a generous constant since `next_ino` is a
+    /// monotonic in-memory counter with no real ceiling, not a fixed-size
+    /// table.
     fn statfs(&self) -> Result<PoolStats, PoolError> {
-        let root = self.vdevs.primary_root().unwrap_or_else(|| self.pool_root.clone());
-        let vfs = nix::sys::statvfs::statvfs(root.as_path())
-            .map_err(|e| PoolError::Io(std::io::Error::from(e)))?;
+        const BLOCK: u64 = 4096;
+        let mut total = u64::MAX;
+        let mut free = u64::MAX;
+        for vdev in self.vdevs.online() {
+            let (t, f) = segment::device(&vdev.root)?.capacity();
+            total = total.min(t);
+            free = free.min(f);
+        }
+        if total == u64::MAX {
+            (total, free) = (0, 0);
+        }
         let files_total = self.namespace.lock().inodes.len() as u64;
         Ok(PoolStats {
-            block_size: vfs.block_size() as u32,
-            fragment_size: vfs.fragment_size() as u32,
-            blocks_total: vfs.blocks(),
-            blocks_free: vfs.blocks_free(),
-            blocks_available: vfs.blocks_available(),
+            block_size: BLOCK as u32,
+            fragment_size: BLOCK as u32,
+            blocks_total: total / BLOCK,
+            blocks_free: free / BLOCK,
+            blocks_available: free / BLOCK,
             files_total,
             files_free: u32::MAX as u64,
             name_max: 255,
@@ -6600,8 +6621,10 @@ fn mount_read_delta(
 /// be this pool's, and only a key can tell.
 pub fn keyring_present(roots: &[&Path], pool_uuid: [u8; 16]) -> bool {
     roots.iter().any(|root| {
-        std::fs::read(keyring::path_on(root))
-            .is_ok_and(|bytes| keyring::parse(&bytes).map_or(true, |k| k.body().pool_uuid == pool_uuid))
+        keyring::read_on(root)
+            .ok()
+            .flatten()
+            .is_some_and(|bytes| keyring::parse(&bytes).map_or(true, |k| k.body().pool_uuid == pool_uuid))
     })
 }
 
@@ -6649,7 +6672,7 @@ fn unlock_pool(
     let mut ours: Vec<&Path> = Vec::new();
     let mut foreign: Vec<&Path> = Vec::new();
     for &root in roots {
-        let Ok(bytes) = std::fs::read(keyring::path_on(root)) else { continue };
+        let Ok(Some(bytes)) = keyring::read_on(root) else { continue };
         match keyring::parse(&bytes) {
             Ok(k) if k.body().pool_uuid == pool_uuid => ours.push(root),
             Ok(_) => {
@@ -6700,22 +6723,15 @@ fn unlock_pool(
 /// opening anything; 0 if there are none. What the id allocator has to
 /// respect on every vdev, not just the one whose readers it opened.
 fn highest_segment_id_on(vdev_root: &Path) -> Result<u64, PoolError> {
-    let mut max = 0u64;
-    for sub in ["data", "meta"] {
-        let dir = vdev_root.join("segments").join(sub);
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
-        for entry in entries {
-            let name = entry?.file_name();
-            let stem = Path::new(&name)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("");
-            if let Ok(id) = stem.parse::<u64>() {
-                max = max.max(id);
-            }
-        }
-    }
-    Ok(max)
+    // Stripe shards share the id space with the segments they replaced.
+    let Ok(dev) = segment::device(vdev_root) else { return Ok(0) };
+    Ok(dev
+        .segments()
+        .into_iter()
+        .filter(|(k, _)| !matches!(k, lchfs_device::SegmentKind::Delta { .. }))
+        .map(|(_, id)| id)
+        .max()
+        .unwrap_or(0))
 }
 
 /// Opens a `SegmentReader` for every existing segment file under
@@ -6729,35 +6745,9 @@ fn open_all_segment_readers(pool_root: &Path, vdev_id: u16) -> Result<(SegmentRe
     let mut readers = HashMap::new();
     let mut max_segment_id = 0u64;
     for kind in [StreamKind::Data, StreamKind::Meta] {
-        let sub = match kind {
-            StreamKind::Data => "data",
-            StreamKind::Meta => "meta",
-            StreamKind::Delta => {
-                unreachable!("this loop only ever iterates Data/Meta; Delta streams are shard-scoped, see delta_log.rs")
-            }
-        };
-        let dir = pool_root.join("segments").join(sub);
-        if !dir.is_dir() {
-            continue;
-        }
-        let expected_ext = match kind {
-            StreamKind::Data => "aseg",
-            _ => "mseg",
-        };
-        let mut entries: Vec<_> = std::fs::read_dir(&dir)?.collect::<Result<_, _>>()?;
-        entries.sort_by_key(|e| e.file_name());
-        for entry in entries {
-            let file_name = entry.file_name();
-            let path = Path::new(&file_name);
-            // Shard files (`<id>.ec<i>`) share the directory and the id;
-            // they are not segments and are read through stripe.rs.
-            if path.extension().and_then(|e| e.to_str()) != Some(expected_ext) {
-                continue;
-            }
-            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-            let Ok(segment_id) = stem.parse::<u64>() else {
-                continue;
-            };
+        // Stripe shards share the id space but are not segments of the
+        // stream; they are read through stripe.rs.
+        for segment_id in segment::segment_ids_on(pool_root, kind) {
             max_segment_id = max_segment_id.max(segment_id);
             let reader = SegmentReader::open(pool_root, segment_id, kind)?;
             readers.insert((vdev_id, segment_id, kind), reader);
@@ -6789,10 +6779,7 @@ fn scan_segments(
 fn rebuild_index(index_file: &Path, vdevs: &[Vdev], generation: u64) -> Result<RedbIndex, PoolError> {
     let mut index = match RedbIndex::open(index_file) {
         Ok(idx) => idx,
-        Err(_) => {
-            let _ = std::fs::remove_file(index_file);
-            RedbIndex::create(index_file)?
-        }
+        Err(_) => RedbIndex::create(index_file)?,
     };
     // Every device gets its own scan, because its copies sit at its own
     // offsets and an index that knew only the primary's would leave read
@@ -6936,16 +6923,22 @@ fn check_membership<'a>(given_roots: &[&'a Path], allow_missing: bool) -> Result
     }
     let mut members: Vec<(SuperblockSlot, &Path)> = Vec::with_capacity(given_roots.len());
     for root in given_roots {
-        // `FileBackend::open` creates a directory and an empty ring where
-        // there is none; a path that is merely wrong must not gain a pool
-        // skeleton for having been named.
-        if !backend::superblock_path(root).exists() {
+        // `FileBackend::open` formats a device that has no layout; a path
+        // that is merely wrong must not be formatted for having been
+        // named. A device that is there but will not open (in use by a
+        // mount, say) says so, rather than looking unformatted.
+        if let Err(e) = lchfs_device::Device::open(root)
+            && !matches!(e.kind(), std::io::ErrorKind::InvalidData | std::io::ErrorKind::NotFound)
+        {
+            return Err(e.into());
+        }
+        if !lchfs_device::is_formatted(root) || !backend::ring_written(root) {
             return Err(PoolError::Format(format!(
                 "no valid superblock found at {} — was create-pool run?",
                 root.display()
             )));
         }
-        let backend = FileBackend::open(root)?;
+        let backend = FileBackend::open_existing(root)?;
         let slot = read_superblock(&backend)?.ok_or_else(|| {
             PoolError::Format(format!(
                 "no valid superblock found at {} — was create-pool run?",
@@ -7042,8 +7035,8 @@ fn check_membership<'a>(given_roots: &[&'a Path], allow_missing: bool) -> Result
 /// would be truncated by the next fresh writer. The caller wipes; this
 /// refuses.
 fn require_blank_device(root: &Path) -> Result<(), PoolError> {
-    if backend::superblock_path(root).exists() {
-        let backend = FileBackend::open(root)?;
+    if backend::ring_written(root) {
+        let backend = FileBackend::open_existing(root)?;
         if read_superblock(&backend)?.is_some() {
             return Err(PoolError::AlreadyExists(root.display().to_string()));
         }
@@ -7052,36 +7045,43 @@ fn require_blank_device(root: &Path) -> Result<(), PoolError> {
     // failed part-way -- would claim whatever pool is built here next.
     if keyring::exists_on(root) {
         return Err(PoolError::AlreadyExists(format!(
-            "{} holds a keyring from another pool; a device joining a pool must be blank (remove {} if that pool is gone)",
+            "{} holds a keyring from another pool; a device joining a pool must be blank (reformat it if that \
+             pool is gone)",
             root.display(),
-            keyring::path_on(root).display()
         )));
     }
-    let segments = root.join("segments");
-    if segments.is_dir() && std::fs::read_dir(&segments)?.next().is_some() {
+    if segment::device(root).is_ok_and(|d| !d.segments().is_empty()) {
         return Err(PoolError::AlreadyExists(format!(
-            "{} has a segments/ tree; a device joining a pool must be blank",
+            "{} holds segments; a device joining a pool must be blank",
             root.display()
         )));
     }
     Ok(())
 }
 
+/// Takes the exclusive pool lock on a device: an advisory lock on the
+/// device file itself (it used to be a `LOCK` file beside the pool).
 fn acquire_pool_lock(pool_root: &Path) -> Result<Flock<std::fs::File>, PoolError> {
-    let path = pool_root.join("LOCK");
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&path)?;
-    match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
-        Ok(guard) => Ok(guard),
-        Err((_, Errno::EWOULDBLOCK)) => {
-            Err(PoolError::PoolLocked(pool_root.display().to_string()))
+    let path = lchfs_device::resolve(pool_root);
+    // On a block device, udev takes a shared lock for as long as it
+    // probes the device, which it does after every close of a writer --
+    // so a lock refused there is most likely udev, briefly. Another pool
+    // on the device is kept out by the exclusive open anyway. Wait it
+    // out; an image file has no such visitor.
+    let patience = if lchfs_device::is_block_device(&path) { 50 } else { 0 };
+    let mut file = std::fs::OpenOptions::new().read(true).open(&path)?;
+    for attempt in 0..=patience {
+        match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+            Ok(guard) => return Ok(guard),
+            Err((f, Errno::EWOULDBLOCK)) if attempt < patience => {
+                file = f;
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err((_, Errno::EWOULDBLOCK)) => break,
+            Err((_, errno)) => return Err(PoolError::Io(std::io::Error::from(errno))),
         }
-        Err((_, errno)) => Err(PoolError::Io(std::io::Error::from(errno))),
     }
+    Err(PoolError::PoolLocked(pool_root.display().to_string()))
 }
 
 /// Clamped `[offset, offset+len)` slice of an in-memory buffer, returning
@@ -7092,7 +7092,7 @@ fn slice_of(buf: &[u8], offset: u64, len: u32) -> Bytes {
     Bytes::copy_from_slice(&buf[start..end])
 }
 
-/// An opaque, RAII hold on a pool's `LOCK` file, released on drop. Keeps
+/// An opaque, RAII hold on a pool device's lock, released on drop. Keeps
 /// `nix`'s `Flock` out of this crate's public API.
 #[derive(Debug)]
 pub struct PoolLockGuard(#[allow(dead_code)] Flock<std::fs::File>);

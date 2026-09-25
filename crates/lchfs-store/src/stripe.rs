@@ -1,28 +1,25 @@
 //! Erasure-coded segments (ARCHITECTURE.md §17.2): a sealed data segment's
 //! body split into `k` data shards plus `m` Reed-Solomon parity shards,
-//! one shard file per device, replacing its N mirror copies. The write
+//! one shard per device, replacing its N mirror copies. The write
 //! path never sees this; a segment is striped by the coalescing daemon
 //! once it is cold, and read back through `StripeReader`, which serves a
 //! record from the one shard that holds it in the common case and
 //! reconstructs from any `k` shards when one is missing.
 //!
 //! Nothing here is ever updated in place. A stripe is written once; a
-//! missing shard is rebuilt as a new file; a repack decodes the live
+//! missing shard is rebuilt as a new one; a repack decodes the live
 //! records into a fresh *mirrored* segment. The append-only invariant
 //! holds for shards as it does for everything else.
 
 use crate::backend::Vdev;
-use crate::segment::{
-    SEGMENT_HEADER_PAGE_SIZE, SegmentError, decode_record_bytes, segment_dir, verify_record_with,
-};
+use crate::segment::{SEGMENT_HEADER_PAGE_SIZE, SegmentError, decode_record_bytes, device, verify_record_with};
+use lchfs_device::{SegmentFile, SegmentKind};
 use lchfs_format::{
     ExtentLocation, ExtentRecordHeader, Hash32, RecordCrypto, SEGMENT_HEADER_MAGIC, STRIPE_DESCRIPTOR_OFFSET,
     SegmentHeader, SegmentState, StreamKind, StripeDescriptor, finalize_segment_header_checksum,
 };
 use reed_solomon_erasure::galois_8::ReedSolomon;
-use std::fs::File;
 use std::io;
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 /// The `vdev_id` a striped record's index entry is keyed under (§17.2.2).
@@ -34,26 +31,31 @@ pub const STRIPED: u16 = lchfs_index::STRIPED_VDEV;
 /// Shard files are aligned to this so a shard boundary is a page boundary.
 const SHARD_ALIGN: u64 = 4096;
 
-/// `segments/data/<segment_id>.ec<shard_index>` under a device root.
-pub fn shard_path(root: &Path, segment_id: u64, shard_index: u8) -> PathBuf {
-    segment_dir(root, StreamKind::Data).join(format!("{segment_id}.ec{shard_index}"))
+/// The device's name for shard `shard_index` of a striped segment.
+pub fn shard_kind(shard_index: u8) -> SegmentKind {
+    SegmentKind::StripeShard { index: shard_index }
 }
 
-/// Every shard index present for `segment_id` under `root`.
+/// Every shard index present for `segment_id` on the device at `root`.
 pub fn shards_on(root: &Path, segment_id: u64) -> Vec<u8> {
-    let prefix = format!("{segment_id}.ec");
-    let mut out = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(segment_dir(root, StreamKind::Data)) {
-        for e in rd.flatten() {
-            if let Some(rest) = e.file_name().to_str().and_then(|n| n.strip_prefix(&prefix))
-                && let Ok(i) = rest.parse::<u8>()
-            {
-                out.push(i);
-            }
-        }
-    }
-    out.sort_unstable();
-    out
+    let Ok(dev) = device(root) else { return Vec::new() };
+    dev.segments()
+        .into_iter()
+        .filter_map(|(kind, id)| match kind {
+            SegmentKind::StripeShard { index } if id == segment_id => Some(index),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Opens shard `shard_index` of `segment_id` on the device at `root`.
+pub fn open_shard(root: &Path, segment_id: u64, shard_index: u8) -> io::Result<SegmentFile> {
+    device(root)?.open_segment(shard_kind(shard_index), segment_id)
+}
+
+/// Deletes shard `shard_index` of `segment_id` from the device at `root`.
+pub fn remove_shard(root: &Path, segment_id: u64, shard_index: u8) -> io::Result<()> {
+    device(root)?.remove_segment(shard_kind(shard_index), segment_id)
 }
 
 /// Every segment id with a shard file on any of `vdevs`, ascending.
@@ -79,20 +81,15 @@ pub fn descriptor_is_sane(d: &StripeDescriptor) -> bool {
         && d.logical_len <= d.shard_size.saturating_mul(d.k as u64)
 }
 
-/// Every segment id that has at least one shard file under `root`.
+/// Every segment id that has at least one shard on the device at `root`.
 pub fn segment_ids_with_shards(root: &Path) -> Vec<u64> {
-    let mut out = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(segment_dir(root, StreamKind::Data)) {
-        for e in rd.flatten() {
-            if let Some(name) = e.file_name().to_str()
-                && let Some((stem, ext)) = name.split_once('.')
-                && ext.starts_with("ec")
-                && let Ok(id) = stem.parse::<u64>()
-            {
-                out.push(id);
-            }
-        }
-    }
+    let Ok(dev) = device(root) else { return Vec::new() };
+    let mut out: Vec<u64> = dev
+        .segments()
+        .into_iter()
+        .filter(|(kind, _)| matches!(kind, SegmentKind::StripeShard { .. }))
+        .map(|(_, id)| id)
+        .collect();
     out.sort_unstable();
     out.dedup();
     out
@@ -119,17 +116,14 @@ pub fn scan_body(body: &[u8]) -> Vec<(ExtentRecordHeader, u32)> {
     out
 }
 
-/// A shard is written only where the device's ring is: never into the
-/// empty path a pulled device leaves behind.
-fn require_device(root: &Path) -> io::Result<()> {
-    if crate::backend::superblock_path(root).is_file() {
-        Ok(())
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("{} has no superblock; not writing a shard there", root.display()),
-        ))
-    }
+/// Writes one shard -- header page, then its bytes -- as a fresh
+/// segment, and syncs it. A shard is only written on a formatted device:
+/// never on whatever a pulled device's path now holds.
+fn write_shard(root: &Path, segment_id: u64, desc: &StripeDescriptor, bytes: &[u8]) -> io::Result<()> {
+    let file = device(root)?.create_segment(shard_kind(desc.shard_index), segment_id)?;
+    write_shard_header(&file, segment_id, desc)?;
+    file.write_all_at(bytes, SEGMENT_HEADER_PAGE_SIZE)?;
+    file.sync_all()
 }
 
 fn rs(k: u8, m: u8) -> io::Result<ReedSolomon> {
@@ -137,9 +131,9 @@ fn rs(k: u8, m: u8) -> io::Result<ReedSolomon> {
 }
 
 /// Splits `body` (a sealed segment's bytes after its header page) into
-/// `k` data shards, computes `m` parity shards, and writes one shard file
-/// on each of `devices` (which must be exactly `k + m` long). Every file
-/// is fsync'd before this returns. Returns the descriptor shard 0 was
+/// `k` data shards, computes `m` parity shards, and writes one shard on
+/// each of `devices` (which must be exactly `k + m` long). Every shard is
+/// synced before this returns. Returns the descriptor shard 0 was
 /// written with; the others differ only in `shard_index`/`shard_hash`.
 pub fn write_stripe(
     body: &[u8],
@@ -182,18 +176,7 @@ pub fn write_stripe(
             body_hash,
             shard_hash: Hash32::of(shard),
         };
-        require_device(&vdev.root)?;
-        std::fs::create_dir_all(segment_dir(&vdev.root, StreamKind::Data))?;
-        let path = shard_path(&vdev.root, segment_id, i as u8);
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)?;
-        write_shard_header(&file, segment_id, &desc)?;
-        file.write_all_at(shard, SEGMENT_HEADER_PAGE_SIZE)?;
-        file.sync_all()?;
+        write_shard(&vdev.root, segment_id, &desc, shard)?;
         if first.is_none() {
             first = Some(desc);
         }
@@ -210,21 +193,10 @@ pub fn rebuild_shard(reader: &StripeReader, shard_index: u8, onto: &Vdev) -> io:
     let mut mine = desc.clone();
     mine.shard_index = shard_index;
     mine.shard_hash = Hash32::of(&shard);
-    require_device(&onto.root)?;
-    std::fs::create_dir_all(segment_dir(&onto.root, StreamKind::Data))?;
-    let path = shard_path(&onto.root, reader.segment_id, shard_index);
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&path)?;
-    write_shard_header(&file, reader.segment_id, &mine)?;
-    file.write_all_at(&shard, SEGMENT_HEADER_PAGE_SIZE)?;
-    file.sync_all()
+    write_shard(&onto.root, reader.segment_id, &mine, &shard)
 }
 
-fn write_shard_header(file: &File, segment_id: u64, desc: &StripeDescriptor) -> io::Result<()> {
+fn write_shard_header(file: &SegmentFile, segment_id: u64, desc: &StripeDescriptor) -> io::Result<()> {
     let mut header = SegmentHeader {
         magic: SEGMENT_HEADER_MAGIC,
         segment_id,
@@ -251,9 +223,9 @@ fn write_shard_header(file: &File, segment_id: u64, desc: &StripeDescriptor) -> 
     file.write_all_at(&page, 0)
 }
 
-/// Reads a shard file's descriptor. `None` if the file is not a shard.
-pub fn read_descriptor(path: &Path) -> io::Result<Option<StripeDescriptor>> {
-    let file = File::open(path)?;
+/// Reads a shard's descriptor. `None` if what is there is not a shard.
+pub fn read_descriptor(root: &Path, segment_id: u64, shard_index: u8) -> io::Result<Option<StripeDescriptor>> {
+    let file = open_shard(root, segment_id, shard_index)?;
     let mut page = vec![0u8; SEGMENT_HEADER_PAGE_SIZE as usize];
     file.read_exact_at(&mut page, 0)?;
     Ok(parse_descriptor_page(&page))
@@ -290,25 +262,25 @@ pub fn parse_descriptor_page(page: &[u8]) -> Option<StripeDescriptor> {
 pub struct StripeReader {
     pub segment_id: u64,
     pub desc: StripeDescriptor,
-    /// Shard files by shard index; `None` where the shard's device is not
-    /// among those offered, or the file is missing.
-    shards: Vec<Option<File>>,
-    /// Where each opened shard came from, same order.
-    paths: Vec<Option<PathBuf>>,
+    /// Shards by shard index; `None` where the shard's device is not
+    /// among those offered, or the shard is missing or incomplete.
+    shards: Vec<Option<SegmentFile>>,
+    /// The device each shard is on, same order.
+    roots: Vec<Option<PathBuf>>,
 }
 
 impl StripeReader {
     /// Opens the stripe for `segment_id` using `root_of` to find each
-    /// shard's device. The descriptor comes from the first shard file
-    /// found; devices that are offline simply contribute no shard.
+    /// shard's device. The descriptor comes from the first shard found;
+    /// devices that are offline simply contribute no shard.
     pub fn open(segment_id: u64, root_of: impl Fn(u16) -> Option<PathBuf>, candidates: &[Vdev]) -> io::Result<Self> {
         // The descriptor comes from the first shard whose header page
-        // reads, parses and makes sense; a truncated or rotted shard file
-        // is skipped, not fatal -- its siblings may be fine.
+        // reads, parses and makes sense; a truncated or rotted shard is
+        // skipped, not fatal -- its siblings may be fine.
         let mut desc = None;
         'find: for vdev in candidates {
             for i in shards_on(&vdev.root, segment_id) {
-                if let Ok(Some(d)) = read_descriptor(&shard_path(&vdev.root, segment_id, i))
+                if let Ok(Some(d)) = read_descriptor(&vdev.root, segment_id, i)
                     && descriptor_is_sane(&d)
                 {
                     desc = Some(d);
@@ -322,29 +294,25 @@ impl StripeReader {
                 format!("no usable shard of segment {segment_id} on any offered device"),
             ));
         };
-        let paths: Vec<Option<PathBuf>> = desc
-            .devices
+        let roots: Vec<Option<PathBuf>> = desc.devices.iter().map(|&vdev_id| root_of(vdev_id)).collect();
+        // A shard is exactly a header page plus `shard_size` bytes; any
+        // other length is treated as absent, so a torn write never sizes
+        // a read.
+        let expected_len = SEGMENT_HEADER_PAGE_SIZE + desc.shard_size;
+        let shards = roots
             .iter()
             .enumerate()
-            .map(|(i, &vdev_id)| root_of(vdev_id).map(|root| shard_path(&root, segment_id, i as u8)))
-            .collect();
-        // A shard file is exactly a header page plus `shard_size` bytes;
-        // anything else is treated as absent, so a torn write never
-        // sizes a read.
-        let expected_len = SEGMENT_HEADER_PAGE_SIZE + desc.shard_size;
-        let shards = paths
-            .iter()
-            .map(|p| {
-                p.as_ref()
-                    .and_then(|p| File::open(p).ok())
-                    .filter(|f| f.metadata().is_ok_and(|m| m.len() == expected_len))
+            .map(|(i, r)| {
+                r.as_ref()
+                    .and_then(|root| open_shard(root, segment_id, i as u8).ok())
+                    .filter(|f| f.len() == expected_len)
             })
             .collect();
         Ok(Self {
             segment_id,
             desc,
             shards,
-            paths,
+            roots,
         })
     }
 
@@ -353,7 +321,7 @@ impl StripeReader {
         self.shards.iter().filter(|s| s.is_some()).count()
     }
 
-    /// Shard indices with no readable file.
+    /// Shard indices with no readable shard.
     pub fn missing(&self) -> Vec<u8> {
         self.shards
             .iter()
@@ -367,7 +335,7 @@ impl StripeReader {
         self.desc.k as usize + self.desc.m as usize
     }
 
-    /// Reads `[start, end)` of shard `i` directly, if its file is present.
+    /// Reads `[start, end)` of shard `i` directly, if it is present.
     fn read_shard_range(&self, i: usize, start: u64, end: u64) -> io::Result<Option<Vec<u8>>> {
         let Some(file) = &self.shards[i] else { return Ok(None) };
         let mut buf = vec![0u8; (end - start) as usize];
@@ -573,15 +541,15 @@ impl StripeReader {
         })
     }
 
-    /// Verifies one shard file's bytes against the hash in its own
+    /// Verifies one shard's bytes against the hash in its own
     /// descriptor. `Ok(false)` when the shard is unreadable or does not
     /// match; either way it needs rebuilding.
     pub fn verify_shard(&self, i: u8) -> io::Result<bool> {
-        let Some(path) = &self.paths[i as usize] else { return Ok(false) };
+        let Some(root) = &self.roots[i as usize] else { return Ok(false) };
         let Some(bytes) = self.read_shard_range(i as usize, 0, self.desc.shard_size)? else {
             return Ok(false);
         };
-        let Some(own) = read_descriptor(path)? else { return Ok(false) };
+        let Some(own) = read_descriptor(root, self.segment_id, i)? else { return Ok(false) };
         Ok(own.shard_index == i && Hash32::of(&bytes) == own.shard_hash)
     }
 }

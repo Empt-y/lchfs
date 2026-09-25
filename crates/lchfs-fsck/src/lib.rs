@@ -11,7 +11,7 @@
 //! code. Everything this crate reads (segment file layout, the superblock
 //! ring's on-disk encoding) is the documented on-disk format from
 //! ARCHITECTURE.md §1, reconstructed here from lchfs-store's genuinely
-//! public API (`segment::SegmentReader`, `backend::FileBackend`) rather
+//! public API (`segment::SegmentReader`, `lchfs_device`) rather
 //! than any `pub(crate)`-only helper.
 
 pub mod stripes;
@@ -22,7 +22,6 @@ use lchfs_format::{
     SUPERBLOCK_SLOT_COUNT, SUPERBLOCK_SLOT_SIZE, SuperblockSlot, compute_superblock_slot_checksum,
 };
 use lchfs_index::{IndexStore, RedbIndex, STRIPED_VDEV};
-use lchfs_store::backend::{FileBackend, StorageBackend};
 use lchfs_store::segment::{SegmentError, SegmentReader};
 use serde::de::DeserializeOwned;
 use std::collections::{HashMap, HashSet};
@@ -157,23 +156,8 @@ pub struct Scanned {
 pub fn scan_all_segments_reporting(pool_root: &Path) -> Result<Scanned, FsckError> {
     let mut locations = HashMap::new();
     let mut damaged = Vec::new();
-    for (sub, kind, ext) in [("data", StreamKind::Data, "aseg"), ("meta", StreamKind::Meta, "mseg")] {
-        let dir = pool_root.join("segments").join(sub);
-        let Ok(read_dir) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        let mut ids: Vec<u64> = read_dir
-            .flatten()
-            .filter(|e| e.path().extension().is_some_and(|x| x == ext))
-            .filter_map(|e| {
-                e.path()
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .and_then(|s| s.parse::<u64>().ok())
-            })
-            .collect();
-        ids.sort_unstable();
-        for segment_id in ids {
+    for kind in [StreamKind::Data, StreamKind::Meta] {
+        for segment_id in lchfs_store::segment::segment_ids_on(pool_root, kind) {
             let reader = SegmentReader::open(pool_root, segment_id, kind)
                 .map_err(|e| FsckError::Io(format!("opening segment {segment_id}: {e}")))?;
             let mut scan = reader.scan();
@@ -186,7 +170,7 @@ pub fn scan_all_segments_reporting(pool_root: &Path) -> Result<Scanned, FsckErro
             for &(from, to) in &scan.damaged {
                 damaged.push(FsckError::DamagedRegion {
                     segment_id,
-                    stream: sub,
+                    stream: if kind == StreamKind::Data { "data" } else { "meta" },
                     from,
                     to,
                 });
@@ -228,13 +212,14 @@ fn device_ids<'a>(vdev_roots: &[&'a Path]) -> Result<Vec<(u16, &'a Path)>, FsckE
 /// shared with it -- see this module's doc comment): every slot's magic,
 /// header checksum, then the highest-generation CRC-valid slot wins.
 pub fn read_superblock(pool_root: &Path) -> Result<SuperblockSlot, FsckError> {
-    let backend = FileBackend::open(pool_root)
-        .map_err(|e| FsckError::Io(format!("opening superblock: {e}")))?;
+    // Read-only and shared: this identifies a device even while a mount
+    // holds it exclusively.
+    let ring = lchfs_device::peek_superblock_ring(pool_root)
+        .map_err(|e| FsckError::Io(format!("reading superblock: {e}")))?;
     let mut best: Option<SuperblockSlot> = None;
     for slot_idx in 0..SUPERBLOCK_SLOT_COUNT {
-        let bytes = backend
-            .read_at(slot_idx as u64 * SUPERBLOCK_SLOT_SIZE as u64, SUPERBLOCK_SLOT_SIZE as u32)
-            .map_err(|e| FsckError::Io(format!("reading superblock slot {slot_idx}: {e}")))?;
+        let at = slot_idx as usize * SUPERBLOCK_SLOT_SIZE;
+        let Some(bytes) = ring.get(at..at + SUPERBLOCK_SLOT_SIZE) else { continue };
         if bytes.len() < 4 {
             continue;
         }
@@ -330,7 +315,7 @@ fn keyring_roots<'a>(vdev_roots: &[&'a Path]) -> Vec<&'a Path> {
         .iter()
         .copied()
         .filter(|r| {
-            std::fs::read(lchfs_crypto::keyring::path_on(r)).is_ok_and(|bytes| {
+            lchfs_crypto::keyring::read_on(r).ok().flatten().is_some_and(|bytes| {
                 lchfs_crypto::keyring::parse(&bytes).map_or(true, |k| Some(k.body().pool_uuid) == uuid)
             })
         })
@@ -732,7 +717,7 @@ pub fn verify_index_devices_with(
             return report;
         }
     };
-    let index = match RedbIndex::open(&pool_root.join("INDEX.redb")) {
+    let index = match RedbIndex::open(pool_root) {
         Ok(idx) => idx,
         Err(e) => {
             let mut report = FsckReport::default();
@@ -795,12 +780,11 @@ pub fn rebuild_index(pool_root: &Path, other_vdevs: &[&Path]) -> Result<(), Fsck
         scans.push((other.vdev_id, scan_all_segments(root)?));
     }
 
-    let index_path = pool_root.join("INDEX.redb");
-    // Always start from an empty file: a rebuild that kept old entries
-    // would keep an entry for a replica that no longer exists, which is
-    // exactly the kind of stale pointer a rebuild is asked to clear.
-    let _ = std::fs::remove_file(&index_path);
-    let mut index = RedbIndex::create(&index_path).map_err(|e| FsckError::Io(e.to_string()))?;
+    // Always start from an empty index (`create` erases the old one): a
+    // rebuild that kept old entries would keep an entry for a replica that
+    // no longer exists, which is exactly the kind of stale pointer a
+    // rebuild is asked to clear.
+    let mut index = RedbIndex::create(pool_root).map_err(|e| FsckError::Io(e.to_string()))?;
     for (vdev_id, locations) in &scans {
         for (&hash, &loc) in locations {
             index
@@ -1064,9 +1048,9 @@ pub fn check_keyrings(vdev_roots: &[&Path]) -> FsckReport {
     let uuid = read_superblock(vdev_roots[0]).map(|s| s.pool_uuid).ok();
     let mut ours: Vec<(u16, &Path, u64)> = Vec::new();
     for &(vdev_id, root) in &devices {
-        let bytes = match std::fs::read(keyring::path_on(root)) {
-            Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        let bytes = match keyring::read_on(root) {
+            Ok(Some(b)) => b,
+            Ok(None) => {
                 report.warnings.push(FsckError::KeyringMissing { vdev_id });
                 continue;
             }

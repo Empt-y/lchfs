@@ -208,14 +208,11 @@ fn torn_delta_record_from_simulated_mid_fsync_crash_recovers_to_prior_state() {
     // continuous session, never reopened) -- truncate the file to
     // simulate a crash partway through appending the *second* fsync's
     // trailing record.
-    let seg_path = dir
-        .path()
-        .join(format!("segments/delta/{shard_id:05}/0.dseg"));
-    assert!(seg_path.is_file());
-    let len = std::fs::metadata(&seg_path).unwrap().len();
-    let file = std::fs::OpenOptions::new().write(true).open(&seg_path).unwrap();
-    file.set_len(len - 5).unwrap();
-    drop(file);
+    use lchfs_store::testing::{SegmentKind, segment_exists, segment_len, truncate_segment};
+    let delta = SegmentKind::Delta { shard: shard_id };
+    assert!(segment_exists(dir.path(), delta, 0));
+    let len = segment_len(dir.path(), delta, 0);
+    truncate_segment(dir.path(), delta, 0, len - 5);
 
     // Must recover cleanly (no panic/hard error) to at least the first
     // fsync's fully-intact state -- never a hard error, never garbage.
@@ -259,7 +256,7 @@ fn gc_mark_succeeds_after_checkpoint_following_fsync_only_crash_recovery() {
     let root = pool2.debug_root_hash();
     drop(pool2);
 
-    let index = lchfs_index::RedbIndex::open(&dir.path().join("INDEX.redb")).unwrap();
+    let index = lchfs_index::RedbIndex::open(dir.path()).unwrap();
     let cache = lchfs_index::ChunkLocationCache::new();
     cache.extend(index.iter_preferred_locations().unwrap());
     let mut gc = lchfs_store::gc::GcEngine::new(

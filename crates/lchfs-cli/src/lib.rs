@@ -19,9 +19,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Initialize a new pool at the given path.
+    /// Format a block device (a disk or partition) as a new pool. Everything
+    /// on it is lost.
     CreatePool {
         path: PathBuf,
+        /// Format the device even though it holds something already (a
+        /// partition table, a filesystem, data).
+        #[arg(long)]
+        force: bool,
         /// Erasure-code cold segments as K data + M parity shards once the
         /// pool has K+M devices (ARCHITECTURE.md §17.2). Both or neither.
         #[arg(long, requires = "stripe_m")]
@@ -36,7 +41,7 @@ enum Command {
         /// Any one of the pool's devices (vdev 0 unless --scan is given).
         pool: PathBuf,
         mountpoint: PathBuf,
-        /// The pool's other vdev roots (ARCHITECTURE.md §15.10). A
+        /// The pool's other devices (ARCHITECTURE.md §15.10). A
         /// replicated pool must be given every device unless --degraded.
         #[arg(long = "vdev")]
         vdevs: Vec<PathBuf>,
@@ -84,7 +89,7 @@ enum Command {
     Fsck {
         /// vdev 0's root.
         pool: PathBuf,
-        /// The pool's other vdev roots, for a replica comparison
+        /// The pool's other devices, for a replica comparison
         /// (ARCHITECTURE.md §15.8). Any order; each device's superblock
         /// says which slot it is.
         #[arg(long = "vdev")]
@@ -489,7 +494,10 @@ pub fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::CreatePool { path, stripe_k, stripe_m, encryption } => create_pool(&path, stripe_k, stripe_m, &encryption),
+        Command::CreatePool { path, force, stripe_k, stripe_m, encryption } => {
+            require_device(&path, force)?;
+            create_pool(&path, stripe_k, stripe_m, &encryption)
+        }
         Command::Mount { pool, mountpoint, vdevs, scan, degraded, unlock, require_encryption } => {
             let devices = DeviceArgs { vdevs, scan };
             mount(&pool, &devices, degraded, &unlock, require_encryption, &mountpoint)
@@ -505,6 +513,7 @@ pub fn run() -> anyhow::Result<()> {
             fsck(&roots, &options, &unlock)
         }
         Command::AttachVdev { pool, vdevs, new_device } => {
+            require_device(&new_device, false)?;
             let mut roots: Vec<&std::path::Path> = vec![pool.as_path()];
             roots.extend(vdevs.iter().map(|p| p.as_path()));
             let id = lchfs_store::Pool::attach_vdev(&roots, &new_device)?;
@@ -527,7 +536,7 @@ pub fn run() -> anyhow::Result<()> {
                 })?,
                 other => other?,
             };
-            println!("vdev {id} detached; its segment files can be deleted.");
+            println!("vdev {id} detached; the device can be reused.");
             Ok(())
         }
         Command::Pool { action: PoolAction::Encrypt { root, devices, slots, rate } } => {
@@ -759,7 +768,7 @@ struct FsckOptions {
 }
 
 fn fsck(roots: &[PathBuf], options: &FsckOptions, unlock: &UnlockArgs) -> anyhow::Result<()> {
-    // No `Pool::open` here: fsck deliberately reads the pool directory
+    // No `Pool::open` here: fsck deliberately reads the devices
     // directly (see lchfs-fsck's module doc comment) rather than going
     // through the live engine -- opening a `Pool` would also run mount-
     // time crash recovery and spawn its background checkpoint/coalesce/
@@ -779,7 +788,7 @@ fn fsck(roots: &[PathBuf], options: &FsckOptions, unlock: &UnlockArgs) -> anyhow
     }
     if options.rebuild_index {
         lchfs_fsck::rebuild_index(pool, other_vdevs)?;
-        println!("INDEX.redb rebuilt from {} vdev(s).", other_vdevs.len() + 1);
+        println!("Index rebuilt from {} vdev(s).", other_vdevs.len() + 1);
     }
 
     // An encrypted pool's records can only be verified with its key. With
@@ -882,7 +891,10 @@ fn pool_control(action: PoolAction) -> anyhow::Result<()> {
         PoolAction::Status { root } => (root, json!({ "cmd": "status" })),
         PoolAction::Scrub { root } => (root, json!({ "cmd": "scrub" })),
         PoolAction::Resilver { root, vdev } => (root, json!({ "cmd": "resilver", "vdev": vdev })),
-        PoolAction::Attach { root, device } => (root, json!({ "cmd": "attach", "path": abs(device)? })),
+        PoolAction::Attach { root, device } => (root, {
+            require_device(device, false)?;
+            json!({ "cmd": "attach", "path": abs(device)? })
+        }),
         PoolAction::Online { root, device } => (root, json!({ "cmd": "online", "path": abs(device)? })),
         PoolAction::Offline { root, vdev } => (root, json!({ "cmd": "offline", "vdev": vdev })),
         PoolAction::Promote { root } => (root, json!({ "cmd": "promote" })),
@@ -896,7 +908,7 @@ fn pool_control(action: PoolAction) -> anyhow::Result<()> {
         PoolAction::EncryptionStatus { root } => (root, json!({ "cmd": "encryption-status" })),
         PoolAction::Encrypt { .. } | PoolAction::Rekey { .. } => unreachable!("dispatched before"),
     };
-    let reply = control::request(&root.join(control::SOCKET_NAME), &req)?;
+    let reply = control::request(&control::socket_for_device(root)?, &req)?;
     println!("{}", serde_json::to_string_pretty(&reply)?);
     Ok(())
 }
@@ -905,7 +917,7 @@ fn pool_control(action: PoolAction) -> anyhow::Result<()> {
 fn pool_encrypt(root: &Path, devices: &DeviceArgs, slots: &SlotArgs, rate: Option<u64>) -> anyhow::Result<()> {
     use serde_json::json;
     let specs = slots.gather()?;
-    let socket = root.join(control::SOCKET_NAME);
+    let socket = control::socket_for_device(root)?;
     if control::is_live(&socket) {
         if let Some(r) = rate {
             control::request(&socket, &json!({ "cmd": "set-conversion-rate", "bytes_per_sec": r }))?;
@@ -939,7 +951,7 @@ fn pool_encrypt(root: &Path, devices: &DeviceArgs, slots: &SlotArgs, rate: Optio
 /// `pool rekey`: the proof is checked by whoever holds the keyring.
 fn pool_rekey(root: &Path, devices: &DeviceArgs, unlock_args: &UnlockArgs, rate: Option<u64>) -> anyhow::Result<()> {
     use serde_json::json;
-    let socket = root.join(control::SOCKET_NAME);
+    let socket = control::socket_for_device(root)?;
     if control::is_live(&socket) {
         if let Some(r) = rate {
             control::request(&socket, &json!({ "cmd": "set-conversion-rate", "bytes_per_sec": r }))?;
@@ -1042,7 +1054,7 @@ fn stats(pool: &std::path::Path) -> anyhow::Result<()> {
     println!("vdev: {} of {}", slot.vdev_id, slot.vdev_count);
     println!("generation: {}", slot.generation);
     println!("root_hash: {:?}", slot.root_hash);
-    match std::fs::read(lchfs_crypto::keyring::path_on(pool)).map(|b| lchfs_crypto::keyring::parse(&b)) {
+    match keyring_bytes(pool).map(|b| lchfs_crypto::keyring::parse(&b)) {
         Err(_) => println!("encrypted: no"),
         Ok(Ok(k)) => println!(
             "encrypted: yes (keyring generation {}, {} slot(s), current epoch {})",
@@ -1059,15 +1071,15 @@ fn stats(pool: &std::path::Path) -> anyhow::Result<()> {
     println!("object_count (denormalized, as of last checkpoint): {}", slot.stats.object_count);
     println!("segment_count (denormalized, as of last checkpoint): {}", slot.stats.segment_count);
 
-    let count_segments = |sub: &str| {
-        std::fs::read_dir(pool.join("segments").join(sub))
-            .map(|d| d.count())
-            .unwrap_or(0)
-    };
-    println!("data segments on disk: {}", count_segments("data"));
-    println!("meta segments on disk: {}", count_segments("meta"));
+    let device = lchfs_device::Device::open(pool)?;
+    let count_segments = |kind| device.segment_ids(kind).len();
+    println!("data segments on disk: {}", count_segments(lchfs_device::SegmentKind::Data));
+    println!("meta segments on disk: {}", count_segments(lchfs_device::SegmentKind::Meta));
+    let (total, free) = device.capacity();
+    println!("device: {} bytes; zone space {total} bytes, {free} free", device.label().device_size);
+    drop(device);
 
-    if let Ok(index) = lchfs_index::RedbIndex::open(&pool.join("INDEX.redb")) {
+    if let Ok(index) = lchfs_index::RedbIndex::open(pool) {
         let entries = index.iter_chunk_locations().map(|v| v.len()).unwrap_or(0);
         println!("index entries: {entries}");
         println!("index generation: {}", index.generation());
@@ -1230,7 +1242,7 @@ fn run_key_op_with(
             None => unlock::with_key(&target.unlock, what, attempt),
         }
     };
-    let socket = target.pool.join(control::SOCKET_NAME);
+    let socket = control::socket_for_device(&target.pool)?;
     let (result, unwritten) = if control::is_live(&socket) {
         // The JSON carries hex secrets: `SecretJson` zeroes every string
         // in it when it drops.
@@ -1294,7 +1306,7 @@ fn key_list(roots: &[PathBuf]) -> anyhow::Result<()> {
     let mut newest: Option<lchfs_crypto::keyring::LockedKeyring> = None;
     for root in roots {
         let vdev = lchfs_fsck::read_superblock(root).map(|s| s.vdev_id.to_string()).unwrap_or_else(|_| "?".into());
-        match std::fs::read(lchfs_crypto::keyring::path_on(root)) {
+        match keyring_bytes(root) {
             Err(_) => println!("vdev {vdev} ({}): no keyring", root.display()),
             Ok(bytes) => match lchfs_crypto::keyring::parse(&bytes) {
                 Err(e) => println!("vdev {vdev} ({}): keyring damaged: {e}", root.display()),
@@ -1349,7 +1361,7 @@ fn key_restore(file: &Path, target: &KeyTarget, force: bool) -> anyhow::Result<(
         .collect::<anyhow::Result<Vec<_>>>()?;
     let mut restored = 0;
     for root in &roots {
-        let intact = std::fs::read(lchfs_crypto::keyring::path_on(root))
+        let intact = keyring_bytes(root)
             .ok()
             .and_then(|b| lchfs_crypto::keyring::parse(&b).ok())
             .filter(|k| k.body().pool_uuid == uuid);
@@ -1374,6 +1386,52 @@ fn key_restore(file: &Path, target: &KeyTarget, force: bool) -> anyhow::Result<(
     Ok(())
 }
 
+/// A device's keyring bytes; `NotFound` when its keyring region is empty.
+fn keyring_bytes(root: &Path) -> std::io::Result<Vec<u8>> {
+    lchfs_crypto::keyring::read_on(root)?.ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no keyring"))
+}
+
+/// Set to `1` to let `create-pool` and the attach commands take a sparse
+/// image file (or a directory, for an `lchfs.img` inside it) instead of a
+/// block device. For tests and development: a pool belongs on a device.
+pub const ALLOW_IMAGES_ENV: &str = "LCHFS_ALLOW_IMAGES";
+
+/// Refuses to format anything that is not a block device, and a block
+/// device that holds something already unless `force`: formatting is the
+/// one command that destroys data it did not write.
+fn require_device(path: &Path, force: bool) -> anyhow::Result<()> {
+    let is_block = lchfs_device::is_block_device(path);
+    if !is_block && std::env::var_os(ALLOW_IMAGES_ENV).is_none_or(|v| v != "1") {
+        anyhow::bail!(
+            "{} is not a block device: a pool is created on a disk or partition (e.g. /dev/sdb1)",
+            path.display()
+        );
+    }
+    if !is_block || force || lchfs_device::is_formatted(path) {
+        // An LCHFS device's own checks (blank, not in another pool) are
+        // the engine's.
+        return Ok(());
+    }
+    use std::os::unix::fs::FileExt;
+    let file = std::fs::File::open(path)?;
+    let mut head = vec![0u8; 1 << 20];
+    let mut read = 0;
+    while read < head.len() {
+        match file.read_at(&mut head[read..], read as u64)? {
+            0 => break,
+            n => read += n,
+        }
+    }
+    if head[..read].iter().any(|&b| b != 0) {
+        anyhow::bail!(
+            "{} is not blank: its first MiB holds data (a partition table or filesystem?). \
+             Pass --force to format it anyway",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1382,3 +1440,4 @@ mod tests {
         super::Cli::command().debug_assert();
     }
 }
+

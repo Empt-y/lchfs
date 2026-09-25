@@ -54,10 +54,16 @@ pub use superblock::{
 ///   and a keyring, which a v4 reader would take for corruption; so v5 is
 ///   written, and v4 is still *read* -- a v4 pool is a valid plaintext v5
 ///   pool, because a plaintext record's layout did not change.
-pub const FORMAT_VERSION: u32 = 5;
+///
+/// - v6: pools live on raw block devices (`lchfs-device`) instead of in a
+///   directory of files. Records and objects are unchanged, but where they
+///   are stored is not, and a v5 pool is a directory this build cannot
+///   open: it is refused rather than guessed at. Moving one over means
+///   copying its files through two mounts.
+pub const FORMAT_VERSION: u32 = 6;
 
-/// The oldest format this build still opens (see v5 above).
-pub const MIN_READABLE_FORMAT_VERSION: u32 = 4;
+/// The oldest format this build still opens (see v6 above).
+pub const MIN_READABLE_FORMAT_VERSION: u32 = 6;
 
 /// The largest logical record this build writes or reads, 512 MiB: an
 /// allocation bound on everything a record header claims. Defined here,

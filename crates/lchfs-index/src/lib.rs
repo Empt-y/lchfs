@@ -7,6 +7,7 @@
 //! boundary). This crate also has no dependency on `lchfs-store`; `store`
 //! depends on `index`, not the reverse (ARCHITECTURE.md §11).
 
+use lchfs_device::Device;
 use lchfs_format::{ExtentLocation, Hash32};
 use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 use std::collections::HashMap;
@@ -115,15 +116,28 @@ fn err(e: impl std::fmt::Display) -> IndexError {
 /// authoritative — only `checkpoint` forces an `Immediate` (fsync'd)
 /// commit, mirroring `Pool`'s own checkpoint being the actual durability
 /// barrier for the DAG itself.
+///
+/// The database lives in the index region of a device (`lchfs-device`),
+/// which holds two copies: the live one, and a spare that `rewrite_fresh`
+/// builds into before making it live.
 pub struct RedbIndex {
     db: Database,
+    device: Device,
     generation: AtomicU64,
 }
 
+fn open_device(path: &Path) -> Result<Device, IndexError> {
+    Device::open(path).map_err(err)
+}
+
 impl RedbIndex {
-    /// Creates a fresh, empty index at `path` (must not already exist).
+    /// Creates a fresh, empty index on the device at `path`, replacing any
+    /// index it held.
     pub fn create(path: &Path) -> Result<Self, IndexError> {
-        let db = Database::create(path).map_err(err)?;
+        let device = open_device(path)?;
+        let copy = device.active_index();
+        device.clear_index(copy).map_err(err)?;
+        let db = Database::builder().create_with_backend(device.index_backend(copy)).map_err(err)?;
         let txn = db.begin_write().map_err(err)?;
         txn.open_table(CHUNK_LOCATIONS).map_err(err)?;
         txn.open_table(INODE_HASHES).map_err(err)?;
@@ -134,13 +148,20 @@ impl RedbIndex {
         txn.commit().map_err(err)?;
         Ok(Self {
             db,
+            device,
             generation: AtomicU64::new(0),
         })
     }
 
-    /// Opens an existing index at `path`.
+    /// Opens the index on the device at `path`. An error if the device
+    /// holds none (a fresh device, or one whose index was dropped).
     pub fn open(path: &Path) -> Result<Self, IndexError> {
-        let db = Database::open(path).map_err(err)?;
+        let device = open_device(path)?;
+        let copy = device.active_index();
+        if device.label().index_len[copy as usize] == 0 {
+            return Err(IndexError::Backend(format!("{} holds no index", path.display())));
+        }
+        let db = Database::builder().create_with_backend(device.index_backend(copy)).map_err(err)?;
         let generation = {
             let txn = db.begin_read().map_err(err)?;
             let table = txn.open_table(META).map_err(err)?;
@@ -152,8 +173,22 @@ impl RedbIndex {
         };
         Ok(Self {
             db,
+            device,
             generation: AtomicU64::new(generation),
         })
+    }
+
+    /// Whether the device at `path` holds an index.
+    pub fn exists(path: &Path) -> bool {
+        Device::open(path).is_ok_and(|d| d.label().index_len[d.active_index() as usize] > 0)
+    }
+
+    /// Drops the index on the device at `path`: both copies are erased, so
+    /// the next mount rebuilds it.
+    pub fn remove(path: &Path) -> Result<(), IndexError> {
+        let device = open_device(path)?;
+        device.clear_index(0).map_err(err)?;
+        device.clear_index(1).map_err(err)
     }
 
     /// Forces a durable (`Durability::Immediate`) commit of whatever's
@@ -441,18 +476,19 @@ impl RedbIndex {
         Ok(())
     }
 
-    /// Rewrites this index into a brand-new file at `path` (where it lives)
-    /// holding only what is live: every chunk location and the metadata,
-    /// not the conversion memo. What retiring a key epoch ends with -- a
-    /// B-tree file keeps the bytes of pages it has freed, so the old
-    /// epoch's addresses (for a converted plaintext pool, the unkeyed hash
-    /// of every chunk) would otherwise stay readable in it.
+    /// Rewrites this index into a brand-new database holding only what is
+    /// live: every chunk location and the metadata, not the conversion
+    /// memo. What retiring a key epoch ends with -- a B-tree keeps the
+    /// bytes of pages it has freed, so the old epoch's addresses (for a
+    /// converted plaintext pool, the unkeyed hash of every chunk) would
+    /// otherwise stay readable in it.
     ///
-    /// Built beside the old file, fsynced, then renamed over it; a crash
-    /// leaves one or the other whole. The open handle moves to the new
-    /// file, which the rename does not disturb.
-    pub fn rewrite_fresh(&mut self, path: &Path) -> Result<(), IndexError> {
-        self.rewrite_fresh_keeping(path, |_, _, _| true)
+    /// Built in the device's spare index copy and committed, then made the
+    /// live copy by one label write; a crash leaves one or the other whole.
+    /// The old copy is then erased. (`_path`, the device, is the one this
+    /// index was opened on; kept for the callers' symmetry with `open`.)
+    pub fn rewrite_fresh(&mut self, _path: &Path) -> Result<(), IndexError> {
+        self.rewrite_fresh_keeping(_path, |_, _, _| true)
     }
 
     /// `rewrite_fresh`, copying only the chunk locations `keep` accepts --
@@ -460,12 +496,15 @@ impl RedbIndex {
     /// carry its hash into the new file.
     pub fn rewrite_fresh_keeping(
         &mut self,
-        path: &Path,
+        _path: &Path,
         keep: impl Fn(Hash32, u16, ExtentLocation) -> bool,
     ) -> Result<(), IndexError> {
-        let tmp = path.with_extension("redb.tmp");
-        let _ = std::fs::remove_file(&tmp);
-        let fresh = Database::create(&tmp).map_err(err)?;
+        let old = self.device.active_index();
+        let spare = 1 - old;
+        self.device.clear_index(spare).map_err(err)?;
+        let fresh = Database::builder()
+            .create_with_backend(self.device.index_backend(spare))
+            .map_err(err)?;
         {
             let read = self.db.begin_read().map_err(err)?;
             let mut txn = fresh.begin_write().map_err(err)?;
@@ -499,11 +538,10 @@ impl RedbIndex {
             }
             txn.commit().map_err(err)?;
         }
-        std::fs::rename(&tmp, path).map_err(err)?;
-        if let Some(dir) = path.parent() {
-            std::fs::File::open(dir).and_then(|d| d.sync_all()).map_err(err)?;
-        }
+        self.device.activate_index(spare).map_err(err)?;
+        // The old database is closed before its copy is erased.
         self.db = fresh;
+        self.device.clear_index(old).map_err(err)?;
         Ok(())
     }
 

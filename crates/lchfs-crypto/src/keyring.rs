@@ -30,13 +30,11 @@ use crate::slots::recipient::{self, Identity, Recipient, RecipientAlg};
 use bincode::Options;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 
 pub const KEYRING_MAGIC: [u8; 8] = *b"LCHFSKR\0";
 pub const KEYRING_VERSION: u32 = 1;
-/// File name at the root of every vdev of an encrypted pool.
-pub const KEYRING_FILE: &str = "keyring";
 /// A keyring is small (a few KiB even with many recipient slots); refuse
 /// to even allocate for anything claiming to be much larger.
 const MAX_BODY_LEN: usize = 1 << 20;
@@ -732,27 +730,26 @@ impl UnlockedKeyring {
     }
 }
 
-/// The keyring file under one vdev root.
-pub fn path_on(root: &Path) -> PathBuf {
-    root.join(KEYRING_FILE)
+/// The keyring bytes on the device at `root` (its keyring region, see
+/// `lchfs-device`), or `None` if it holds none.
+pub fn read_on(root: &Path) -> io::Result<Option<Vec<u8>>> {
+    Ok(lchfs_device::Device::open(root)?.read_keyring())
 }
 
 pub fn exists_on(root: &Path) -> bool {
-    path_on(root).exists()
+    read_on(root).is_ok_and(|k| k.is_some())
 }
 
-/// Replaces the keyring on one root atomically: a temporary file, fsync,
-/// rename over the old one, fsync the directory. A crash leaves the old
-/// keyring or the new one, never a torn mix.
+/// Replaces the keyring on the device at `root` atomically: the region
+/// keeps two copies and this overwrites the older one, then flushes, so a
+/// crash leaves the old keyring or the new one, never a torn mix.
 pub fn write_on(root: &Path, bytes: &[u8]) -> io::Result<()> {
-    let tmp = root.join(format!("{KEYRING_FILE}.tmp"));
-    {
-        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).open(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, path_on(root))?;
-    std::fs::File::open(root)?.sync_all()
+    lchfs_device::Device::open(root)?.write_keyring(bytes)
+}
+
+/// Erases the keyring on the device at `root` (both copies).
+pub fn remove_on(root: &Path) -> io::Result<()> {
+    lchfs_device::Device::open(root)?.clear_keyring()
 }
 
 /// Writes to every root, returning the ones that failed. The caller
@@ -771,8 +768,9 @@ pub fn write_all(roots: &[&Path], bytes: &[u8]) -> Vec<(PathBuf, io::Error)> {
 pub fn read_all(roots: &[&Path]) -> Result<Vec<(PathBuf, LockedKeyring)>, KeyringError> {
     let mut found: Vec<(PathBuf, LockedKeyring)> = Vec::new();
     for root in roots {
-        let bytes = match std::fs::read(path_on(root)) {
-            Ok(b) => b,
+        let bytes = match read_on(root) {
+            Ok(Some(b)) => b,
+            Ok(None) => continue,
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
             Err(e) => return Err(e.into()),
         };
@@ -883,6 +881,14 @@ mod tests {
 
     const CHEAP: KdfCost = KdfCost::Explicit { m_kib: 64, t: 1, p: 1 };
     const UUID: [u8; 16] = [7; 16];
+
+    /// A formatted device (an image in a temporary directory).
+    fn device() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let options = lchfs_device::FormatOptions { zone_size: None, index_copy_len: Some(8 << 20) };
+        lchfs_device::format(dir.path(), options).unwrap();
+        dir
+    }
 
     fn pass_slot(p: &[u8]) -> NewSlot<'_> {
         NewSlot::Passphrase {
@@ -1031,7 +1037,7 @@ mod tests {
 
     #[test]
     fn newest_valid_generation_wins_and_a_forged_newer_one_is_passed_over() {
-        let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        let dirs: Vec<_> = (0..3).map(|_| device()).collect();
         let roots: Vec<&Path> = dirs.iter().map(|d| d.path()).collect();
         let mut ring = UnlockedKeyring::create(UUID, Padding::Padme, pass_slot(b"pw")).unwrap();
         let g1 = ring.to_file();
@@ -1112,8 +1118,8 @@ mod tests {
     /// has the newer keyring must never be "repaired" down to the older one.
     #[test]
     fn an_older_keyring_is_never_unlocked_in_place_of_a_newer_one() {
-        let a = tempfile::tempdir().unwrap();
-        let b = tempfile::tempdir().unwrap();
+        let a = device();
+        let b = device();
         let roots: Vec<&Path> = vec![a.path(), b.path()];
         let mut ring = UnlockedKeyring::create(UUID, Padding::Padme, pass_slot(b"old")).unwrap();
         let g1 = ring.to_file();
@@ -1127,7 +1133,7 @@ mod tests {
 
         let err = unlock_newest(&roots, &Unlock::Passphrase(b"old")).unwrap_err();
         assert!(matches!(err, KeyringError::NewestRefuses { generation: 2, .. }), "{err}");
-        assert_eq!(std::fs::read(path_on(roots[0])).unwrap(), g2, "the newer keyring was left alone");
+        assert_eq!(read_on(roots[0]).unwrap().unwrap(), g2, "the newer keyring was left alone");
 
         let got = unlock_newest(&roots, &Unlock::Passphrase(b"new")).unwrap();
         assert_eq!(got.ring.body.generation, 2);

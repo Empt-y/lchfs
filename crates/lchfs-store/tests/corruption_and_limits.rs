@@ -8,7 +8,6 @@
 use lchfs_format::{CodecId, ExtentKind, ExtentRecordHeader, Hash32, PoolParams, finalize_header_checksum};
 use lchfs_store::segment::parse_record_header;
 use lchfs_store::{Pool, PoolError};
-use std::io::{Seek, SeekFrom, Write};
 
 fn small_params() -> PoolParams {
     PoolParams {
@@ -43,20 +42,9 @@ fn corrupted_header_len_prefix_is_an_error_not_a_panic() {
     // `header_len` framing prefix, itself unprotected by any checksum.
     // Segments are created on first use, so the one data segment is
     // whichever id the shard took, not 0.
-    let data_seg_path = std::fs::read_dir(dir.path().join("segments/data"))
-        .unwrap()
-        .flatten()
-        .map(|e| e.path())
-        .find(|p| p.extension().is_some_and(|x| x == "aseg"))
-        .expect("one data segment");
-    let mut f = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&data_seg_path)
-        .unwrap();
-    f.seek(SeekFrom::Start(4096)).unwrap();
-    f.write_all(&u32::MAX.to_le_bytes()).unwrap();
-    drop(f);
+    use lchfs_store::testing::{SegmentKind, segment_ids, write_at};
+    let data_seg = *segment_ids(dir.path(), SegmentKind::Data).first().expect("one data segment");
+    write_at(dir.path(), SegmentKind::Data, data_seg, 4096, &u32::MAX.to_le_bytes());
 
     let pool = Pool::open(dir.path()).unwrap();
     let ino = pool.lookup(1, "f.bin").unwrap().unwrap();
@@ -173,15 +161,10 @@ fn poison_format_version(pool_root: &std::path::Path, version: u32) {
         SUPERBLOCK_MAGIC, SUPERBLOCK_SLOT_COUNT, SUPERBLOCK_SLOT_SIZE, SuperblockSlot,
         compute_superblock_slot_checksum, finalize_superblock_slot_checksum,
     };
-    let path = pool_root.join("SUPERBLOCK");
-    let mut file = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+    let mut ring = lchfs_store::testing::read_ring(pool_root);
     for slot_idx in 0..SUPERBLOCK_SLOT_COUNT {
-        let offset = slot_idx as u64 * SUPERBLOCK_SLOT_SIZE as u64;
-        let mut buf = vec![0u8; SUPERBLOCK_SLOT_SIZE];
-        file.seek(SeekFrom::Start(offset)).unwrap();
-        if std::io::Read::read_exact(&mut file, &mut buf).is_err() {
-            continue;
-        }
+        let offset = slot_idx as usize * SUPERBLOCK_SLOT_SIZE;
+        let buf = ring[offset..offset + SUPERBLOCK_SLOT_SIZE].to_vec();
         let encoded_len = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
         if encoded_len == 0 || 4 + encoded_len > buf.len() {
             continue;
@@ -200,10 +183,9 @@ fn poison_format_version(pool_root: &std::path::Path, version: u32) {
         let mut out = vec![0u8; SUPERBLOCK_SLOT_SIZE];
         out[0..4].copy_from_slice(&(encoded.len() as u32).to_le_bytes());
         out[4..4 + encoded.len()].copy_from_slice(&encoded);
-        file.seek(SeekFrom::Start(offset)).unwrap();
-        file.write_all(&out).unwrap();
+        ring[offset..offset + SUPERBLOCK_SLOT_SIZE].copy_from_slice(&out);
     }
-    file.sync_all().unwrap();
+    lchfs_store::testing::write_ring(pool_root, 0, &ring);
 }
 
 /// A pool written by a future format version must be refused outright.

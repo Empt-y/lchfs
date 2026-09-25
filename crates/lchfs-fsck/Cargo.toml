@@ -18,6 +18,7 @@ lchfs-store = { workspace = true }
 lchfs-index = { workspace = true }
 lchfs-format = { workspace = true }
 lchfs-crypto = { workspace = true }
+lchfs-device = { workspace = true }
 reed-solomon-erasure = "6"
 thiserror = { workspace = true }
 serde = { workspace = true }
