@@ -7062,14 +7062,26 @@ fn require_blank_device(root: &Path) -> Result<(), PoolError> {
 /// Takes the exclusive pool lock on a device: an advisory lock on the
 /// device file itself (it used to be a `LOCK` file beside the pool).
 fn acquire_pool_lock(pool_root: &Path) -> Result<Flock<std::fs::File>, PoolError> {
-    let file = std::fs::OpenOptions::new().read(true).open(lchfs_device::resolve(pool_root))?;
-    match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
-        Ok(guard) => Ok(guard),
-        Err((_, Errno::EWOULDBLOCK)) => {
-            Err(PoolError::PoolLocked(pool_root.display().to_string()))
+    let path = lchfs_device::resolve(pool_root);
+    // On a block device, udev takes a shared lock for as long as it
+    // probes the device, which it does after every close of a writer --
+    // so a lock refused there is most likely udev, briefly. Another pool
+    // on the device is kept out by the exclusive open anyway. Wait it
+    // out; an image file has no such visitor.
+    let patience = if lchfs_device::is_block_device(&path) { 50 } else { 0 };
+    let mut file = std::fs::OpenOptions::new().read(true).open(&path)?;
+    for attempt in 0..=patience {
+        match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+            Ok(guard) => return Ok(guard),
+            Err((f, Errno::EWOULDBLOCK)) if attempt < patience => {
+                file = f;
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err((_, Errno::EWOULDBLOCK)) => break,
+            Err((_, errno)) => return Err(PoolError::Io(std::io::Error::from(errno))),
         }
-        Err((_, errno)) => Err(PoolError::Io(std::io::Error::from(errno))),
     }
+    Err(PoolError::PoolLocked(pool_root.display().to_string()))
 }
 
 /// Clamped `[offset, offset+len)` slice of an in-memory buffer, returning
