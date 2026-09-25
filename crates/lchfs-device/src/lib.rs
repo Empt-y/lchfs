@@ -978,23 +978,32 @@ impl SegmentFile {
         let label = device.label();
         let payload = label.zone_size - DEVICE_BLOCK;
         let end = offset + len as u64;
-        if grow && end > 0 {
-            let needed = end.div_ceil(payload) as usize;
+        let needed = end.div_ceil(payload) as usize;
+        // Most writes land in zones the segment already has: the write
+        // lock is taken only to add one, since readers of the segment hold
+        // the read side while they look its zones up.
+        if grow && end > 0 && self.seg.zones.read().len() < needed {
             let mut zones = self.seg.zones.write();
             while zones.len() < needed {
                 let z = device.claim_zone(self.seg.kind, self.seg.id, zones.len() as u32)?;
                 zones.push(z);
             }
         }
-        let zones = self.seg.zones.read();
+        // The zone numbers are copied out, and the I/O done with no lock
+        // held: a zone never moves once claimed.
+        if end == offset {
+            return Ok(());
+        }
+        let first = (offset / payload) as usize;
+        let zones: Vec<u64> = self.seg.zones.read().get(first..needed).map(<[u64]>::to_vec).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::UnexpectedEof, "read past the end of the segment")
+        })?;
         let mut at = offset;
         while at < end {
             let ordinal = (at / payload) as usize;
             let within = at % payload;
             let n = (payload - within).min(end - at);
-            let zone = *zones.get(ordinal).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::UnexpectedEof, "read past the end of the segment")
-            })?;
+            let zone = zones[ordinal - first];
             let dev_at = Device::zone_offset(&label, zone) + DEVICE_BLOCK + within;
             let from = (at - offset) as usize;
             each(dev_at, from..from + n as usize)?;
