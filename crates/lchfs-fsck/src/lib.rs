@@ -218,8 +218,8 @@ pub fn read_superblock(pool_root: &Path) -> Result<SuperblockSlot, FsckError> {
         .map_err(|e| FsckError::Io(format!("reading superblock: {e}")))?;
     let mut best: Option<SuperblockSlot> = None;
     for slot_idx in 0..SUPERBLOCK_SLOT_COUNT {
-        let at = slot_idx as usize * SUPERBLOCK_SLOT_SIZE as usize;
-        let Some(bytes) = ring.get(at..at + SUPERBLOCK_SLOT_SIZE as usize) else { continue };
+        let at = slot_idx as usize * SUPERBLOCK_SLOT_SIZE;
+        let Some(bytes) = ring.get(at..at + SUPERBLOCK_SLOT_SIZE) else { continue };
         if bytes.len() < 4 {
             continue;
         }
