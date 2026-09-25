@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 lchfs-format = { workspace = true }
 lchfs-crypto = { workspace = true }
+lchfs-device = { workspace = true }
 redb = { workspace = true }
 thiserror = { workspace = true }
 

@@ -979,6 +979,7 @@ dependencies = [
  "criterion",
  "getrandom 0.3.4",
  "hex",
+ "lchfs-device",
  "nix",
  "serde",
  "serde_json",
@@ -987,6 +988,21 @@ dependencies = [
  "tss-esapi",
  "x-wing",
  "zeroize",
+]
+
+[[package]]
+name = "lchfs-device"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "crc32fast",
+ "getrandom 0.3.4",
+ "nix",
+ "parking_lot 0.12.5",
+ "redb",
+ "serde",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]
@@ -1034,6 +1050,7 @@ name = "lchfs-index"
 version = "0.1.0"
 dependencies = [
  "lchfs-crypto",
+ "lchfs-device",
  "lchfs-format",
  "redb",
  "tempfile",

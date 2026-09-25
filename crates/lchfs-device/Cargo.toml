@@ -1,0 +1,22 @@
+[package]
+name = "lchfs-device"
+description = "The raw-device layout of LCHFS: labels, fixed regions, zones and segments"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+bincode = { workspace = true }
+crc32fast = { workspace = true }
+redb = { workspace = true }
+getrandom = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+nix = { workspace = true, features = ["fs"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
