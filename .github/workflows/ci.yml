@@ -115,7 +115,11 @@ jobs:
       # stripes and recovery against Windows file semantics (a file
       # deleted while open, a file replaced while open), which Wine only
       # approximates. Optimized, as on Linux, for the torture tests.
+      # A hang fails the step, with the log saying which test (libtest
+      # reports any test running for over 60 s), rather than holding the
+      # job until the runner's six-hour limit, with no log until then.
       - name: Engine tests on Windows
+        timeout-minutes: 45
         run: cargo test --release --no-fail-fast -p lchfs-crypto -p lchfs-format -p lchfs-index -p lchfs-store -p lchfs-fsck
 
       - name: Clippy
