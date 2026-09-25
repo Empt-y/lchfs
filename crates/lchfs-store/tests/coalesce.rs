@@ -70,11 +70,8 @@ fn post_repack_reads_are_byte_identical_and_old_segment_is_gone() {
     let dir = tempfile::tempdir().unwrap();
     let (pool, survivors) = setup_low_liveness_pool(dir.path());
 
-    let data_dir = dir.path().join("segments/data");
-    let before: std::collections::HashSet<_> = std::fs::read_dir(&data_dir)
-        .unwrap()
-        .filter_map(|e| e.ok().map(|e| e.file_name()))
-        .collect();
+    let data_dir = dir.path().to_path_buf();
+    let before = data_set(&data_dir);
 
     pool.run_gc_and_coalesce_pass().unwrap();
 
@@ -83,10 +80,7 @@ fn post_repack_reads_are_byte_identical_and_old_segment_is_gone() {
         assert_eq!(read_back.as_ref(), expected.as_slice(), "mismatch for ino {ino} after coalesce");
     }
 
-    let after: std::collections::HashSet<_> = std::fs::read_dir(&data_dir)
-        .unwrap()
-        .filter_map(|e| e.ok().map(|e| e.file_name()))
-        .collect();
+    let after = data_set(&data_dir);
     assert_ne!(before, after, "coalesce should have changed the segment file set");
     // At least one old segment file must actually be gone (not just a new one added).
     assert!(
@@ -230,11 +224,8 @@ fn generation_change_mid_pass_blocks_deletion_even_without_a_pin() {
         Arc::new(PendingDedupPins::new()),
     );
 
-    let data_dir = dir.path().join("segments/data");
-    let before: std::collections::HashSet<_> = std::fs::read_dir(&data_dir)
-        .unwrap()
-        .filter_map(|e| e.ok().map(|e| e.file_name()))
-        .collect();
+    let data_dir = dir.path().to_path_buf();
+    let before = data_set(&data_dir);
 
     // `generation_at_mark` (0) deliberately doesn't match
     // `published_generation`'s value (1) below -- simulating "a checkpoint
@@ -244,10 +235,7 @@ fn generation_change_mid_pass_blocks_deletion_even_without_a_pin() {
         .run_pass(&[root], 0, &published_generation, &persisted_index, &next_segment_id)
         .unwrap();
 
-    let after: std::collections::HashSet<_> = std::fs::read_dir(&data_dir)
-        .unwrap()
-        .filter_map(|e| e.ok().map(|e| e.file_name()))
-        .collect();
+    let after = data_set(&data_dir);
     // Every pre-pass segment must still be present -- the gate blocks
     // *deletion*, not the copy-forward work itself: whatever was
     // genuinely live per this pass's (stale) mark is still correctly
@@ -263,7 +251,10 @@ fn generation_change_mid_pass_blocks_deletion_even_without_a_pin() {
     );
 
     // And nothing was corrupted along the way -- every survivor still
-    // reads back correctly through a fresh mount.
+    // reads back correctly through a fresh mount. Which opens the index
+    // itself: close this handle first, so one database is on the index
+    // region at a time.
+    drop(persisted_index);
     let pool2 = Pool::open(dir.path()).unwrap();
     for (ino, expected) in &survivors {
         let read_back = pool2.read(*ino, 0, expected.len() as u32).unwrap();
@@ -373,46 +364,37 @@ fn a_chunk_identical_to_a_meta_object_reads_back() {
     assert!(report.is_clean(), "fsck: {:?}", report.errors);
 }
 
-/// Open descriptors this process holds on files under `root` that have
-/// since been unlinked -- what the kernel shows as "(deleted)".
-fn deleted_fds_under(root: &std::path::Path) -> usize {
-    std::fs::read_dir("/proc/self/fd")
-        .unwrap()
-        .filter_map(|e| std::fs::read_link(e.ok()?.path()).ok())
-        .filter(|target| {
-            let target = target.to_string_lossy();
-            target.starts_with(&*root.to_string_lossy()) && target.ends_with(" (deleted)")
-        })
-        .count()
+/// The data segments (and stripe shards) on a device.
+fn data_set(root: &std::path::Path) -> std::collections::HashSet<(lchfs_store::testing::SegmentKind, u64)> {
+    use lchfs_store::testing::{SegmentKind, segments};
+    segments(root)
+        .into_iter()
+        .filter(|(k, _)| matches!(k, SegmentKind::Data | SegmentKind::StripeShard { .. }))
+        .collect()
 }
 
 #[test]
 fn coalesce_closes_its_readers_on_segments_it_deleted() {
-    // An open reader keeps an unlinked segment's space allocated and costs
-    // a descriptor; the reader cache used to keep one for every segment
-    // coalesce ever deleted, for the life of the mount.
+    // An open reader keeps a removed segment's zones from being freed (as
+    // it kept an unlinked file's space allocated); the reader cache used
+    // to keep one for every segment coalesce ever deleted, for the life of
+    // the mount.
     let dir = tempfile::tempdir().unwrap();
     let (pool, survivors) = setup_low_liveness_pool(dir.path());
     drop(pool);
     // A fresh mount opens a reader on every segment it scans.
     let pool = Pool::open(dir.path()).unwrap();
-    let data_dir = dir.path().join("segments/data");
-    let before: std::collections::HashSet<_> = std::fs::read_dir(&data_dir)
-        .unwrap()
-        .filter_map(|e| e.ok().map(|e| e.file_name()))
-        .collect();
+    let data_dir = dir.path().to_path_buf();
+    let before = data_set(&data_dir);
 
     for _ in 0..4 {
         pool.checkpoint().unwrap();
         pool.run_gc_and_coalesce_pass().unwrap();
     }
-    let after: std::collections::HashSet<_> = std::fs::read_dir(&data_dir)
-        .unwrap()
-        .filter_map(|e| e.ok().map(|e| e.file_name()))
-        .collect();
+    let after = data_set(&data_dir);
     assert!(!before.is_subset(&after), "setup: coalesce must have deleted a segment");
 
-    assert_eq!(deleted_fds_under(dir.path()), 0, "descriptors left open on deleted segments");
+    assert_eq!(lchfs_store::testing::zones_awaiting_release(dir.path()), 0, "handles left open on deleted segments");
     for (ino, expected) in &survivors {
         assert_eq!(pool.read(*ino, 0, expected.len() as u32).unwrap().as_ref(), expected.as_slice());
     }

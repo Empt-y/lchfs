@@ -60,15 +60,26 @@ fn segments_read_back_across_zones_and_reopen_with_their_length() {
 }
 
 #[test]
-fn an_unsynced_length_is_not_persisted() {
+fn an_unsynced_length_survives_a_clean_close_but_not_a_crash() {
     let (dir, dev) = fresh();
     let seg = dev.create_segment(SegmentKind::Meta, 1).unwrap();
     seg.write_all_at(b"synced", 0).unwrap();
     seg.sync_all().unwrap();
     seg.write_all_at(b" and not", 6).unwrap();
     drop(seg);
+    // Closing cleanly keeps it, as a file's length outlives its handle.
     let dev = reopen(&dir, dev);
-    assert_eq!(dev.read_segment(SegmentKind::Meta, 1).unwrap(), b"synced");
+    assert_eq!(dev.read_segment(SegmentKind::Meta, 1).unwrap(), b"synced and not");
+
+    // A crash (the process gone, nothing run at close) keeps only what was
+    // synced.
+    let seg = dev.open_segment(SegmentKind::Meta, 1).unwrap();
+    seg.write_all_at(b"!", 14).unwrap();
+    std::mem::forget(seg);
+    std::mem::forget(dev);
+    registry().lock().remove(&resolve(dir.path()));
+    let dev = Device::open(dir.path()).unwrap();
+    assert_eq!(dev.read_segment(SegmentKind::Meta, 1).unwrap(), b"synced and not");
 }
 
 #[test]
@@ -112,7 +123,7 @@ fn a_zone_left_freeing_by_a_crash_is_zeroed_at_mount() {
     // The process dies with the handle still open: the zone stays Freeing.
     std::mem::forget(seg);
     drop(dev);
-    registry().lock().clear();
+    registry().lock().remove(&resolve(dir.path()));
     let dev = Device::open(dir.path()).unwrap();
     assert!(dev.segments().is_empty());
     assert_eq!(dev.zones_in_use(), 0);

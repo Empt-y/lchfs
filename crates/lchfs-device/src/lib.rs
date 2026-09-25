@@ -293,6 +293,42 @@ struct Inner {
     allocation_blocked: AtomicBool,
 }
 
+impl Drop for Inner {
+    /// A clean close persists every segment's written length, as closing a
+    /// file leaves its length for the next open without an fsync (the page
+    /// cache keeps it). Only a crash loses what was never synced.
+    fn drop(&mut self) {
+        let label = self.label.read().clone();
+        let mut wrote = false;
+        for seg in self.segments.lock().values() {
+            let len = seg.len.load(Ordering::Acquire);
+            if seg.removed.load(Ordering::Acquire) || seg.synced_len.load(Ordering::Acquire) == len {
+                continue;
+            }
+            let Some(&first) = seg.zones.read().first() else { continue };
+            let mut header = ZoneHeader {
+                magic: ZONE_HEADER_MAGIC,
+                device_uuid: label.device_uuid,
+                state: ZoneState::Owned,
+                kind: seg.kind,
+                segment_id: seg.id,
+                ordinal: 0,
+                written_len: len,
+                checksum: 0,
+            };
+            header.finalize();
+            let at = label.zones_offset + first * label.zone_size;
+            if let Err(e) = self.file.write_all_at(&layout::encode_block(&header), at) {
+                tracing::error!("{}: persisting segment {} length at close failed: {e}", self.path.display(), seg.id);
+            }
+            wrote = true;
+        }
+        if wrote && let Err(e) = self.file.sync_data() {
+            tracing::error!("{}: flush at close failed: {e}", self.path.display());
+        }
+    }
+}
+
 /// An open LCHFS device. Cheap to clone; every clone is the same device.
 #[derive(Clone)]
 pub struct Device(Arc<Inner>);
@@ -820,6 +856,12 @@ impl Device {
     #[doc(hidden)]
     pub fn block_allocation(&self, blocked: bool) {
         self.0.allocation_blocked.store(blocked, Ordering::Relaxed);
+    }
+
+    /// Zones of removed segments still held by an open handle: what an
+    /// unlinked-but-open file's blocks were.
+    pub fn zones_awaiting_release(&self) -> u64 {
+        self.0.zones.lock().iter().filter(|z| matches!(z, Zone::Freeing)).count() as u64
     }
 
     /// Zones in use by segments, or still being freed.

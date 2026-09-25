@@ -5,7 +5,6 @@
 
 use lchfs_format::PoolParams;
 use lchfs_store::{Pool, PoolError};
-use std::io::{Seek, SeekFrom, Write};
 
 fn small_params() -> PoolParams {
     // Small caps/thresholds so tests can exercise segment rollover and
@@ -188,24 +187,15 @@ fn survives_checkpoint_and_reopen() {
 /// Total bytes of every data segment on a device -- segments are created
 /// on first use, so "the" data segment has no fixed id.
 fn data_segment_bytes(root: &std::path::Path) -> u64 {
-    std::fs::read_dir(root.join("segments/data"))
-        .unwrap()
-        .flatten()
-        .filter(|e| e.path().extension().is_some_and(|x| x == "aseg"))
-        .map(|e| e.metadata().unwrap().len())
-        .sum()
+    use lchfs_store::testing::{SegmentKind, segment_ids, segment_len};
+    segment_ids(root, SegmentKind::Data).into_iter().map(|id| segment_len(root, SegmentKind::Data, id)).sum()
 }
 
-/// The one data segment file on a device.
-fn only_data_segment(root: &std::path::Path) -> std::path::PathBuf {
-    let mut files: Vec<_> = std::fs::read_dir(root.join("segments/data"))
-        .unwrap()
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "aseg"))
-        .collect();
-    assert_eq!(files.len(), 1, "expected exactly one data segment: {files:?}");
-    files.pop().unwrap()
+/// The one data segment on a device.
+fn only_data_segment(root: &std::path::Path) -> u64 {
+    let mut ids = lchfs_store::testing::segment_ids(root, lchfs_store::testing::SegmentKind::Data);
+    assert_eq!(ids.len(), 1, "expected exactly one data segment: {ids:?}");
+    ids.pop().unwrap()
 }
 
 /// ARCHITECTURE.md §2: identical content must dedup to the same on-disk
@@ -246,19 +236,10 @@ fn corrupted_chunk_is_detected_on_read() {
     drop(pool);
 
     // Flip a byte well past the segment header page, inside chunk payload.
-    let data_seg_path = only_data_segment(dir.path());
-    let mut f = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&data_seg_path)
-        .unwrap();
-    f.seek(SeekFrom::Start(4200)).unwrap();
-    let mut byte = [0u8; 1];
-    std::io::Read::read_exact(&mut f, &mut byte).unwrap();
-    byte[0] ^= 0xFF;
-    f.seek(SeekFrom::Start(4200)).unwrap();
-    f.write_all(&byte).unwrap();
-    drop(f);
+    use lchfs_store::testing::{SegmentKind, read_segment, write_at};
+    let data_seg = only_data_segment(dir.path());
+    let byte = read_segment(dir.path(), SegmentKind::Data, data_seg)[4200] ^ 0xFF;
+    write_at(dir.path(), SegmentKind::Data, data_seg, 4200, &[byte]);
 
     let pool = Pool::open(dir.path()).unwrap();
     let ino = pool.lookup(1, "f.bin").unwrap().unwrap();
@@ -304,8 +285,8 @@ fn segment_rollover_across_many_writes() {
     }
     pool.checkpoint().unwrap();
 
-    let data_dir = dir.path().join("segments/data");
-    let segment_count = std::fs::read_dir(&data_dir).unwrap().count();
+    let segment_count =
+        lchfs_store::testing::segment_ids(dir.path(), lchfs_store::testing::SegmentKind::Data).len();
     assert!(
         segment_count > 1,
         "expected multiple data segments after exceeding the cap, got {segment_count}"

@@ -97,7 +97,7 @@ fn a_tpm_slot_alone_is_never_created() {
     // passphrase slot too -- asked for, and here there is no one to ask.
     let err = fails(&["create-pool", "--encrypt", "--tpm", s(&pool)]);
     assert!(err.contains("needs a terminal"), "{err}");
-    assert!(!pool.join("SUPERBLOCK").exists() && !lchfs_crypto::keyring::exists_on(&pool), "nothing may be created");
+    assert!(!lchfs_store::testing::ring_written(pool) && !lchfs_crypto::keyring::exists_on(&pool), "nothing may be created");
 }
 
 #[test]

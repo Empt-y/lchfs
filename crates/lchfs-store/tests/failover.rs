@@ -15,6 +15,7 @@
 use lchfs_format::{PoolParams, StreamKind};
 use lchfs_index::RedbIndex;
 use lchfs_store::Pool;
+use lchfs_store::testing::{self as t, SegmentKind};
 use std::path::{Path, PathBuf};
 
 fn small_params() -> PoolParams {
@@ -38,29 +39,52 @@ fn payload() -> Vec<u8> {
     (0..40_000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect()
 }
 
-fn segment_files(root: &Path, stream: &str) -> Vec<PathBuf> {
-    let dir = root.join("segments").join(stream);
-    let mut out: Vec<PathBuf> = match std::fs::read_dir(&dir) {
-        Ok(rd) => rd.flatten().map(|e| e.path()).collect(),
-        Err(_) => Vec::new(),
-    };
-    out.sort();
-    out
+/// One segment on one device: what a segment file's path was.
+#[derive(Debug, Clone, PartialEq)]
+struct SegFile {
+    root: PathBuf,
+    kind: SegmentKind,
+    id: u64,
+}
+
+impl SegFile {
+    fn len(&self) -> u64 {
+        t::segment_len(&self.root, self.kind, self.id)
+    }
+
+    fn remove(&self) {
+        t::remove_segment(&self.root, self.kind, self.id).unwrap();
+    }
+
+    fn write_at(&self, offset: u64, bytes: &[u8]) {
+        t::write_at(&self.root, self.kind, self.id, offset, bytes);
+    }
+}
+
+/// The segments of a stream on a device: "data" (with stripe shards, which
+/// shared its directory) or "meta".
+fn segment_files(root: &Path, stream: &str) -> Vec<SegFile> {
+    t::segments(root)
+        .into_iter()
+        .filter(|(k, _)| match stream {
+            "data" => matches!(k, SegmentKind::Data | SegmentKind::StripeShard { .. }),
+            "meta" => *k == SegmentKind::Meta,
+            other => panic!("no stream {other}"),
+        })
+        .map(|(kind, id)| SegFile { root: root.to_path_buf(), kind, id })
+        .collect()
 }
 
 /// Overwrites a run of bytes in the middle of every data segment on `root`,
 /// well past the 4 KiB header page, so at least one record's payload no
 /// longer matches its content hash.
 fn corrupt_data_segments(root: &Path) {
-    use std::io::{Seek, SeekFrom, Write};
     let files = segment_files(root, "data");
     assert!(!files.is_empty(), "no data segments to corrupt under {root:?}");
-    for path in files {
-        let len = std::fs::metadata(&path).unwrap().len();
-        assert!(len > 8192, "segment {path:?} too small to corrupt safely");
-        let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-        f.seek(SeekFrom::Start(len / 2)).unwrap();
-        f.write_all(&[0xFFu8; 64]).unwrap();
+    for seg in files {
+        let len = seg.len();
+        assert!(len > 8192, "segment {seg:?} too small to corrupt safely");
+        seg.write_at(len / 2, &[0xFFu8; 64]);
     }
 }
 
@@ -118,7 +142,7 @@ fn a_missing_primary_segment_fails_over_and_the_heal_is_then_the_only_copy_neede
     let ino = write_and_checkpoint(a.path(), b.path());
 
     for f in segment_files(a.path(), "data") {
-        std::fs::remove_file(f).unwrap();
+        f.remove();
     }
 
     let pool = Pool::open_replicated(&[a.path(), b.path()]).unwrap();
@@ -128,7 +152,7 @@ fn a_missing_primary_segment_fails_over_and_the_heal_is_then_the_only_copy_neede
 
     // Now lose vdev b's data. Everything the file needs was healed onto a.
     for f in segment_files(b.path(), "data") {
-        std::fs::remove_file(f).unwrap();
+        f.remove();
     }
     let before = pool.repair_stats();
     assert_eq!(read_all(&pool, ino), payload());
@@ -168,7 +192,7 @@ fn resilver_recreates_replicas_a_device_never_received() {
 
     // Make vdev b look like it was offline for every write: its segments
     // never arrived, and the index never learned of a replica there.
-    std::fs::remove_dir_all(b.path().join("segments")).unwrap();
+    t::remove_segments(b.path(), |_| true);
     let expected_missing = {
         let mut index = RedbIndex::open(a.path()).unwrap();
         let all = index.iter_all_chunk_locations().unwrap();
@@ -201,7 +225,7 @@ fn resilver_recreates_replicas_a_device_never_received() {
     // which would make this pass for the wrong reason.
     drop(pool);
     for f in segment_files(a.path(), "data") {
-        std::fs::remove_file(f).unwrap();
+        f.remove();
     }
     let pool = Pool::open_replicated(&[a.path(), b.path()]).unwrap();
     assert_eq!(read_all(&pool, ino), payload());
@@ -245,7 +269,7 @@ fn scrub_repairs_replicas_that_went_bad_in_place() {
 
     drop(pool);
     for f in segment_files(a.path(), "data") {
-        std::fs::remove_file(f).unwrap();
+        f.remove();
     }
     let pool = Pool::open_replicated(&[a.path(), b.path()]).unwrap();
     assert_eq!(read_all(&pool, ino), payload());
@@ -261,7 +285,7 @@ fn scrub_reports_what_no_replica_can_supply() {
     // Both copies of the data are gone; only metadata survives.
     for root in [a.path(), b.path()] {
         for f in segment_files(root, "data") {
-            std::fs::remove_file(f).unwrap();
+            f.remove();
         }
     }
     let pool = Pool::open_replicated(&[a.path(), b.path()]).unwrap();
@@ -325,15 +349,15 @@ fn a_heal_segment_that_exists_on_one_vdev_survives_a_remount_and_new_writes() {
     }
     // New files on b that hold records. (Mounting also opens a fresh,
     // header-only active data segment on every vdev; that is not a heal.)
-    let heal_segments: Vec<PathBuf> = segment_files(b.path(), "data")
+    let heal_segments: Vec<SegFile> = segment_files(b.path(), "data")
         .into_iter()
         .filter(|p| !data_on_b_before.contains(p))
-        .filter(|p| std::fs::metadata(p).unwrap().len() > 4096)
+        .filter(|p| p.len() > 4096)
         .collect();
     assert!(!heal_segments.is_empty(), "resilver left no heal segment on vdev b");
     let sizes_before: Vec<u64> = heal_segments
         .iter()
-        .map(|p| std::fs::metadata(p).unwrap().len())
+        .map(|p| p.len())
         .collect();
 
     // Remount, and allocate fresh segments by writing and checkpointing.
@@ -346,7 +370,7 @@ fn a_heal_segment_that_exists_on_one_vdev_survives_a_remount_and_new_writes() {
     }
     let sizes_after: Vec<u64> = heal_segments
         .iter()
-        .map(|p| std::fs::metadata(p).unwrap().len())
+        .map(|p| p.len())
         .collect();
     assert_eq!(sizes_after, sizes_before, "a heal segment on vdev b was clobbered by a new writer");
 }
@@ -370,7 +394,7 @@ fn a_mirror_still_mounts_when_the_primary_has_lost_its_metadata() {
         pool.checkpoint().unwrap();
     }
     for f in segment_files(a.path(), "meta") {
-        std::fs::remove_file(f).unwrap();
+        f.remove();
     }
 
     let pool = Pool::open_replicated(&[a.path(), b.path()]).unwrap();
@@ -419,9 +443,9 @@ fn delta_replay_at_mount_fails_over_too() {
         drop(pool);
         ino
     };
-    let delta_dir = a.path().join("segments/delta");
-    assert!(delta_dir.is_dir(), "test setup: expected a delta log on vdev a");
-    std::fs::remove_dir_all(&delta_dir).unwrap();
+    let is_delta = |k: SegmentKind| matches!(k, SegmentKind::Delta { .. });
+    assert!(t::segments(a.path()).iter().any(|(k, _)| is_delta(*k)), "test setup: expected a delta log on vdev a");
+    t::remove_segments(a.path(), is_delta);
 
     let pool = Pool::open_replicated(&[a.path(), b.path()]).unwrap();
     // Replay's failovers are accounted like the rest of the mount's.

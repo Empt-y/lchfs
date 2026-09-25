@@ -8,7 +8,7 @@
 
 use lchfs_format::PoolParams;
 use lchfs_store::Pool;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 fn small_params() -> PoolParams {
     PoolParams {
@@ -31,12 +31,8 @@ fn payload(seed: u32) -> Vec<u8> {
         .collect()
 }
 
-fn data_segments(root: &Path) -> Vec<PathBuf> {
-    let mut v: Vec<_> = std::fs::read_dir(root.join("segments/data"))
-        .map(|rd| rd.flatten().map(|e| e.path()).collect())
-        .unwrap_or_default();
-    v.sort();
-    v
+fn data_segments(root: &Path) -> Vec<u64> {
+    lchfs_store::testing::segment_ids(root, lchfs_store::testing::SegmentKind::Data)
 }
 
 fn read_file(pool: &Pool, name: &str, len: usize) -> Vec<u8> {
@@ -347,8 +343,8 @@ fn a_live_attach_refuses_a_device_that_already_holds_a_pool() {
 fn a_device_with_leftover_segments_is_not_blank() {
     let a = tempfile::tempdir().unwrap();
     let stale = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(stale.path().join("segments/data")).unwrap();
-    std::fs::write(stale.path().join("segments/data/0.aseg"), b"leftovers").unwrap();
+    lchfs_device::format(stale.path(), Default::default()).unwrap();
+    lchfs_store::testing::write_segment(stale.path(), lchfs_store::testing::SegmentKind::Data, 0, b"leftovers");
     {
         let pool = Pool::create(a.path(), small_params()).unwrap();
         let err = pool.attach_vdev_live(stale.path()).unwrap_err().to_string();
@@ -372,7 +368,7 @@ fn opening_a_wrong_path_leaves_nothing_behind() {
     let empty = nowhere.path().join("empty");
     std::fs::create_dir(&empty).unwrap();
     assert!(Pool::open(&empty).is_err());
-    assert!(!lchfs_store::testing::ring_written(empty), "open created a superblock ring in an empty dir");
+    assert!(!lchfs_device::is_formatted(&empty), "open formatted an empty dir");
 }
 
 /// An attach interrupted after some members were rewritten with the new

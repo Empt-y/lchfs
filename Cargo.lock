@@ -1021,6 +1021,7 @@ name = "lchfs-fsck"
 version = "0.1.0"
 dependencies = [
  "lchfs-crypto",
+ "lchfs-device",
  "lchfs-format",
  "lchfs-index",
  "lchfs-store",
@@ -1082,6 +1083,7 @@ dependencies = [
  "lchfs-chunk",
  "lchfs-compress",
  "lchfs-crypto",
+ "lchfs-device",
  "lchfs-format",
  "lchfs-fsck",
  "lchfs-index",

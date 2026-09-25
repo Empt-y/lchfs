@@ -84,6 +84,11 @@ pub fn reappear(root: &Path) {
     dev(root).block_allocation(false);
 }
 
+/// Zones of removed segments that an open handle still holds.
+pub fn zones_awaiting_release(root: &Path) -> u64 {
+    dev(root).zones_awaiting_release()
+}
+
 /// The written length of a segment.
 pub fn segment_len(root: &Path, kind: SegmentKind, id: u64) -> u64 {
     dev(root).open_segment(kind, id).unwrap().len()
@@ -149,4 +154,26 @@ pub fn device_bytes(root: &Path) -> Vec<u8> {
         at = hole;
     }
     out
+}
+
+/// A crash image of a device: a copy of its bytes as they are right now
+/// (written or not yet synced), holes kept, at `to` (a directory, as a
+/// device path is).
+pub fn copy_device(from: &Path, to: &Path) {
+    use nix::unistd::{Whence, lseek};
+    use std::os::unix::fs::FileExt;
+    std::fs::create_dir_all(to).unwrap();
+    let src = std::fs::File::open(lchfs_device::resolve(from)).unwrap();
+    let size = src.metadata().unwrap().len();
+    let dst = std::fs::File::create(to.join(lchfs_device::IMAGE_NAME)).unwrap();
+    dst.set_len(size).unwrap();
+    let mut at = 0i64;
+    while (at as u64) < size {
+        let Ok(data) = lseek(&src, at, Whence::SeekData) else { break };
+        let hole = lseek(&src, data, Whence::SeekHole).unwrap_or(size as i64);
+        let mut buf = vec![0u8; (hole - data) as usize];
+        src.read_exact_at(&mut buf, data as u64).unwrap();
+        dst.write_all_at(&buf, data as u64).unwrap();
+        at = hole;
+    }
 }
