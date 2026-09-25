@@ -707,7 +707,7 @@ pub fn parse_symlink_reparse_buffer(buf: &[u8]) -> Result<String> {
     }
     let start = SYMLINK_HEADER + sub_off;
     let raw = buf.get(start..start + sub_len).ok_or(status::IO_REPARSE_DATA_INVALID)?;
-    let units: Vec<u16> = raw.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    let units: Vec<u16> = raw.as_chunks::<2>().0.iter().map(|&c| u16::from_le_bytes(c)).collect();
     let target = String::from_utf16(&units).map_err(|_| status::OBJECT_NAME_INVALID)?;
     if target.is_empty() {
         return Err(status::IO_REPARSE_DATA_INVALID);

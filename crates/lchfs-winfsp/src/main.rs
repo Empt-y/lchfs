@@ -162,7 +162,7 @@ mod win {
         let mut secret = LockedBytes::with_capacity(LockedBytes::MAX);
         secret.read_to_end_from(&mut file).with_context(|| path.display().to_string())?;
         // One trailing newline is the file's, not the passphrase's.
-        for end in [b'\n', b'\r'] {
+        for end in *b"\n\r" {
             if secret.last() == Some(&end) {
                 secret.pop();
             }
