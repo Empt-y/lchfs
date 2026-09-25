@@ -1317,7 +1317,7 @@ impl Pool {
         // the state a rerun handles as a replacement.
         if new_count != membership.vdev_count {
             for (slot, root) in &membership.members {
-                let backend = FileBackend::open(root)?;
+                let backend = FileBackend::open_existing(root)?;
                 let mut updated = *slot;
                 updated.vdev_count = new_count;
                 finalize_superblock_slot_checksum(&mut updated);
@@ -1459,7 +1459,7 @@ impl Pool {
             if slot.vdev_id == leaving {
                 continue;
             }
-            let backend = FileBackend::open(root)?;
+            let backend = FileBackend::open_existing(root)?;
             let mut updated = *slot;
             updated.vdev_count = leaving;
             finalize_superblock_slot_checksum(&mut updated);
@@ -1494,7 +1494,7 @@ impl Pool {
             if !seen.insert(canonical) {
                 return Ok(());
             }
-            let backend = FileBackend::open(dir)?;
+            let backend = FileBackend::open_existing(dir)?;
             match read_superblock(&backend) {
                 Ok(Some(slot)) => found.push((
                     slot.pool_uuid,
@@ -1617,7 +1617,7 @@ impl Pool {
         let mut set_members = Vec::with_capacity(members.len());
         for (slot, root) in &members {
             let lock = acquire_pool_lock(root)?;
-            let backend = FileBackend::open(root)?;
+            let backend = FileBackend::open_existing(root)?;
             set_members.push(VdevSet::member(Vdev::new(slot.vdev_id, root.to_path_buf()), backend, lock));
         }
         let vdev_set = Arc::new(VdevSet::new(set_members, vdev_count));
@@ -4546,7 +4546,7 @@ impl PoolShared {
                 root.display()
             )));
         }
-        let probe = FileBackend::open(root)?;
+        let probe = FileBackend::open_existing(root)?;
         let slot = read_superblock(&probe)?.ok_or_else(|| {
             PoolError::Format(format!("no valid superblock found at {}", root.display()))
         })?;
@@ -4633,7 +4633,7 @@ impl PoolShared {
             Some(member) => member,
             None => {
                 let lock = acquire_pool_lock(root)?;
-                let backend = FileBackend::open(root)?;
+                let backend = FileBackend::open_existing(root)?;
                 VdevSet::member(Vdev::new(id, root.to_path_buf()), backend, lock)
             }
         };
@@ -6925,14 +6925,20 @@ fn check_membership<'a>(given_roots: &[&'a Path], allow_missing: bool) -> Result
     for root in given_roots {
         // `FileBackend::open` formats a device that has no layout; a path
         // that is merely wrong must not be formatted for having been
-        // named.
+        // named. A device that is there but will not open (in use by a
+        // mount, say) says so, rather than looking unformatted.
+        if let Err(e) = lchfs_device::Device::open(root)
+            && !matches!(e.kind(), std::io::ErrorKind::InvalidData | std::io::ErrorKind::NotFound)
+        {
+            return Err(e.into());
+        }
         if !lchfs_device::is_formatted(root) || !backend::ring_written(root) {
             return Err(PoolError::Format(format!(
                 "no valid superblock found at {} — was create-pool run?",
                 root.display()
             )));
         }
-        let backend = FileBackend::open(root)?;
+        let backend = FileBackend::open_existing(root)?;
         let slot = read_superblock(&backend)?.ok_or_else(|| {
             PoolError::Format(format!(
                 "no valid superblock found at {} — was create-pool run?",

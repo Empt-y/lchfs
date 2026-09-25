@@ -920,6 +920,7 @@ dependencies = [
  "anyhow",
  "lchfs-cli",
  "lchfs-crypto",
+ "lchfs-store",
  "tempfile",
 ]
 
@@ -941,6 +942,7 @@ dependencies = [
  "fuser",
  "hex",
  "lchfs-crypto",
+ "lchfs-device",
  "lchfs-format",
  "lchfs-fsck",
  "lchfs-fuse",

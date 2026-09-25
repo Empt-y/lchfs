@@ -8,7 +8,8 @@
 use lchfs_format::{Hash32, PoolParams, STRIPE_DESCRIPTOR_OFFSET, StripeDescriptor};
 use lchfs_fsck::FsckError;
 use lchfs_store::Pool;
-use lchfs_store::stripe::{segment_ids_with_shards, shard_path, shards_on};
+use lchfs_store::stripe::{remove_shard, segment_ids_with_shards, shard_kind, shards_on};
+use lchfs_store::testing::{read_segment, write_segment};
 use std::path::Path;
 
 fn striped_params() -> PoolParams {
@@ -109,7 +110,7 @@ fn a_missing_shard_is_reported_and_rebuilt() {
 
     let lost = striped[0];
     let index = shards_on(c.path(), lost)[0];
-    std::fs::remove_file(shard_path(c.path(), lost, index)).unwrap();
+    remove_shard(c.path(), lost, index).unwrap();
 
     let live = lchfs_fsck::collect_live_roots(a.path()).unwrap();
     let report = lchfs_fsck::check_devices(&roots, &live);
@@ -149,13 +150,12 @@ fn a_corrupt_shard_is_reported_and_rebuilt() {
 
     let hit = striped[1];
     let index = shards_on(b.path(), hit)[0];
-    let path = shard_path(b.path(), hit, index);
-    let mut bytes = std::fs::read(&path).unwrap();
+    let mut bytes = read_segment(b.path(), shard_kind(index), hit);
     let n = bytes.len();
     for x in &mut bytes[n - 100..n - 40] {
         *x ^= 0x5a;
     }
-    std::fs::write(&path, &bytes).unwrap();
+    write_segment(b.path(), shard_kind(index), hit, &bytes);
 
     let report = lchfs_fsck::check_stripes(&roots);
     assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
@@ -189,8 +189,7 @@ fn parity_that_disagrees_with_the_data_is_caught() {
         .flat_map(|r| shards_on(r, hit).into_iter().map(move |i| (*r, i)))
         .find(|(_, i)| *i == 2)
         .expect("a parity shard");
-    let path = shard_path(root, hit, index);
-    let mut file = std::fs::read(&path).unwrap();
+    let mut file = read_segment(root, shard_kind(index), hit);
     let page = 4096usize;
     for x in &mut file[page + 10..page + 30] {
         *x ^= 0xff;
@@ -202,7 +201,7 @@ fn parity_that_disagrees_with_the_data_is_caught() {
     let encoded = lchfs_format::encode(&desc).unwrap();
     assert_eq!(encoded.len(), len, "the descriptor re-encodes to the same size");
     file[at + 4..at + 4 + len].copy_from_slice(&encoded);
-    std::fs::write(&path, &file).unwrap();
+    write_segment(root, shard_kind(index), hit, &file);
 
     let report = lchfs_fsck::check_stripes(&roots);
     assert!(

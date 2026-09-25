@@ -11,7 +11,7 @@
 //! code. Everything this crate reads (segment file layout, the superblock
 //! ring's on-disk encoding) is the documented on-disk format from
 //! ARCHITECTURE.md §1, reconstructed here from lchfs-store's genuinely
-//! public API (`segment::SegmentReader`, `backend::FileBackend`) rather
+//! public API (`segment::SegmentReader`, `lchfs_device`) rather
 //! than any `pub(crate)`-only helper.
 
 pub mod stripes;
@@ -22,7 +22,6 @@ use lchfs_format::{
     SUPERBLOCK_SLOT_COUNT, SUPERBLOCK_SLOT_SIZE, SuperblockSlot, compute_superblock_slot_checksum,
 };
 use lchfs_index::{IndexStore, RedbIndex, STRIPED_VDEV};
-use lchfs_store::backend::{FileBackend, StorageBackend};
 use lchfs_store::segment::{SegmentError, SegmentReader};
 use serde::de::DeserializeOwned;
 use std::collections::{HashMap, HashSet};
@@ -213,13 +212,14 @@ fn device_ids<'a>(vdev_roots: &[&'a Path]) -> Result<Vec<(u16, &'a Path)>, FsckE
 /// shared with it -- see this module's doc comment): every slot's magic,
 /// header checksum, then the highest-generation CRC-valid slot wins.
 pub fn read_superblock(pool_root: &Path) -> Result<SuperblockSlot, FsckError> {
-    let backend = FileBackend::open(pool_root)
-        .map_err(|e| FsckError::Io(format!("opening superblock: {e}")))?;
+    // Read-only and shared: this identifies a device even while a mount
+    // holds it exclusively.
+    let ring = lchfs_device::peek_superblock_ring(pool_root)
+        .map_err(|e| FsckError::Io(format!("reading superblock: {e}")))?;
     let mut best: Option<SuperblockSlot> = None;
     for slot_idx in 0..SUPERBLOCK_SLOT_COUNT {
-        let bytes = backend
-            .read_at(slot_idx as u64 * SUPERBLOCK_SLOT_SIZE as u64, SUPERBLOCK_SLOT_SIZE as u32)
-            .map_err(|e| FsckError::Io(format!("reading superblock slot {slot_idx}: {e}")))?;
+        let at = slot_idx as usize * SUPERBLOCK_SLOT_SIZE as usize;
+        let Some(bytes) = ring.get(at..at + SUPERBLOCK_SLOT_SIZE as usize) else { continue };
         if bytes.len() < 4 {
             continue;
         }

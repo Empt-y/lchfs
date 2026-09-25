@@ -78,4 +78,5 @@ anyhow = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+lchfs-store = { workspace = true }
 lchfs-crypto = { workspace = true }

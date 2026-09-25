@@ -74,7 +74,11 @@ pub struct ShardDeltaLog {
     vdevs: Arc<VdevSet>,
     /// Snapshot of `vdevs` as of the current segment.
     vdev_roots: Vec<PathBuf>,
-    writer: SegmentWriter,
+    /// The segment commits append to. Started by the first commit, not at
+    /// open: on a device every segment holds a zone, and most of a pool's
+    /// many shards may never see an fsync between two mounts.
+    writer: Option<SegmentWriter>,
+    /// The id the next segment started takes.
     next_segment_id: u64,
     local_epoch: u64,
     delta_log_tail: ExtentLocation,
@@ -82,7 +86,7 @@ pub struct ShardDeltaLog {
 
 impl ShardDeltaLog {
     /// Opens shard `shard_id`'s delta log, always starting a *fresh*
-    /// segment for new writes (mirroring `Pool::open` always starting
+    /// segment for new writes -- at its first commit -- (mirroring `Pool::open` always starting
     /// fresh data/meta writers at mount) while recovering `local_epoch`/
     /// `delta_log_tail` from the shard's own superblock file, if present
     /// and valid. A missing or corrupt shard superblock degrades to
@@ -118,11 +122,6 @@ impl ShardDeltaLog {
         }
         let next_id = max_id.map_or(0, |m| m + 1);
 
-        let mut writer = SegmentWriter::create_delta_on(&online, shard_id, next_id)?;
-        for id in writer.take_faults() {
-            vdevs.fault(id);
-        }
-
         // The shard superblock fans out too; whichever device's copy is
         // furthest along is the truth, since a crash can land between two
         // devices' writes of the same commit.
@@ -141,8 +140,8 @@ impl ShardDeltaLog {
             shard_id,
             vdevs,
             vdev_roots,
-            writer,
-            next_segment_id: next_id + 1,
+            writer: None,
+            next_segment_id: next_id,
             local_epoch,
             delta_log_tail,
         })
@@ -153,30 +152,50 @@ impl ShardDeltaLog {
     /// after it fans out to the new device too. The old segment stays
     /// where it is: replay walks every segment on every device.
     pub fn roll_over(&mut self) -> io::Result<()> {
-        let online = self.vdevs.online();
-        let id = self.next_segment_id;
-        self.next_segment_id += 1;
-        let new_writer = SegmentWriter::create_delta_on(&online, self.shard_id, id)?;
-        let old = std::mem::replace(&mut self.writer, new_writer);
-        self.vdev_roots = online.into_iter().map(|v| v.root).collect();
-        self.report_faults();
+        let Some(old) = self.writer.take() else {
+            // Nothing started yet: the first commit starts on the set as
+            // it stands then.
+            self.vdev_roots = self.vdevs.online().into_iter().map(|v| v.root).collect();
+            return Ok(());
+        };
+        self.start_segment()?;
         for id in old.seal()? {
             self.vdevs.fault(id);
         }
         Ok(())
     }
 
+    /// Starts a new segment on the device set as it stands now.
+    fn start_segment(&mut self) -> io::Result<()> {
+        let online = self.vdevs.online();
+        let id = self.next_segment_id;
+        self.next_segment_id += 1;
+        self.writer = Some(SegmentWriter::create_delta_on(&online, self.shard_id, id)?);
+        self.vdev_roots = online.into_iter().map(|v| v.root).collect();
+        self.report_faults();
+        Ok(())
+    }
+
+    /// The current segment, started if there is none.
+    fn writer(&mut self) -> io::Result<&mut SegmentWriter> {
+        if self.writer.is_none() {
+            self.start_segment()?;
+        }
+        Ok(self.writer.as_mut().expect("started above"))
+    }
+
     /// Reports replicas the current segment has dropped, and stops
     /// writing the shard superblock to them.
     fn report_faults(&mut self) {
-        let faults = self.writer.take_faults();
+        let Some(writer) = self.writer.as_mut() else { return };
+        let faults = writer.take_faults();
         if faults.is_empty() {
             return;
         }
         for id in &faults {
             self.vdevs.fault(*id);
         }
-        let still: Vec<u16> = self.writer.vdev_ids().to_vec();
+        let still: Vec<u16> = writer.vdev_ids().to_vec();
         let online = self.vdevs.online();
         self.vdev_roots = online
             .into_iter()
@@ -209,7 +228,7 @@ impl ShardDeltaLog {
         let record_epoch = crypto.current_epoch();
         for record in records {
             let appended = crate::crypto::append_fresh(
-                &mut self.writer,
+                self.writer()?,
                 crypto,
                 record_epoch,
                 record.kind,
@@ -231,7 +250,7 @@ impl ShardDeltaLog {
         let encoded = lchfs_format::encode(&entry).map_err(decode_error)?;
         let entry_hash = crypto.address_in(record_epoch, &encoded);
         let appended = crate::crypto::append_fresh(
-            &mut self.writer,
+            self.writer()?,
             crypto,
             record_epoch,
             ExtentKind::DeltaLogEntry,
@@ -243,7 +262,7 @@ impl ShardDeltaLog {
         self.report_faults();
         let loc = appended?;
 
-        let synced = self.writer.fsync();
+        let synced = self.writer()?.fsync();
         self.report_faults();
         synced?;
 
@@ -254,15 +273,17 @@ impl ShardDeltaLog {
         // new segment for the next one. A commit's records and its entry
         // therefore always share a segment -- what `truncate_through`
         // relies on to delete them together.
-        if self.writer.current_size() >= DELTA_ROLL_BYTES {
+        if self.writer()?.current_size() >= DELTA_ROLL_BYTES {
             self.roll_over()?;
         }
         Ok(())
     }
 
-    /// The segment new commits go to; never a truncation candidate.
+    /// The segment new commits go to -- or, before the first, will go
+    /// to; never a truncation candidate, and every segment already on a
+    /// device has a lower id.
     pub fn current_segment_id(&self) -> u64 {
-        self.writer.segment_id()
+        self.writer.as_ref().map_or(self.next_segment_id, SegmentWriter::segment_id)
     }
 
     /// The roots this log writes to right now.

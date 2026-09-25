@@ -49,8 +49,16 @@ pub const IMAGE_NAME: &str = "lchfs.img";
 /// only what is written. `LCHFS_IMAGE_SIZE` (bytes) overrides it.
 pub const DEFAULT_IMAGE_SIZE: u64 = 4 << 30;
 
-/// Zone size on a block device.
-pub const DEFAULT_ZONE_SIZE: u64 = 16 << 20;
+/// The largest zone size a block device gets by default.
+pub const MAX_DEFAULT_ZONE_SIZE: u64 = 16 << 20;
+
+/// The zone size a block device of `device_size` bytes gets by default:
+/// about 64Ki zones, so a mount's zone-header scan stays short, but
+/// between 1 MiB and 16 MiB. Small devices get small zones, since every
+/// open segment (one per busy logical shard) holds at least one zone.
+pub fn default_zone_size(device_size: u64) -> u64 {
+    (device_size / (64 << 10)).next_power_of_two().clamp(MIB, MAX_DEFAULT_ZONE_SIZE)
+}
 
 /// Zone size in an image file: small, so tests with many tiny segments do
 /// not need a large image.
@@ -74,7 +82,7 @@ fn align_up(v: u64, to: u64) -> u64 {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FormatOptions {
     /// Zone size in bytes: a power of two, at least 64 KiB. `None` picks
-    /// [`DEFAULT_ZONE_SIZE`], or [`DEFAULT_IMAGE_ZONE_SIZE`] for an image.
+    /// [`default_zone_size`], or [`DEFAULT_IMAGE_ZONE_SIZE`] for an image.
     pub zone_size: Option<u64>,
     /// Bytes for each of the two index copies. `None` picks 0.5% of the
     /// device, at least 64 MiB.
@@ -195,6 +203,20 @@ fn read_label(file: &File) -> Option<DeviceLabel> {
     }
 }
 
+/// The superblock ring of the device at `path`, read without opening it
+/// for writing or exclusively: what a tool uses to identify a device that
+/// a mount may be holding (`lchfs pool status` finding the mount's control
+/// socket, say). Only as current as the last ring write that reached it.
+pub fn peek_superblock_ring(path: &Path) -> io::Result<Vec<u8>> {
+    let file = File::open(resolve(path))?;
+    let label = read_label(&file).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, format!("{} is not a formatted LCHFS device", path.display()))
+    })?;
+    let mut ring = vec![0u8; label.superblock.len as usize];
+    file.read_exact_at(&mut ring, label.superblock.offset)?;
+    Ok(ring)
+}
+
 /// Writes both copies of `label`, each followed by a flush: a torn write
 /// of either leaves the other intact.
 fn write_label(file: &File, label: &DeviceLabel) -> io::Result<()> {
@@ -233,7 +255,7 @@ pub fn format(path: &Path, options: FormatOptions) -> io::Result<()> {
     };
     let size = device_size(&file)?;
     let zone_size =
-        options.zone_size.unwrap_or(if block { DEFAULT_ZONE_SIZE } else { DEFAULT_IMAGE_ZONE_SIZE });
+        options.zone_size.unwrap_or(if block { default_zone_size(size) } else { DEFAULT_IMAGE_ZONE_SIZE });
     let label = plan_layout(size, zone_size, options.index_copy_len)?;
     // Everything a mount reads before the zones must start out empty:
     // an old superblock ring, keyring or shard superblock would be read

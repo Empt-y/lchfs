@@ -1,5 +1,6 @@
 //! End-to-end tests for `lchfs-fsck` against a real on-disk pool.
 
+use lchfs_store::testing::SegmentKind;
 use lchfs_format::PoolParams;
 use lchfs_store::Pool;
 
@@ -92,18 +93,14 @@ fn corrupted_chunk_payload_is_detected() {
     // header page, so this corrupts an actual record's bytes rather than
     // the segment header. With multiple logical shards, most segments are
     // empty (header page only); pick one that actually holds a record.
-    let data_dir = dir.path().join("segments/data");
-    let mut entries: Vec<_> = std::fs::read_dir(&data_dir).unwrap().collect::<Result<_, _>>().unwrap();
-    entries.sort_by_key(|e| e.file_name());
-    let target = entries
-        .iter()
-        .map(|e| e.path())
-        .find(|p| std::fs::metadata(p).unwrap().len() > 4096 + 100)
+    let target = data_segments(dir.path())
+        .into_iter()
+        .find(|&id| lchfs_store::testing::segment_len(dir.path(), SegmentKind::Data, id) > 4096 + 100)
         .expect("at least one data segment must hold the written chunk");
-    let mut bytes = std::fs::read(&target).unwrap();
     let corrupt_at = 4096 + 100; // header page + a bit into the first record
-    bytes[corrupt_at] ^= 0xff;
-    std::fs::write(&target, &bytes).unwrap();
+    let mut byte = lchfs_store::testing::read_segment(dir.path(), SegmentKind::Data, target)[corrupt_at];
+    byte ^= 0xff;
+    lchfs_store::testing::write_at(dir.path(), SegmentKind::Data, target, corrupt_at as u64, &[byte]);
 
     let live_roots = lchfs_fsck::collect_live_roots(dir.path()).unwrap();
     let report = lchfs_fsck::check(dir.path(), &live_roots);
@@ -167,14 +164,8 @@ fn setup_replicated_pool(a: &std::path::Path, b: &std::path::Path) {
     pool.checkpoint().unwrap();
 }
 
-fn data_segments(root: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let mut v: Vec<_> = std::fs::read_dir(root.join("segments/data"))
-        .unwrap()
-        .flatten()
-        .map(|e| e.path())
-        .collect();
-    v.sort();
-    v
+fn data_segments(root: &std::path::Path) -> Vec<u64> {
+    lchfs_store::testing::segment_ids(root, SegmentKind::Data)
 }
 
 #[test]
@@ -193,7 +184,7 @@ fn a_record_missing_from_one_vdev_is_reported_against_that_vdev() {
     let b = tempfile::tempdir().unwrap();
     setup_replicated_pool(a.path(), b.path());
     for f in data_segments(b.path()) {
-        lchfs_store::testing::remove_segment(b.path(), lchfs_store::testing::SegmentKind::Data, f).unwrap();
+        lchfs_store::testing::remove_segment(b.path(), SegmentKind::Data, f).unwrap();
     }
     let report = lchfs_fsck::check_replicas(&[a.path(), b.path()]);
     let missing_on_b = report
@@ -214,14 +205,14 @@ fn a_corrupt_replica_is_reported_and_the_good_one_is_not() {
     let a = tempfile::tempdir().unwrap();
     let b = tempfile::tempdir().unwrap();
     setup_replicated_pool(a.path(), b.path());
-    for path in data_segments(b.path()) {
-        let mut bytes = std::fs::read(&path).unwrap();
+    for id in data_segments(b.path()) {
+        let mut bytes = lchfs_store::testing::read_segment(b.path(), SegmentKind::Data, id);
         if bytes.len() > 8192 {
             let mid = bytes.len() / 2;
             for x in &mut bytes[mid..mid + 64] {
                 *x ^= 0xff;
             }
-            std::fs::write(&path, &bytes).unwrap();
+            lchfs_store::testing::write_segment(b.path(), SegmentKind::Data, id, &bytes);
         }
     }
     let report = lchfs_fsck::check_replicas(&[a.path(), b.path()]);
@@ -245,14 +236,14 @@ fn a_healed_pool_compares_clean() {
     let a = tempfile::tempdir().unwrap();
     let b = tempfile::tempdir().unwrap();
     setup_replicated_pool(a.path(), b.path());
-    for path in data_segments(b.path()) {
-        let mut bytes = std::fs::read(&path).unwrap();
+    for id in data_segments(b.path()) {
+        let mut bytes = lchfs_store::testing::read_segment(b.path(), SegmentKind::Data, id);
         if bytes.len() > 8192 {
             let mid = bytes.len() / 2;
             for x in &mut bytes[mid..mid + 64] {
                 *x ^= 0xff;
             }
-            std::fs::write(&path, &bytes).unwrap();
+            lchfs_store::testing::write_segment(b.path(), SegmentKind::Data, id, &bytes);
         }
     }
     {
@@ -323,7 +314,7 @@ fn rebuild_index_records_every_vdevs_replicas() {
     lchfs_fsck::rebuild_index(a.path(), &[b.path()]).unwrap();
 
     for f in data_segments(a.path()) {
-        lchfs_store::testing::remove_segment(a.path(), lchfs_store::testing::SegmentKind::Data, f).unwrap();
+        lchfs_store::testing::remove_segment(a.path(), SegmentKind::Data, f).unwrap();
     }
     let pool = Pool::open_replicated(&[a.path(), b.path()]).unwrap();
     let ino = pool.lookup(1, "chunked.bin").unwrap().unwrap();
@@ -352,14 +343,14 @@ fn damage_mid_segment_is_reported_without_hiding_what_follows() {
     setup_replicated_pool(a.path(), b.path());
 
     // Scribble over the middle third of b's real data segments.
-    for path in data_segments(b.path()) {
-        let mut bytes = std::fs::read(&path).unwrap();
+    for id in data_segments(b.path()) {
+        let mut bytes = lchfs_store::testing::read_segment(b.path(), SegmentKind::Data, id);
         if bytes.len() > 8192 {
             let third = bytes.len() / 3;
             for x in &mut bytes[third..2 * third] {
                 *x = 0xEE;
             }
-            std::fs::write(&path, &bytes).unwrap();
+            lchfs_store::testing::write_segment(b.path(), SegmentKind::Data, id, &bytes);
         }
     }
 
