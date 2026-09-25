@@ -43,7 +43,7 @@ impl Key32 {
             _ => None,
         };
         let mut slot = Slot::new();
-        for (out, pair) in slot.bytes_mut().iter_mut().zip(digits.chunks_exact(2)) {
+        for (out, pair) in slot.bytes_mut().iter_mut().zip(digits.as_chunks::<2>().0) {
             *out = (nibble(pair[0])? << 4) | nibble(pair[1])?;
         }
         Some(Self(slot))

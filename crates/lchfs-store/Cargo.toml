@@ -24,8 +24,13 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 blake3 = { workspace = true }
 serde = { workspace = true }
-nix = { workspace = true, features = ["fs", "user"] }
 arc-swap = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["fs", "user"] }
+
+[target.'cfg(windows)'.dependencies]
+fs4 = { version = "0.13", features = ["sync"] }
 
 [features]
 # Test-only: lets a test declare a device root dead so every replica
@@ -46,6 +51,8 @@ lchfs-store = { path = ".", features = ["fault-injection"] }
 tempfile = { workspace = true }
 criterion = { workspace = true }
 lchfs-fsck = { workspace = true }
+
+[target.'cfg(unix)'.dev-dependencies]
 nix = { workspace = true, features = ["user"] }
 
 [[bench]]

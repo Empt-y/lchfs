@@ -263,7 +263,9 @@ fn generation_change_mid_pass_blocks_deletion_even_without_a_pin() {
     );
 
     // And nothing was corrupted along the way -- every survivor still
-    // reads back correctly through a fresh mount.
+    // reads back correctly through a fresh mount. Which opens the index
+    // itself: close this handle first (Windows locks it per handle).
+    drop(persisted_index);
     let pool2 = Pool::open(dir.path()).unwrap();
     for (ino, expected) in &survivors {
         let read_back = pool2.read(*ino, 0, expected.len() as u32).unwrap();
@@ -375,6 +377,7 @@ fn a_chunk_identical_to_a_meta_object_reads_back() {
 
 /// Open descriptors this process holds on files under `root` that have
 /// since been unlinked -- what the kernel shows as "(deleted)".
+#[cfg(target_os = "linux")]
 fn deleted_fds_under(root: &std::path::Path) -> usize {
     std::fs::read_dir("/proc/self/fd")
         .unwrap()
@@ -387,6 +390,7 @@ fn deleted_fds_under(root: &std::path::Path) -> usize {
 }
 
 #[test]
+#[cfg(target_os = "linux")] // counts descriptors through /proc/self/fd
 fn coalesce_closes_its_readers_on_segments_it_deleted() {
     // An open reader keeps an unlinked segment's space allocated and costs
     // a descriptor; the reader cache used to keep one for every segment

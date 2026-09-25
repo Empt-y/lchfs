@@ -67,7 +67,9 @@ fn all_bytes_under(root: &Path) -> Vec<u8> {
             let ty = entry.file_type().unwrap();
             if ty.is_dir() {
                 stack.push(entry.path());
-            } else if ty.is_file() {
+            } else if ty.is_file() && entry.file_name() != "LOCK" {
+                // The pool's LOCK file is empty, and on Windows the live
+                // pool's lock covers it whole, so it cannot be read.
                 out.extend(std::fs::read(entry.path()).unwrap());
             }
         }

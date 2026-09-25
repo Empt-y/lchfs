@@ -84,3 +84,43 @@ jobs:
           sleep 1
           LCHFS_TEST_TPM=1 LCHFS_TPM_TCTI="swtpm:host=127.0.0.1,port=2331" \
             cargo test --test cli_encryption a_tpm
+
+  # The Windows frontend (lchfs-winfsp) and the engine it runs, built and
+  # tested on Windows itself: its tests create real pools on NTFS, so they
+  # exercise the engine's Windows paths (positional I/O, the pool lock,
+  # free space) as well as the frontend. No WinFsp is needed -- the DLL is
+  # loaded only when mounting, which CI does not do.
+  windows:
+    name: Windows frontend (build, test, clippy)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build -p lchfs-winfsp --all-targets
+
+      - name: Test
+        run: cargo test -p lchfs-winfsp
+
+      - name: Test (every pool encrypted)
+        run: cargo test -p lchfs-winfsp --release --features lchfs-crypto/test-encrypt-all
+
+      # The engine's own suites on real Windows and NTFS: GC, conversion,
+      # stripes and recovery against Windows file semantics (a file
+      # deleted while open, a file replaced while open), which Wine only
+      # approximates. Optimized, as on Linux, for the torture tests.
+      # A hang fails the step, with the log saying which test (libtest
+      # reports any test running for over 60 s), rather than holding the
+      # job until the runner's six-hour limit, with no log until then.
+      - name: Engine tests on Windows
+        timeout-minutes: 45
+        run: cargo test --release --no-fail-fast -p lchfs-crypto -p lchfs-format -p lchfs-index -p lchfs-store -p lchfs-fsck
+
+      - name: Clippy
+        run: cargo clippy -p lchfs-winfsp -p lchfs-fsck --all-targets -- -D warnings

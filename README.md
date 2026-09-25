@@ -110,6 +110,50 @@ mounted pool go through its control socket (owner-only, and every change
 must be proven with a key the pool already has); on an unmounted pool they
 write every device's keyring directly, under the pool lock.
 
+## Windows
+
+`lchfs-win` mounts a pool as a Windows drive through
+[WinFsp](https://winfsp.dev), the Windows counterpart of FUSE: WinFsp's
+signed kernel driver does the kernel side, and `lchfs-win` is the
+user-mode file system it talks to, running the same engine as Linux.
+
+```bat
+:: Install WinFsp first (https://winfsp.dev/rel/), then:
+cargo build --release -p lchfs-winfsp
+
+lchfs-win create-pool D:\pool --encrypt      :: asks for a passphrase twice
+lchfs-win mount D:\pool                      :: next free drive letter, Z: down
+lchfs-win mount D:\pool L: --read-only
+lchfs-win mount D:\pool C:\mnt\pool         :: a folder that does not exist yet
+lchfs-win mount D:\pool --identity recovery  :: or --passphrase-file FILE
+```
+
+Ctrl+C, or closing the window, unmounts after a final checkpoint. A pool
+is an ordinary directory, so one kept on an NTFS drive (which Linux reads
+and writes too) mounts on either system -- one at a time; the pool lock
+refuses a second mount. Keep Windows-side pools off FAT and exFAT: they
+cannot drop a file's name while it is still open, which holds up the last
+step of `pool encrypt`/`pool rekey` (removing the old key's segments).
+
+How Windows sees a pool:
+
+- **Names** match regardless of case, and keep the case they were created
+  with. An exact match wins, so two names that differ only in case (made
+  on Linux) both still open.
+- **Symlinks** are Windows symlinks, followed by Windows itself; Explorer
+  deletes a link to a folder without touching the folder. `mklink` works
+  for relative targets (and needs Developer Mode or an elevated prompt,
+  as it does on NTFS).
+- **Attributes** come from the Unix mode: a file with no owner-write bit
+  is read-only, and setting or clearing read-only changes the write bits.
+  Names starting with a dot are hidden.
+- **Permissions** are not mapped to ACLs: every file grants full access
+  to everyone, as on a FAT drive. New files take the owner of their
+  folder, so a pool shared with Linux stays writable by its owner there.
+
+Not on Windows yet: TPM key slots, multi-device pools (`--vdev`/`--scan`),
+and the `key`/`pool`/`snapshot` commands -- use the Linux CLI for those.
+
 ## Build
 
 ```sh
@@ -127,6 +171,7 @@ crates/
   lchfs-index/      persisted hash index (redb-backed)
   lchfs-store/      the engine — segments, ingress, checkpointing, GC
   lchfs-fuse/       FUSE3 frontend (fuser)
+  lchfs-winfsp/     Windows frontend (WinFsp) and the lchfs-win command
   lchfs-fsck/       DAG-walk verification
   lchfs-cli/        create-pool / mount / fsck / snapshot / key commands
   lchfs-testkit/    reference model + proptest generators (dev-only)

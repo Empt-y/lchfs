@@ -21,7 +21,7 @@ use reed_solomon_erasure::galois_8::ReedSolomon;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io;
-use std::os::unix::fs::FileExt;
+use lchfs_store::platform::FileExt;
 use std::path::{Path, PathBuf};
 
 /// One shard file as found on one device.

@@ -16,7 +16,7 @@
 use lchfs_format::{SUPERBLOCK_SLOT_COUNT, SUPERBLOCK_SLOT_SIZE};
 use std::fs::OpenOptions;
 use std::io;
-use std::os::unix::fs::FileExt;
+use crate::platform::FileExt;
 use std::path::{Path, PathBuf};
 
 /// One physical storage device backing (part of) a pool.

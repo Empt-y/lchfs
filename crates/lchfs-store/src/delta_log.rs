@@ -24,7 +24,7 @@ use lchfs_format::{
 };
 use std::fs::OpenOptions;
 use std::io;
-use std::os::unix::fs::FileExt;
+use crate::platform::FileExt;
 use std::path::{Path, PathBuf};
 
 const SHARD_SUPERBLOCK_FILE_SIZE: u64 = 4096;
