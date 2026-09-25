@@ -499,11 +499,24 @@ impl RedbIndex {
             }
             txn.commit().map_err(err)?;
         }
-        std::fs::rename(&tmp, path).map_err(err)?;
-        if let Some(dir) = path.parent() {
-            std::fs::File::open(dir).and_then(|d| d.sync_all()).map_err(err)?;
+        #[cfg(unix)]
+        {
+            std::fs::rename(&tmp, path).map_err(err)?;
+            if let Some(dir) = path.parent() {
+                std::fs::File::open(dir).and_then(|d| d.sync_all()).map_err(err)?;
+            }
+            self.db = fresh;
         }
-        self.db = fresh;
+        // Windows refuses to replace a file that is still open, so the old
+        // database is closed first; the new one, open under the temporary
+        // name, moves with the rename. Until the rename, the old file on
+        // disk is untouched, as on Unix. There is no directory to fsync:
+        // NTFS journals the rename itself.
+        #[cfg(windows)]
+        {
+            self.db = fresh;
+            std::fs::rename(&tmp, path).map_err(err)?;
+        }
         Ok(())
     }
 

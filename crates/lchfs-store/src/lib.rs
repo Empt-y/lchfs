@@ -40,6 +40,7 @@ pub mod dedup;
 pub mod delta_log;
 pub mod gc;
 pub mod ingress;
+pub mod platform;
 pub mod prep;
 pub mod rekey;
 pub mod segment;
@@ -65,8 +66,6 @@ use prep::{IngestPreparationPool, PrepTask, PreparedChunk, prepare_chunk_with};
 use segment::{SegmentError, SegmentReader, SegmentWriter};
 use vdevs::VdevSet;
 use std::collections::{HashMap, HashSet};
-use nix::errno::Errno;
-use nix::fcntl::{Flock, FlockArg};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1054,6 +1053,7 @@ impl Pool {
 
         let mut inodes = HashMap::new();
         let (now_secs, now_nanos) = now_unix();
+        let owner = platform::current_owner();
         // The root inode is owned by whoever runs `create`, not hardcoded to
         // uid/gid 0 -- with `DefaultPermissions` enabled at mount time, a
         // root owned by uid 0 would lock a non-root mounting user out of
@@ -1063,8 +1063,8 @@ impl Pool {
             InodeObject {
                 kind: InodeKind::Directory,
                 mode: 0o755,
-                uid: nix::unistd::getuid().as_raw(),
-                gid: nix::unistd::getgid().as_raw(),
+                uid: owner.0,
+                gid: owner.1,
                 size: 0,
                 nlink: 2,
                 atime: (now_secs, now_nanos),
@@ -5787,7 +5787,7 @@ impl PoolShared {
 
     /// Filesystem-wide usage stats for `statfs` (ARCHITECTURE.md §9).
     /// Block-level numbers come straight from the underlying filesystem at
-    /// `pool_root` (`nix::sys::statvfs`) -- a pool has no fixed capacity of
+    /// `pool_root` (`statvfs`, or `GetDiskFreeSpaceExW` on Windows) -- a pool has no fixed capacity of
     /// its own, it just grows on-disk, so the host filesystem's free space
     /// *is* the meaningful "how much more can I write" answer. Inode counts
     /// come from `Pool` itself: `files` is the live inode count, `ffree` a
@@ -5795,15 +5795,14 @@ impl PoolShared {
     /// with no real ceiling, not a fixed-size table.
     fn statfs(&self) -> Result<PoolStats, PoolError> {
         let root = self.vdevs.primary_root().unwrap_or_else(|| self.pool_root.clone());
-        let vfs = nix::sys::statvfs::statvfs(root.as_path())
-            .map_err(|e| PoolError::Io(std::io::Error::from(e)))?;
+        let vfs = platform::disk_space(root.as_path())?;
         let files_total = self.namespace.lock().inodes.len() as u64;
         Ok(PoolStats {
-            block_size: vfs.block_size() as u32,
-            fragment_size: vfs.fragment_size() as u32,
-            blocks_total: vfs.blocks(),
-            blocks_free: vfs.blocks_free(),
-            blocks_available: vfs.blocks_available(),
+            block_size: vfs.block_size,
+            fragment_size: vfs.fragment_size,
+            blocks_total: vfs.blocks,
+            blocks_free: vfs.blocks_free,
+            blocks_available: vfs.blocks_available,
             files_total,
             files_free: u32::MAX as u64,
             name_max: 255,
@@ -7067,7 +7066,9 @@ fn require_blank_device(root: &Path) -> Result<(), PoolError> {
     Ok(())
 }
 
-fn acquire_pool_lock(pool_root: &Path) -> Result<Flock<std::fs::File>, PoolError> {
+/// An exclusive `flock` (`LockFileEx` on Windows) on a pool's `LOCK` file,
+/// held for as long as the file stays open.
+fn acquire_pool_lock(pool_root: &Path) -> Result<std::fs::File, PoolError> {
     let path = pool_root.join("LOCK");
     let file = std::fs::OpenOptions::new()
         .read(true)
@@ -7075,12 +7076,12 @@ fn acquire_pool_lock(pool_root: &Path) -> Result<Flock<std::fs::File>, PoolError
         .create(true)
         .truncate(false)
         .open(&path)?;
-    match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
-        Ok(guard) => Ok(guard),
-        Err((_, Errno::EWOULDBLOCK)) => {
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => {
             Err(PoolError::PoolLocked(pool_root.display().to_string()))
         }
-        Err((_, errno)) => Err(PoolError::Io(std::io::Error::from(errno))),
+        Err(std::fs::TryLockError::Error(e)) => Err(PoolError::Io(e)),
     }
 }
 
@@ -7092,10 +7093,9 @@ fn slice_of(buf: &[u8], offset: u64, len: u32) -> Bytes {
     Bytes::copy_from_slice(&buf[start..end])
 }
 
-/// An opaque, RAII hold on a pool's `LOCK` file, released on drop. Keeps
-/// `nix`'s `Flock` out of this crate's public API.
+/// An opaque, RAII hold on a pool's `LOCK` file, released on drop.
 #[derive(Debug)]
-pub struct PoolLockGuard(#[allow(dead_code)] Flock<std::fs::File>);
+pub struct PoolLockGuard(#[allow(dead_code)] std::fs::File);
 
 /// Takes the same exclusive pool lock a live `Pool` holds, for callers that
 /// mutate a pool's on-disk state without opening one. Fails immediately with

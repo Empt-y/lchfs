@@ -263,7 +263,9 @@ fn generation_change_mid_pass_blocks_deletion_even_without_a_pin() {
     );
 
     // And nothing was corrupted along the way -- every survivor still
-    // reads back correctly through a fresh mount.
+    // reads back correctly through a fresh mount. Which opens the index
+    // itself: close this handle first (Windows locks it per handle).
+    drop(persisted_index);
     let pool2 = Pool::open(dir.path()).unwrap();
     for (ino, expected) in &survivors {
         let read_back = pool2.read(*ino, 0, expected.len() as u32).unwrap();

@@ -742,7 +742,7 @@ pub fn exists_on(root: &Path) -> bool {
 }
 
 /// Replaces the keyring on one root atomically: a temporary file, fsync,
-/// rename over the old one, fsync the directory. A crash leaves the old
+/// rename over the old one, fsync the directory (on Unix). A crash leaves the old
 /// keyring or the new one, never a torn mix.
 pub fn write_on(root: &Path, bytes: &[u8]) -> io::Result<()> {
     let tmp = root.join(format!("{KEYRING_FILE}.tmp"));
@@ -752,7 +752,11 @@ pub fn write_on(root: &Path, bytes: &[u8]) -> io::Result<()> {
         f.sync_all()?;
     }
     std::fs::rename(&tmp, path_on(root))?;
-    std::fs::File::open(root)?.sync_all()
+    // Windows cannot open a directory as a `File` to fsync it; NTFS
+    // journals the rename itself.
+    #[cfg(unix)]
+    std::fs::File::open(root)?.sync_all()?;
+    Ok(())
 }
 
 /// Writes to every root, returning the ones that failed. The caller

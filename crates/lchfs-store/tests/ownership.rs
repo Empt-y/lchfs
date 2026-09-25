@@ -5,6 +5,9 @@
 //! the precondition for enabling `DefaultPermissions` without locking a
 //! non-root mounting user out of their own pool.
 
+// Unix uid/gid; a pool created on Windows has no creating user's ids.
+#![cfg(unix)]
+
 use lchfs_format::PoolParams;
 use lchfs_store::Pool;
 

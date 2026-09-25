@@ -8,7 +8,6 @@
 //! *forced* to reach them by rolling each writer under its own lock.
 
 use crate::backend::{FileBackend, Vdev};
-use nix::fcntl::Flock;
 use parking_lot::RwLock;
 use std::collections::HashSet;
 use std::fs::File;
@@ -22,8 +21,9 @@ pub(crate) struct Member {
     /// paths, which never checkpoint.
     pub superblock: Option<FileBackend>,
     /// The advisory lock on its root, held for the mount's lifetime so two
-    /// mounts cannot share even a single device (§15.6). Never read.
-    _lock: Option<Flock<File>>,
+    /// mounts cannot share even a single device (§15.6): its `LOCK` file,
+    /// locked for as long as it stays open. Never read.
+    _lock: Option<File>,
 }
 
 pub(crate) struct VdevSetState {
@@ -96,7 +96,7 @@ impl VdevSet {
         self.primary.store(id, Ordering::Release);
     }
 
-    pub(crate) fn member(vdev: Vdev, superblock: FileBackend, lock: Flock<File>) -> Member {
+    pub(crate) fn member(vdev: Vdev, superblock: FileBackend, lock: File) -> Member {
         Member {
             vdev,
             superblock: Some(superblock),

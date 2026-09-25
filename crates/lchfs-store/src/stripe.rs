@@ -22,7 +22,7 @@ use lchfs_format::{
 use reed_solomon_erasure::galois_8::ReedSolomon;
 use std::fs::File;
 use std::io;
-use std::os::unix::fs::FileExt;
+use crate::platform::FileExt;
 use std::path::{Path, PathBuf};
 
 /// The `vdev_id` a striped record's index entry is keyed under (§17.2.2).

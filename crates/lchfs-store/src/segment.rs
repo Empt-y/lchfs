@@ -18,7 +18,7 @@ use lchfs_format::{
 use crate::backend::Vdev;
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::unix::fs::FileExt;
+use crate::platform::FileExt;
 use std::path::{Path, PathBuf};
 
 /// Fixed-size reserved page at the start of every segment file for its
