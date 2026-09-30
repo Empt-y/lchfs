@@ -39,27 +39,11 @@ fn setup() -> EncryptionSetup<'static> {
     }
 }
 
-/// Every byte under `root`, from every ordinary file (not a directory,
-/// not a socket) -- segments, delta logs, the superblock, the index, the
-/// keyring, all of it. What a leakage check has to grep.
+/// Every byte the device at `root` holds -- segments, delta logs, the
+/// superblock ring, the index, the keyring, freed space, all of it. What a
+/// leakage check has to grep.
 fn all_bytes_under(root: &std::path::Path) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir).unwrap() {
-            let entry = entry.unwrap();
-            let path = entry.path();
-            let file_type = entry.file_type().unwrap();
-            if file_type.is_dir() {
-                stack.push(path);
-            } else if file_type.is_file() && entry.file_name() != "LOCK" {
-                // The pool's LOCK file is empty, and on Windows the live
-                // pool's lock covers it whole, so it cannot be read.
-                out.extend(std::fs::read(&path).unwrap());
-            }
-        }
-    }
-    out
+    lchfs_store::testing::device_bytes(root)
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -254,10 +238,8 @@ fn padding_setting_is_honoured_end_to_end() {
     drop(padded);
 
     let segment_bytes = |root: &std::path::Path| -> u64 {
-        std::fs::read_dir(root.join("segments/data"))
-            .unwrap()
-            .map(|e| e.unwrap().metadata().unwrap().len())
-            .sum()
+        use lchfs_store::testing::{SegmentKind, segment_ids, segment_len};
+        segment_ids(root, SegmentKind::Data).into_iter().map(|id| segment_len(root, SegmentKind::Data, id)).sum()
     };
     assert!(
         segment_bytes(padded_dir.path()) > segment_bytes(unpadded_dir.path()),
@@ -278,23 +260,21 @@ fn every_bit_of_a_sealed_data_segment_is_authenticated() {
     pool.checkpoint().unwrap();
     drop(pool);
 
-    let data_dir = dir.path().join("segments/data");
+    use lchfs_store::testing::{SegmentKind, read_segment, segment_ids, write_at};
     let mut flips = 0;
-    for entry in std::fs::read_dir(&data_dir).unwrap() {
-        let path = entry.unwrap().path();
-        let mut bytes = std::fs::read(&path).unwrap();
+    for id in segment_ids(dir.path(), SegmentKind::Data) {
+        let bytes = read_segment(dir.path(), SegmentKind::Data, id);
         if bytes.len() <= 4096 + 50 {
             continue; // header page only, or too small to safely flip
         }
-        let original = bytes.clone();
-        bytes[4096 + 50] ^= 0xff;
-        std::fs::write(&path, &bytes).unwrap();
+        let original = bytes[4096 + 50];
+        write_at(dir.path(), SegmentKind::Data, id, 4096 + 50, &[original ^ 0xff]);
 
         let pool = Pool::open_with(dir.path(), &Unlock::Passphrase(PASSPHRASE)).unwrap();
         let ino = pool.lookup(1, "f").unwrap().unwrap();
         let result = pool.read(ino, 0, content.len() as u32);
         drop(pool);
-        std::fs::write(&path, &original).unwrap();
+        write_at(dir.path(), SegmentKind::Data, id, 4096 + 50, &[original]);
         if result.is_ok() {
             continue; // this byte wasn't inside the record we wrote
         }
@@ -321,12 +301,9 @@ fn every_metadata_kind_ends_up_sealed_not_only_raw_chunks() {
     drop(pool);
 
     let mut kinds: BTreeMap<String, u32> = BTreeMap::new();
-    for (sub, kind) in [("data", lchfs_format::StreamKind::Data), ("meta", lchfs_format::StreamKind::Meta)] {
-        let seg_dir = dir.path().join("segments").join(sub);
-        for entry in std::fs::read_dir(&seg_dir).unwrap() {
-            let path = entry.unwrap().path();
-            let stem: u64 = path.file_stem().unwrap().to_str().unwrap().parse().unwrap();
-            let Ok(reader) = lchfs_store::segment::SegmentReader::open(dir.path(), stem, kind) else { continue };
+    for kind in [lchfs_format::StreamKind::Data, lchfs_format::StreamKind::Meta] {
+        for id in lchfs_store::testing::segment_ids(dir.path(), lchfs_store::testing::kind(kind)) {
+            let Ok(reader) = lchfs_store::segment::SegmentReader::open(dir.path(), id, kind) else { continue };
             for (header, _offset) in reader.scan() {
                 *kinds.entry(format!("{:?}", header.kind)).or_insert(0) += 1;
             }
@@ -356,7 +333,7 @@ fn a_detached_device_takes_no_keyring_with_it() {
     drop(pool);
     assert!(!lchfs_crypto::keyring::exists_on(b.path()), "the detached device still holds the keyring");
 
-    std::fs::remove_dir_all(b.path().join("segments")).unwrap();
+    lchfs_store::testing::remove_segments(b.path(), |_| true);
     let reused = Pool::create(b.path(), small_params()).unwrap();
     drop(reused);
     if !lchfs_crypto::testing::TEST_ENCRYPT_ALL {
@@ -371,11 +348,9 @@ fn a_stray_keyring_makes_a_device_not_blank() {
     let donor = tempfile::tempdir().unwrap();
     drop(Pool::create_encrypted(donor.path(), small_params(), setup()).unwrap());
     let target = tempfile::tempdir().unwrap();
-    std::fs::copy(
-        lchfs_crypto::keyring::path_on(donor.path()),
-        lchfs_crypto::keyring::path_on(target.path()),
-    )
-    .unwrap();
+    lchfs_device::format(target.path(), Default::default()).unwrap();
+    let keyring = lchfs_crypto::keyring::read_on(donor.path()).unwrap().unwrap();
+    lchfs_crypto::keyring::write_on(target.path(), &keyring).unwrap();
     let err = Pool::create(target.path(), small_params()).unwrap_err();
     assert!(matches!(err, lchfs_store::PoolError::AlreadyExists(_)), "{err}");
 }
@@ -395,11 +370,8 @@ fn a_foreign_keyring_on_a_plaintext_pool_is_ignored() {
     pool.write(ino, 0, b"plaintext pool content").unwrap();
     pool.checkpoint().unwrap();
     drop(pool);
-    std::fs::copy(
-        lchfs_crypto::keyring::path_on(donor.path()),
-        lchfs_crypto::keyring::path_on(plain.path()),
-    )
-    .unwrap();
+    let keyring = lchfs_crypto::keyring::read_on(donor.path()).unwrap().unwrap();
+    lchfs_crypto::keyring::write_on(plain.path(), &keyring).unwrap();
     let pool = Pool::open(plain.path()).unwrap();
     assert!(!pool.is_encrypted());
     let ino = pool.lookup(1, "f").unwrap().unwrap();
@@ -454,4 +426,58 @@ fn fsck_without_a_key_says_so_instead_of_reporting_corruption() {
     assert!(matches!(report.errors[0], lchfs_fsck::FsckError::KeyRequired));
     let replicas = lchfs_fsck::check_replicas(&[dir.path()]);
     assert!(replicas.errors.iter().all(|e| matches!(e, lchfs_fsck::FsckError::KeyRequired)), "{:?}", replicas.errors);
+}
+
+/// Writes the seed corpora of the `sealed_segment` and `sealed_inner` fuzz
+/// targets. Run by hand when the format changes:
+/// `cargo test -p lchfs-store --test encryption write_sealed_fuzz_seeds -- --ignored`.
+/// The key and pool uuid must match the targets' `crypto()`.
+#[test]
+#[ignore]
+fn write_sealed_fuzz_seeds() {
+    use lchfs_compress::Codec;
+    use lchfs_crypto::Key32;
+    use lchfs_crypto::epoch::EpochKeys;
+    use lchfs_format::{CodecId, ExtentKind, RecordCrypto, StreamKind};
+    use lchfs_store::segment::SegmentWriter;
+    let crypto = RecordCrypto::new([3; 16], 1, 1, Padding::Padme, vec![EpochKeys::derive(1, &Key32::from_bytes([7; 32]))]);
+    let seeds = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/seeds");
+
+    // A sealed segment: raw and zstd chunks of a few sizes, then sealed
+    // with its footer.
+    let dir = tempfile::tempdir().unwrap();
+    lchfs_store::backend::FileBackend::open(dir.path()).unwrap();
+    let mut w = SegmentWriter::create(&[dir.path()], 1, StreamKind::Data, 0).unwrap();
+    for (i, len) in [0usize, 1, 100, 4096, 20_000].into_iter().enumerate() {
+        let data: Vec<u8> = (0..len).map(|j| ((i * 31 + j * 7) % 251) as u8).collect();
+        let (epoch, hash) = crypto.address(&data);
+        let (codec, payload) = if i % 2 == 1 {
+            (CodecId::Zstd, lchfs_compress::ZstdCodec.compress(&data, 3))
+        } else {
+            (CodecId::None, data.clone())
+        };
+        lchfs_store::crypto::append_fresh(&mut w, &crypto, epoch, ExtentKind::RawChunk, hash, codec, len as u32, &payload).unwrap();
+    }
+    w.seal().unwrap();
+    let out = seeds.join("sealed_segment");
+    std::fs::create_dir_all(&out).unwrap();
+    let segment = lchfs_store::testing::read_segment(dir.path(), lchfs_store::testing::SegmentKind::Data, 1);
+    std::fs::write(out.join("five-sealed-records"), segment).unwrap();
+
+    // Inner plaintexts (mode byte 0): the inner header -- encoded as the
+    // same fields in the same order `seal` writes, which bincode lays out
+    // identically for a tuple -- then the payload. And mode 1: one outer
+    // header byte flipped over a valid record.
+    let out = seeds.join("sealed_inner");
+    std::fs::create_dir_all(&out).unwrap();
+    let data = b"a chunk of file content".to_vec();
+    let (_, hash) = crypto.address(&data);
+    let inner_header = (ExtentKind::RawChunk, CodecId::None, data.len() as u32, data.len() as u32, vec![hash]);
+    let mut seed = vec![0u8];
+    seed.extend_from_slice(&lchfs_format::encode(&inner_header).unwrap());
+    seed.extend_from_slice(&data);
+    std::fs::write(out.join("valid-inner"), seed).unwrap();
+    let mut seed = vec![1u8, 0, 1, 0xFF];
+    seed.extend_from_slice(&data);
+    std::fs::write(out.join("flip-magic"), seed).unwrap();
 }

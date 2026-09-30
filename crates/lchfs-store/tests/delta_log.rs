@@ -4,7 +4,6 @@
 
 use lchfs_format::{ExtentKind, Hash32, RecordCrypto};
 use lchfs_store::delta_log::{ShardCommitRecord, ShardDeltaLog};
-use std::io::{Seek, SeekFrom, Write};
 
 /// A device is where its ring is: a writer refuses to create a segment
 /// on a root without one, so a bare directory is given a ring first.
@@ -95,17 +94,13 @@ fn torn_trailing_record_is_tolerated_not_fatal() {
     // shard) and truncate it mid-way through, simulating a crash during
     // the third append (which never actually happened here, but the byte
     // pattern is the same: a torn trailing record).
-    let seg_path = dir.path().join("segments/delta/00005/0.dseg");
-    assert!(seg_path.is_file());
-    let len = std::fs::metadata(&seg_path).unwrap().len();
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .open(&seg_path)
-        .unwrap();
+    use lchfs_store::testing::{SegmentKind, segment_exists, segment_len, truncate_segment};
+    let delta = SegmentKind::Delta { shard: 5 };
+    assert!(segment_exists(dir.path(), delta, 0));
+    let len = segment_len(dir.path(), delta, 0);
     // Truncate a few bytes off the end, into the middle of the last
     // record's header/payload rather than exactly on a boundary.
-    file.set_len(len - 3).unwrap();
-    drop(file);
+    truncate_segment(dir.path(), delta, 0, len - 3);
 
     let log = ShardDeltaLog::open(&[dir.path().to_path_buf()], 5).unwrap();
     let replay = log.replay_since(0, &RecordCrypto::plaintext()).unwrap();
@@ -131,15 +126,10 @@ fn corrupt_shard_superblock_degrades_to_fresh_state_not_a_hard_error() {
         let mut log = ShardDeltaLog::open(&[dir.path().to_path_buf()], 1).unwrap();
         log.commit(1, Hash32::of(b"x"), &[], &RecordCrypto::plaintext()).unwrap();
     }
-    let sb_path = dir.path().join("segments/delta/00001/superblock.sblk");
-    assert!(sb_path.is_file());
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .open(&sb_path)
-        .unwrap();
-    file.seek(SeekFrom::Start(20)).unwrap();
-    file.write_all(&[0xff; 16]).unwrap();
-    drop(file);
+    let mut slot = lchfs_store::testing::read_shard_superblock(dir.path(), 1);
+    assert!(slot.iter().any(|&b| b != 0), "the commit wrote shard 1's superblock");
+    slot[20..36].fill(0xff);
+    lchfs_store::testing::write_shard_superblock(dir.path(), 1, &slot);
 
     // Must not panic/error — degrades to fresh state (epoch 0), and the
     // delta segments themselves are still fully scannable regardless.

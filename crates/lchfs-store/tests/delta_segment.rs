@@ -57,17 +57,10 @@ fn delta_segment_round_trips_and_is_shard_scoped() {
     assert_eq!(header.content_hash, hash);
     assert_eq!(header.kind, ExtentKind::DeltaLogEntry);
 
-    // On-disk layout: shard-scoped subdirectories, not a flat pool.
-    assert!(
-        dir.path()
-            .join("segments/delta/00007/0.dseg")
-            .is_file()
-    );
-    assert!(
-        dir.path()
-            .join("segments/delta/00009/0.dseg")
-            .is_file()
-    );
+    // On-disk layout: each shard's delta stream is its own, not a flat pool.
+    use lchfs_store::testing::{SegmentKind, segment_exists};
+    assert!(segment_exists(dir.path(), SegmentKind::Delta { shard: 7 }, 0));
+    assert!(segment_exists(dir.path(), SegmentKind::Delta { shard: 9 }, 0));
 }
 
 #[test]

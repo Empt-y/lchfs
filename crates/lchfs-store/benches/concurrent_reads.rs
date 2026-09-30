@@ -12,7 +12,8 @@
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use lchfs_format::PoolParams;
-use lchfs_store::Pool;
+use lchfs_crypto::keyring::{NewSlot, Padding, Unlock};
+use lchfs_store::{EncryptionSetup, Pool};
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::{Duration, Instant};
 
@@ -83,11 +84,27 @@ fn batch_wall_clock(threads: usize, body: Arc<dyn Fn(usize) + Send + Sync>) -> D
 /// on-disk chunk path. Returns the reopened pool, its tempdir (kept alive),
 /// and the inos. Reads never mutate, so one cold pool serves every
 /// iteration.
-fn cold_pool(threads: usize) -> (tempfile::TempDir, Arc<Pool>, Vec<u64>) {
+fn cold_pool(threads: usize, mode: &str) -> (tempfile::TempDir, Arc<Pool>, Vec<u64>) {
     let dir = tempfile::tempdir().unwrap();
     let names: Vec<String> = (0..threads).map(|i| format!("f{i}")).collect();
+    let passphrase = Unlock::Passphrase(lchfs_crypto::testing::TEST_PASSPHRASE);
     {
-        let pool = Pool::create(dir.path(), bench_params()).unwrap();
+        let pool = match mode {
+            "plain" => Pool::create(dir.path(), bench_params()).unwrap(),
+            _ => Pool::create_encrypted(
+                dir.path(),
+                bench_params(),
+                EncryptionSetup {
+                    padding: Padding::Padme,
+                    slots: vec![NewSlot::Passphrase {
+                        passphrase: lchfs_crypto::testing::TEST_PASSPHRASE,
+                        cost: lchfs_crypto::testing::TEST_KDF,
+                        label: "bench".into(),
+                    }],
+                },
+            )
+            .unwrap(),
+        };
         for (t, name) in names.iter().enumerate() {
             let ino = pool.create_file(1, name, 0o644).unwrap();
             let payload = pseudo_random_bytes(t as u64 + 1, WRITE_SIZE);
@@ -97,7 +114,10 @@ fn cold_pool(threads: usize) -> (tempfile::TempDir, Arc<Pool>, Vec<u64>) {
         }
         pool.checkpoint().unwrap();
     }
-    let pool = Arc::new(Pool::open(dir.path()).unwrap());
+    let pool = Arc::new(match mode {
+        "plain" => Pool::open(dir.path()).unwrap(),
+        _ => Pool::open_with(dir.path(), &passphrase).unwrap(),
+    });
     let inos: Vec<u64> = names
         .iter()
         .map(|n| pool.lookup(1, n).unwrap().unwrap())
@@ -110,10 +130,13 @@ fn bench_concurrent_readers(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(5));
     group.sample_size(10);
 
+    // Plaintext against encrypted (ARCHITECTURE.md §18): an AEAD open and a
+    // keyed-hash verify per record are the whole difference.
+    for &mode in &["plain", "encrypted"] {
     for &threads in THREAD_COUNTS {
-        let (_dir, pool, inos) = cold_pool(threads);
+        let (_dir, pool, inos) = cold_pool(threads, mode);
         group.throughput(Throughput::Bytes((threads * BYTES_PER_THREAD) as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(threads), &threads, |b, &threads| {
+        group.bench_with_input(BenchmarkId::new(mode, threads), &threads, |b, &threads| {
             b.iter_custom(|iters| {
                 let mut total = Duration::ZERO;
                 for _ in 0..iters {
@@ -135,6 +158,7 @@ fn bench_concurrent_readers(c: &mut Criterion) {
                 total
             });
         });
+    }
     }
     group.finish();
 }

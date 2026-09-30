@@ -78,3 +78,17 @@ path = "fuzz_targets/envelope_open.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "sealed_inner"
+path = "fuzz_targets/sealed_inner.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sealed_segment"
+path = "fuzz_targets/sealed_segment.rs"
+test = false
+doc = false
+bench = false

@@ -52,7 +52,7 @@ fn deterministic_bytes(seed: u64, len: usize) -> Vec<u8> {
 /// `walk_reachable` bail, which is how the original post-crash GC bug
 /// manifested.
 fn gc_marks_cleanly(pool_root: &std::path::Path, root: lchfs_format::Hash32) -> bool {
-    let index = RedbIndex::open(&pool_root.join("INDEX.redb")).unwrap();
+    let index = RedbIndex::open(pool_root).unwrap();
     let cache = ChunkLocationCache::new();
     cache.extend(index.iter_preferred_locations().unwrap());
     let mut gc = GcEngine::new(

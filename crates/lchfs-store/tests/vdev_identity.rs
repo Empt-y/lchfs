@@ -12,7 +12,6 @@ use lchfs_format::{
     SUPERBLOCK_SLOT_COUNT, SUPERBLOCK_SLOT_SIZE,
 };
 use lchfs_store::Pool;
-use std::io::Write;
 
 fn small_params() -> PoolParams {
     PoolParams {
@@ -51,15 +50,8 @@ fn write_legacy_v2_superblock(pool_root: &std::path::Path) {
     buf[0..4].copy_from_slice(&(encoded.len() as u32).to_le_bytes());
     buf[4..4 + encoded.len()].copy_from_slice(&encoded);
 
-    std::fs::create_dir_all(pool_root).unwrap();
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(pool_root.join("SUPERBLOCK"))
-        .unwrap();
-    f.write_all(&buf).unwrap();
-    f.flush().unwrap();
+    lchfs_device::format(pool_root, Default::default()).unwrap();
+    lchfs_store::testing::write_ring(pool_root, 0, &buf);
 }
 
 #[test]
@@ -128,7 +120,7 @@ fn a_v2_pool_is_refused_by_open_rather_than_looking_empty() {
 fn a_v2_pool_is_not_overwritten_by_create() {
     let dir = tempfile::tempdir().unwrap();
     write_legacy_v2_superblock(dir.path());
-    let before = std::fs::read(dir.path().join("SUPERBLOCK")).unwrap();
+    let before = lchfs_store::testing::read_ring(dir.path());
 
     let err = Pool::create(dir.path(), small_params()).unwrap_err();
     let msg = err.to_string();
@@ -137,7 +129,7 @@ fn a_v2_pool_is_not_overwritten_by_create() {
         "expected a legacy-format refusal, got: {msg}"
     );
 
-    let after = std::fs::read(dir.path().join("SUPERBLOCK")).unwrap();
+    let after = lchfs_store::testing::read_ring(dir.path());
     assert_eq!(before, after, "create clobbered an existing v2 pool's superblock");
 }
 
@@ -164,12 +156,7 @@ fn a_backend_knows_which_vdev_root_it_belongs_to() {
     let dir = tempfile::tempdir().unwrap();
     let backend = FileBackend::open(dir.path()).unwrap();
 
-    assert_eq!(backend.root(), dir.path(), "vdev root should be the directory");
-    assert_eq!(
-        Vdev::new(3, dir.path().to_path_buf()).superblock_path(),
-        dir.path().join("SUPERBLOCK"),
-        "the superblock lives inside the vdev root, per the §15.10 layout"
-    );
+    assert_eq!(backend.root(), dir.path(), "a backend is its device's");
     // A backend is opened before the superblock is read, so it knows the
     // root and not the slot; the slot is the Vdev's to carry.
     assert_eq!(Vdev::new(3, dir.path().to_path_buf()).id, 3);

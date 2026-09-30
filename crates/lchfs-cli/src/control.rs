@@ -1,5 +1,5 @@
 //! The control channel of a running mount: a Unix socket at
-//! `<primary root>/control.sock`, one newline-delimited JSON request per
+//! `<runtime dir>/lchfs/<pool uuid>.sock` (see `socket_dir`), one newline-delimited JSON request per
 //! connection, one JSON reply. It lives here and not in `lchfs-store`
 //! because the store is transport-free by design (ARCHITECTURE.md §5a);
 //! every command is one call on `Pool`'s public API. §14.3 declined ioctl
@@ -16,21 +16,42 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-pub const SOCKET_NAME: &str = "control.sock";
-
 /// The reply code for a key the pool did not accept.
 pub const KEY_REFUSED: &str = "key-refused";
 
-/// Where a mounted pool's socket is: in its primary's root.
+/// Where control sockets live. A pool on raw devices has no directory of
+/// its own, so its socket goes where runtime state goes: `$LCHFS_RUNTIME_DIR`
+/// if set, else `$XDG_RUNTIME_DIR/lchfs`, else `/run/lchfs` for root and
+/// a per-user directory under the temp dir for anyone else.
+pub fn socket_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("LCHFS_RUNTIME_DIR") {
+        return PathBuf::from(dir);
+    }
+    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+        return PathBuf::from(dir).join("lchfs");
+    }
+    let uid = nix::unistd::getuid();
+    if uid.is_root() {
+        PathBuf::from("/run/lchfs")
+    } else {
+        std::env::temp_dir().join(format!("lchfs-{uid}"))
+    }
+}
+
+/// The socket of the pool with `pool_uuid`.
+pub fn socket_for(pool_uuid: [u8; 16]) -> PathBuf {
+    socket_dir().join(format!("{}.sock", lchfs_format::pool_uuid_hex(&pool_uuid)))
+}
+
+/// The socket of the pool a device belongs to.
+pub fn socket_for_device(root: &Path) -> anyhow::Result<PathBuf> {
+    let slot = lchfs_fsck::read_superblock(root).map_err(|e| anyhow::anyhow!("{}: {e}", root.display()))?;
+    Ok(socket_for(slot.pool_uuid))
+}
+
+/// Where a mounted pool's socket is.
 pub fn socket_path(pool: &Pool) -> PathBuf {
-    let primary = pool.primary_vdev();
-    let root = pool
-        .vdev_status()
-        .into_iter()
-        .find(|s| s.id == primary)
-        .and_then(|s| s.root)
-        .expect("the primary is online and has a root");
-    root.join(SOCKET_NAME)
+    socket_for(pool.pool_uuid())
 }
 
 /// A running control listener. Dropping it stops the thread and removes
@@ -51,6 +72,11 @@ impl ControlServer {
                 anyhow::bail!("{} is in use: is the pool already mounted?", path.display());
             }
             std::fs::remove_file(&path)?;
+        }
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+            // Owner only, like the socket.
+            std::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
         }
         let listener = UnixListener::bind(&path)?;
         // Owner only. The peer check in `serve_one` is what enforces it --

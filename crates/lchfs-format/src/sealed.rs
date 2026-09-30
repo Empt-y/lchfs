@@ -264,6 +264,18 @@ impl RecordCrypto {
         (header, envelope)
     }
 
+    /// Fuzzing only: seals arbitrary bytes as a record's *inner* plaintext,
+    /// so a fuzzer can drive everything `open` does after the AEAD passes
+    /// -- which no byte flip of a real envelope can reach.
+    #[cfg(fuzzing)]
+    #[doc(hidden)]
+    pub fn seal_inner_for_fuzzing(&self, epoch: u16, content_hash: Hash32, inner: &[u8]) -> (ExtentRecordHeader, Vec<u8>) {
+        let keys = self.epochs.get(&epoch).expect("fuzzing in an epoch whose keys are held");
+        let header = sealed_header(content_hash, epoch, (inner.len() + OVERHEAD) as u32);
+        let envelope = envelope::seal(keys.record_key(), &aad(&self.pool_uuid, &header), inner);
+        (header, envelope)
+    }
+
     /// Recovers a record's content-bearing fields: from the header itself
     /// for a plaintext record, by authenticating and decrypting the
     /// envelope for a sealed one. Does not check the content hash (the

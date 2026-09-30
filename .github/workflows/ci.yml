@@ -20,7 +20,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libfuse3-dev pkg-config libtss2-dev swtpm
+          sudo apt-get install -y libfuse3-dev fuse3 pkg-config libtss2-dev swtpm
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -42,6 +42,10 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # A pool on a real block device (the tests use sparse images).
+      - name: Loop device
+        run: sudo ci/loop-device.sh target/debug/lchfs
 
       # The whole suite again with every pool the engine creates encrypted
       # under a fixed test passphrase (lchfs-crypto's `test-encrypt-all`),
@@ -86,9 +90,10 @@ jobs:
             cargo test --test cli_encryption a_tpm
 
   # The Windows frontend (lchfs-winfsp) and the engine it runs, built and
-  # tested on Windows itself: its tests create real pools on NTFS, so they
-  # exercise the engine's Windows paths (positional I/O, the pool lock,
-  # free space) as well as the frontend. No WinFsp is needed -- the DLL is
+  # tested on Windows itself. Expected to fail until lchfs-device (format
+  # v6's raw-device layer, Unix-only so far) is ported to Windows; its
+  # tests then create real pools on device images on NTFS, exercising the
+  # device layer's Windows paths as well as the frontend. No WinFsp is needed -- the DLL is
   # loaded only when mounting, which CI does not do.
   windows:
     name: Windows frontend (build, test, clippy)

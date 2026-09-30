@@ -94,20 +94,7 @@ impl DedupScanner {
     }
 
     fn run_pass_on(&mut self, vdev: &Vdev, persisted_index: &RwLock<RedbIndex>) -> io::Result<Vec<DedupMerge>> {
-        let dir = vdev.root.join("segments").join("data");
-        let Ok(read_dir) = std::fs::read_dir(&dir) else {
-            return Ok(Vec::new());
-        };
-        let mut segment_ids: Vec<u64> = read_dir
-            .flatten()
-            .filter_map(|e| {
-                e.path()
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .and_then(|s| s.parse::<u64>().ok())
-            })
-            .collect();
-        segment_ids.sort_unstable();
+        let segment_ids = crate::segment::segment_ids_on(&vdev.root, StreamKind::Data);
 
         let cursor = self.scanned_up_to.get(&(vdev.id, StreamKind::Data)).copied().unwrap_or(0);
         let mut seen_this_pass: HashMap<Hash32, Vec<ExtentLocation>> = HashMap::new();

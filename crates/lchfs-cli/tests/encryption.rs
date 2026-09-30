@@ -191,11 +191,10 @@ fn fsck_checks_structure_without_a_key_and_everything_with_one() {
     assert!(report.objects_visited > structural.objects_visited / 2);
 
     // A damaged keyring is an error even without a key.
-    let path = keyring::path_on(a.path());
-    let mut bytes = std::fs::read(&path).unwrap();
+    let mut bytes = keyring::read_on(a.path()).unwrap().unwrap();
     let mid = bytes.len() / 2;
     bytes[mid] ^= 0xff;
-    std::fs::write(&path, &bytes).unwrap();
+    keyring::write_on(a.path(), &bytes).unwrap();
     let structural = lchfs_fsck::structural_check(&roots);
     assert!(
         structural.errors.iter().any(|e| matches!(e, lchfs_fsck::FsckError::KeyringDamaged { .. })),

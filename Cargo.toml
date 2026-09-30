@@ -9,6 +9,7 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 lchfs-crypto = { path = "crates/lchfs-crypto" }
+lchfs-device = { path = "crates/lchfs-device" }
 lchfs-chunk = { path = "crates/lchfs-chunk" }
 lchfs-compress = { path = "crates/lchfs-compress" }
 lchfs-format = { path = "crates/lchfs-format" }
@@ -57,6 +58,8 @@ windows-sys = "0.61"
 # which maps the pages secrets live in (lchfs-crypto sets its own lints).
 [workspace.lints.rust]
 unsafe_code = "forbid"
+# cargo-fuzz builds with `--cfg fuzzing`; hooks for it hide behind that.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
 
 [package]
 name = "lchfs"
@@ -78,4 +81,6 @@ anyhow = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+lchfs-store = { workspace = true }
 lchfs-crypto = { workspace = true }
+lchfs-device = { workspace = true }

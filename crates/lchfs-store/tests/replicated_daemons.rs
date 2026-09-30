@@ -5,7 +5,7 @@
 
 use lchfs_format::PoolParams;
 use lchfs_store::Pool;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 fn small_params() -> PoolParams {
     PoolParams {
@@ -34,19 +34,12 @@ fn deterministic_bytes(seed: u64, len: usize) -> Vec<u8> {
     out
 }
 
-fn data_segments(root: &Path) -> Vec<PathBuf> {
-    let mut v: Vec<_> = std::fs::read_dir(root.join("segments/data"))
-        .map(|rd| rd.flatten().map(|e| e.path()).collect())
-        .unwrap_or_default();
-    v.sort();
-    v
+fn data_segments(root: &Path) -> Vec<u64> {
+    lchfs_store::testing::segment_ids(root, lchfs_store::testing::SegmentKind::Data)
 }
 
-fn names(paths: &[PathBuf]) -> Vec<String> {
-    paths
-        .iter()
-        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
-        .collect()
+fn names(ids: &[u64]) -> Vec<u64> {
+    ids.to_vec()
 }
 
 /// Ten files written, nine overwritten with something much smaller: the
@@ -109,7 +102,7 @@ fn coalesce_reclaims_dead_space_on_every_vdev_not_just_the_primary() {
     pool.checkpoint().unwrap();
     drop(pool);
     for f in data_segments(a.path()) {
-        std::fs::remove_file(f).unwrap();
+        lchfs_store::testing::remove_segment(a.path(), lchfs_store::testing::SegmentKind::Data, f).unwrap();
     }
     let pool = Pool::open_replicated(&[a.path(), b.path()]).unwrap();
     for (ino, expected) in &survivors {
@@ -146,7 +139,6 @@ fn a_sweep_of_another_vdev_leaves_the_primary_cache_alone() {
 /// again, forever.
 #[test]
 fn dedup_does_not_hand_a_healed_hash_back_to_its_corrupt_copy() {
-    use std::io::{Seek, SeekFrom, Write};
     let a = tempfile::tempdir().unwrap();
     let b = tempfile::tempdir().unwrap();
     let payload: Vec<u8> = (0..40_000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
@@ -157,12 +149,11 @@ fn dedup_does_not_hand_a_healed_hash_back_to_its_corrupt_copy() {
         pool.checkpoint().unwrap();
         ino
     };
-    for path in data_segments(a.path()) {
-        let len = std::fs::metadata(&path).unwrap().len();
+    for id in data_segments(a.path()) {
+        use lchfs_store::testing::{SegmentKind, segment_len, write_at};
+        let len = segment_len(a.path(), SegmentKind::Data, id);
         if len > 8192 {
-            let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-            f.seek(SeekFrom::Start(len / 2)).unwrap();
-            f.write_all(&[0xFFu8; 64]).unwrap();
+            write_at(a.path(), SegmentKind::Data, id, len / 2, &[0xFFu8; 64]);
         }
     }
 
