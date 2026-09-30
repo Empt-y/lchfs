@@ -247,3 +247,48 @@ fn wiping_unformats() {
     wipe(dir.path()).unwrap();
     assert!(!is_formatted(dir.path()));
 }
+
+#[test]
+fn a_removal_cut_short_after_its_first_zone_frees_the_whole_segment() {
+    let (dir, dev) = fresh();
+    let payload = dev.label().zone_size - DEVICE_BLOCK;
+    let seg = dev.create_segment(SegmentKind::Data, 5).unwrap();
+    seg.write_all_at(&vec![0xEE; (3 * payload) as usize], 0).unwrap();
+    seg.sync_all().unwrap();
+    let zones = seg.seg.zones.read().clone();
+    assert_eq!(zones.len(), 3);
+    // What `remove_segment` makes durable before anything else: the first
+    // zone's Freeing header. Then the process dies.
+    dev.mark_freeing(&dev.label(), zones[0]).unwrap();
+    dev.sync().unwrap();
+    std::mem::forget(seg);
+    drop(dev);
+    registry().lock().remove(&resolve(dir.path()));
+
+    let dev = Device::open(dir.path()).unwrap();
+    assert!(dev.segments().is_empty(), "no truncated segment came back");
+    assert_eq!(dev.zones_in_use(), 0);
+    let label = dev.label();
+    for z in zones {
+        let h = dev.read_zone_header(&label, z).unwrap();
+        assert_eq!(h.state, ZoneState::Free);
+        let mut body = vec![0u8; payload as usize];
+        dev.0.file.read_exact_at(&mut body, Device::zone_offset(&label, z) + DEVICE_BLOCK).unwrap();
+        assert!(body.iter().all(|&b| b == 0), "zone {z} was freed without being zeroed");
+    }
+}
+
+#[test]
+fn removing_every_segment_leaves_the_device_blank() {
+    let (dir, dev) = fresh();
+    for (kind, id) in [(SegmentKind::Data, 1), (SegmentKind::Meta, 2), (SegmentKind::Delta { shard: 0 }, 3)] {
+        let s = dev.create_segment(kind, id).unwrap();
+        s.write_all_at(&[7; 10_000], 0).unwrap();
+        s.sync_all().unwrap();
+    }
+    dev.remove_all_segments().unwrap();
+    assert!(dev.segments().is_empty());
+    let dev = reopen(&dir, dev);
+    assert!(dev.segments().is_empty());
+    assert_eq!(dev.zones_in_use(), 0);
+}

@@ -1020,6 +1020,15 @@ impl Pool {
         // pass is a no-op until it has enough -- but a shape that can
         // never work is not.
         validate_stripe_shape(params.stripe_k, params.stripe_m)?;
+        // Each logical shard keeps its superblock in a fixed slot on
+        // every device.
+        if params.logical_shard_count == 0 || params.logical_shard_count > lchfs_device::MAX_SHARD_SLOTS {
+            return Err(PoolError::InvalidArgument(format!(
+                "logical_shard_count {} is outside 1..={}",
+                params.logical_shard_count,
+                lchfs_device::MAX_SHARD_SLOTS
+            )));
+        }
         let pool_root = vdev_roots[0];
         let mut members = Vec::with_capacity(vdev_roots.len());
         for (id, root) in vdev_roots.iter().enumerate() {
@@ -1373,7 +1382,7 @@ impl Pool {
     /// left. Only then are the survivors' superblocks rewritten with the
     /// smaller count, the slot's index entries dropped, and the leaving
     /// device's superblock erased so it can never be taken for a member
-    /// again. Its segment files are left for the caller to wipe.
+    /// again. Its segments are removed first, so it is left blank.
     ///
     /// Only the last slot can leave, because slots are `0..count` and a
     /// hole in the middle is a degraded pool, not a smaller one.
@@ -1450,6 +1459,12 @@ impl Pool {
             locks.push(acquire_pool_lock(root)?);
         }
         if let Some(root) = &leaving_root {
+            // Its segments first, while it is still a member: they are
+            // copies the survivors were just proven to hold, and a crash
+            // before the ring goes leaves a member a resilver refills --
+            // where segments left behind a cleared ring would leave a
+            // device nothing will take (`require_blank_device`).
+            segment::device(root)?.remove_all_segments()?;
             backend::clear_ring(root)?;
             if keyring::exists_on(root) {
                 keyring::remove_on(root)?;
@@ -2313,7 +2328,7 @@ impl Pool {
 
     /// Removes the highest-numbered device while mounted: the live form
     /// of `detach_vdev`, with the same proof first. Returns the slot that
-    /// left; its segment files are the caller's to wipe.
+    /// left; the device is left blank, ready to join a pool again.
     pub fn detach_vdev_live(&self) -> Result<u16, PoolError> {
         self.0.detach_vdev_live()
     }
@@ -3767,6 +3782,8 @@ impl PoolShared {
         if let Some(member) = member {
             let root = member.vdev.root.clone();
             drop(member);
+            // As in `detach_vdev_with`: segments, then ring, then keys.
+            segment::device(&root)?.remove_all_segments()?;
             if backend::ring_written(&root) {
                 backend::clear_ring(&root)?;
             }

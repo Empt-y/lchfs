@@ -244,3 +244,25 @@ fn the_primary_cannot_leave_while_mounted() {
     let err = pool.detach_vdev_live().unwrap_err().to_string();
     assert!(err.contains("primary"), "{err}");
 }
+
+/// The CLI tells the user a detached device "can be reused". On a raw
+/// device there is no `rm -r segments/` to do by hand, so detach must leave
+/// it blank: attachable again, here or to another pool.
+#[test]
+fn a_detached_device_can_be_attached_again() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let data = payload(23);
+    {
+        let pool = Pool::create_replicated(&[a.path(), b.path()], small_params()).unwrap();
+        let ino = pool.create_file(1, "f", 0o644).unwrap();
+        pool.write(ino, 0, &data).unwrap();
+        pool.checkpoint().unwrap();
+    }
+    assert_eq!(Pool::detach_vdev(&[a.path(), b.path()]).unwrap(), 1);
+    assert!(data_segments(b.path()).is_empty(), "the detached device kept its segments");
+
+    assert_eq!(Pool::attach_vdev(&[a.path()], b.path()).unwrap(), 1);
+    let pool = Pool::open_replicated(&[a.path(), b.path()]).unwrap();
+    assert_eq!(read_file(&pool, "f", data.len()), data);
+}

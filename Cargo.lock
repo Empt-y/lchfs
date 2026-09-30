@@ -920,6 +920,7 @@ dependencies = [
  "anyhow",
  "lchfs-cli",
  "lchfs-crypto",
+ "lchfs-device",
  "lchfs-store",
  "tempfile",
 ]

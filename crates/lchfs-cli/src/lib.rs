@@ -27,6 +27,12 @@ enum Command {
         /// partition table, a filesystem, data).
         #[arg(long)]
         force: bool,
+        /// Size of each of the device's two index copies, in MiB. The
+        /// index cannot grow after formatting; the default (0.5% of the
+        /// device, at least 64 MiB) suits large files, a pool of very many
+        /// small files wants more.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(64..))]
+        index_size_mib: Option<u64>,
         /// Erasure-code cold segments as K data + M parity shards once the
         /// pool has K+M devices (ARCHITECTURE.md §17.2). Both or neither.
         #[arg(long, requires = "stripe_m")]
@@ -494,8 +500,25 @@ pub fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::CreatePool { path, force, stripe_k, stripe_m, encryption } => {
+        Command::CreatePool { path, force, index_size_mib, stripe_k, stripe_m, encryption } => {
             require_device(&path, force)?;
+            if let Some(mib) = index_size_mib {
+                // The engine formats a device it finds unformatted with the
+                // defaults; formatting it here first is how a layout
+                // choice reaches it.
+                if lchfs_device::is_formatted(&path) {
+                    anyhow::bail!(
+                        "{} is already formatted; --index-size-mib applies when a device is formatted (--force \
+                         starts a device that holds no pool afresh)",
+                        path.display()
+                    );
+                }
+                if !path.exists() {
+                    std::fs::create_dir_all(&path)?;
+                }
+                let options = lchfs_device::FormatOptions { zone_size: None, index_copy_len: Some(mib << 20) };
+                lchfs_device::format(&path, options)?;
+            }
             create_pool(&path, stripe_k, stripe_m, &encryption)
         }
         Command::Mount { pool, mountpoint, vdevs, scan, degraded, unlock, require_encryption } => {
@@ -1407,9 +1430,18 @@ fn require_device(path: &Path, force: bool) -> anyhow::Result<()> {
             path.display()
         );
     }
-    if !is_block || force || lchfs_device::is_formatted(path) {
+    if lchfs_device::is_formatted(path) {
         // An LCHFS device's own checks (blank, not in another pool) are
-        // the engine's.
+        // the engine's. One that belongs to no pool but is not blank --
+        // a create that failed part-way, a keyring or segments left by a
+        // crash -- is only reused on request: --force starts it afresh.
+        // A device that holds a pool is never formatted over.
+        if force && lchfs_fsck::read_superblock(path).is_err() {
+            lchfs_device::wipe(path)?;
+        }
+        return Ok(());
+    }
+    if !is_block || force {
         return Ok(());
     }
     use std::os::unix::fs::FileExt;

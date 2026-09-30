@@ -80,3 +80,4 @@ anyhow = { workspace = true }
 tempfile = { workspace = true }
 lchfs-store = { workspace = true }
 lchfs-crypto = { workspace = true }
+lchfs-device = { workspace = true }

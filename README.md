@@ -44,7 +44,7 @@ A pool lives directly on one or more block devices. Each device is
 formatted the same way (`crates/lchfs-device`):
 
 ```
-0          label A      magic, layout version, pool uuid, device size,
+0          label A      magic, layout version, device uuid, device size,
                         zone size, region offsets, CRC (a copy, label B,
                         sits in the device's last 4 KiB)
 4 KiB      superblock   16 x 4 KiB slots, atomically rotated
@@ -62,6 +62,14 @@ A segment (data, metadata, a shard's delta log, a stripe shard) is an
 ordered list of zones, claimed as it grows; a mount rebuilds the segment
 table from the zone headers. A deleted segment's zones are zeroed before
 reuse, so a scan never meets an old segment's records.
+
+The index copies are sized when the device is formatted -- 0.5% of the
+device each, at least 64 MiB -- and cannot grow afterwards. At the default
+64 KiB average chunk that is ample for large files, but a pool of very many
+small files (or a mirror, which indexes every copy) can fill the index
+before the zones; writes then fail with "the index needs N bytes and its
+region holds M". There is no resize yet: such a pool has to be copied to
+a device created with a larger one (`create-pool --index-size-mib N`).
 
 ```sh
 lchfs create-pool /dev/sdb1                 # refuses a disk that is not blank; --force

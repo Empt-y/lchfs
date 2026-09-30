@@ -321,8 +321,18 @@ impl Drop for Inner {
     /// cache keeps it). Only a crash loses what was never synced.
     fn drop(&mut self) {
         let label = self.label.read().clone();
+        // The data first: a length made durable ahead of the bytes it
+        // covers would put unwritten zone contents inside a segment.
+        let segments = self.segments.lock();
+        if segments.values().any(|seg| {
+            !seg.removed.load(Ordering::Acquire) && seg.synced_len.load(Ordering::Acquire) != seg.len.load(Ordering::Acquire)
+        }) && let Err(e) = self.file.sync_data()
+        {
+            tracing::error!("{}: flush at close failed: {e}; segment lengths left as last synced", self.path.display());
+            return;
+        }
         let mut wrote = false;
-        for seg in self.segments.lock().values() {
+        for seg in segments.values() {
             let len = seg.len.load(Ordering::Acquire);
             if seg.removed.load(Ordering::Acquire) || seg.synced_len.load(Ordering::Acquire) == len {
                 continue;
@@ -626,24 +636,43 @@ impl Device {
         self.0.file.write_all_at(&layout::encode_block(&header), Self::zone_offset(label, zone))
     }
 
-    /// Zeroes a zone's payload and marks it free.
-    fn zero_and_free(&self, label: &DeviceLabel, zone: u64) -> io::Result<()> {
-        let at = Self::zone_offset(label, zone);
-        zero_range(&self.0.file, self.0.block, at + DEVICE_BLOCK, label.zone_size - DEVICE_BLOCK)?;
-        self.write_zone_header(
-            label,
-            zone,
-            ZoneHeader {
-                magic: ZONE_HEADER_MAGIC,
-                device_uuid: label.device_uuid,
-                state: ZoneState::Free,
-                kind: SegmentKind::Data,
-                segment_id: 0,
-                ordinal: 0,
-                written_len: 0,
-                checksum: 0,
-            },
-        )
+    /// Zeroes zones' payloads and marks them free. The zeroing is flushed
+    /// before any zone is marked `Free`: a `Free` header that reached the
+    /// disk ahead of its zeroing would let the zone be claimed as known
+    /// zero while it still holds an old segment's records -- which a
+    /// record scan resyncing past damage would then find. Returns the
+    /// zones freed; one whose zeroing failed stays as it was on disk
+    /// (`Freeing`, which the next mount finishes).
+    fn zero_and_free(&self, label: &DeviceLabel, zones: &[u64]) -> io::Result<Vec<u64>> {
+        let mut zeroed = Vec::with_capacity(zones.len());
+        for &zone in zones {
+            let at = Self::zone_offset(label, zone);
+            match zero_range(&self.0.file, self.0.block, at + DEVICE_BLOCK, label.zone_size - DEVICE_BLOCK) {
+                Ok(()) => zeroed.push(zone),
+                Err(e) => tracing::error!("{}: zeroing zone {zone} failed: {e}", self.0.path.display()),
+            }
+        }
+        if zeroed.is_empty() {
+            return Ok(zeroed);
+        }
+        self.sync()?;
+        for &zone in &zeroed {
+            self.write_zone_header(
+                label,
+                zone,
+                ZoneHeader {
+                    magic: ZONE_HEADER_MAGIC,
+                    device_uuid: label.device_uuid,
+                    state: ZoneState::Free,
+                    kind: SegmentKind::Data,
+                    segment_id: 0,
+                    ordinal: 0,
+                    written_len: 0,
+                    checksum: 0,
+                },
+            )?;
+        }
+        Ok(zeroed)
     }
 
     /// Reads every zone header: rebuilds the segment table and the free
@@ -668,8 +697,7 @@ impl Device {
                 None => zones[z as usize] = Zone::Unknown,
             }
         }
-        for z in unfinished {
-            self.zero_and_free(&label, z)?;
+        for z in self.zero_and_free(&label, &unfinished)? {
             zones[z as usize] = Zone::Clean;
         }
         let payload = label.zone_size - DEVICE_BLOCK;
@@ -711,8 +739,16 @@ impl Device {
                 }),
             );
         }
-        for z in orphans {
-            self.zero_and_free(&label, z)?;
+        // Orphans are marked `Freeing` first, so that a crash while they
+        // are zeroed cannot leave one looking free and zero.
+        for &z in &orphans {
+            self.mark_freeing(&label, z)?;
+        }
+        self.sync()?;
+        for &z in &orphans {
+            zones[z as usize] = Zone::Freeing;
+        }
+        for z in self.zero_and_free(&label, &orphans)? {
             zones[z as usize] = Zone::Clean;
         }
         self.sync()?;
@@ -824,32 +860,65 @@ impl Device {
         let seg = self.0.segments.lock().remove(&(kind, id)).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, format!("{}: no {kind:?} segment {id}", self.0.path.display()))
         })?;
+        self.mark_removed(&[seg])
+    }
+
+    /// Removes every segment on the device, as `remove_segment` does each:
+    /// what leaving a pool ends with, so the device is blank for the next.
+    pub fn remove_all_segments(&self) -> io::Result<()> {
+        let segs: Vec<Arc<SegInner>> = std::mem::take(&mut *self.0.segments.lock()).into_values().collect();
+        self.mark_removed(&segs)
+    }
+
+    /// Writes a `Freeing` header over one zone (not flushed).
+    fn mark_freeing(&self, label: &DeviceLabel, zone: u64) -> io::Result<()> {
+        self.write_zone_header(
+            label,
+            zone,
+            ZoneHeader {
+                magic: ZONE_HEADER_MAGIC,
+                device_uuid: label.device_uuid,
+                state: ZoneState::Freeing,
+                kind: SegmentKind::Data,
+                segment_id: 0,
+                ordinal: 0,
+                written_len: 0,
+                checksum: 0,
+            },
+        )
+    }
+
+    /// Marks removed segments' zones `Freeing` on disk and in the map.
+    /// Each segment's first zone goes first, and is flushed before the
+    /// rest: once it is gone, a mount frees the others as orphans, so a
+    /// crash part-way cannot bring back a truncated segment.
+    fn mark_removed(&self, segs: &[Arc<SegInner>]) -> io::Result<()> {
+        if segs.is_empty() {
+            return Ok(());
+        }
         let label = self.label();
-        let zones = seg.zones.read().clone();
-        for (ordinal, &z) in zones.iter().enumerate() {
-            self.write_zone_header(
-                &label,
-                z,
-                ZoneHeader {
-                    magic: ZONE_HEADER_MAGIC,
-                    device_uuid: label.device_uuid,
-                    state: ZoneState::Freeing,
-                    kind,
-                    segment_id: id,
-                    ordinal: ordinal as u32,
-                    written_len: 0,
-                    checksum: 0,
-                },
-            )?;
+        let zones: Vec<Vec<u64>> = segs.iter().map(|s| s.zones.read().clone()).collect();
+        for list in &zones {
+            if let Some(&first) = list.first() {
+                self.mark_freeing(&label, first)?;
+            }
+        }
+        self.sync()?;
+        for list in &zones {
+            for &z in list.iter().skip(1) {
+                self.mark_freeing(&label, z)?;
+            }
         }
         self.sync()?;
         {
             let mut map = self.0.zones.lock();
-            for &z in &zones {
+            for &z in zones.iter().flatten() {
                 map[z as usize] = Zone::Freeing;
             }
         }
-        seg.removed.store(true, Ordering::Release);
+        for seg in segs {
+            seg.removed.store(true, Ordering::Release);
+        }
         Ok(())
     }
 
@@ -902,12 +971,15 @@ impl Device {
     /// Releases a removed segment's zones once nothing has it open.
     fn release(&self, zones: &[u64]) {
         let label = self.label();
-        for &z in zones {
-            match self.zero_and_free(&label, z) {
-                Ok(()) => self.0.zones.lock()[z as usize] = Zone::Clean,
-                // Left Freeing on disk; the next mount finishes it.
-                Err(e) => tracing::error!("{}: zeroing freed zone {z} failed: {e}", self.0.path.display()),
+        match self.zero_and_free(&label, zones) {
+            Ok(freed) => {
+                let mut map = self.0.zones.lock();
+                for z in freed {
+                    map[z as usize] = Zone::Clean;
+                }
             }
+            // Left Freeing on disk; the next mount finishes it.
+            Err(e) => tracing::error!("{}: freeing zones {zones:?} failed: {e}", self.0.path.display()),
         }
     }
 }
@@ -1036,6 +1108,10 @@ impl SegmentFile {
         let device = self.device()?;
         let len = self.len();
         if self.seg.synced_len.load(Ordering::Acquire) != len && !self.seg.removed.load(Ordering::Acquire) {
+            // The bytes before the length that covers them: a device may
+            // reorder writes within one flush, and a length that landed
+            // first would put whatever the zone held inside the segment.
+            device.sync()?;
             let label = device.label();
             let first = self.seg.zones.read()[0];
             device.write_zone_header(
