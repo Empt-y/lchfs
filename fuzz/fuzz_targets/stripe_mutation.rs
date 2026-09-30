@@ -16,7 +16,8 @@ use arbitrary::Arbitrary;
 use lchfs_format::{CodecId, ExtentKind, ExtentLocation, Hash32, StreamKind};
 use lchfs_store::backend::Vdev;
 use lchfs_store::segment::{SEGMENT_HEADER_PAGE_SIZE, SegmentReader, SegmentWriter};
-use lchfs_store::stripe::{StripeReader, shard_path, write_stripe};
+use lchfs_store::stripe::{StripeReader, write_stripe};
+use lchfs_store::testing::{self as t, SegmentKind};
 use libfuzzer_sys::fuzz_target;
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -61,7 +62,7 @@ fn fixture() -> &'static Fixture {
             records.push((loc, payload));
         }
         w.seal().unwrap();
-        let mut body = std::fs::read(src.join("segments/data/7.aseg")).unwrap();
+        let mut body = t::read_segment(&src, SegmentKind::Data, 7);
         body.drain(..SEGMENT_HEADER_PAGE_SIZE as usize);
         let devs: Vec<Vdev> = (0..3)
             .map(|i| {
@@ -71,12 +72,12 @@ fn fixture() -> &'static Fixture {
             })
             .collect();
         write_stripe(&body, 7, 2, 1, &devs).unwrap();
-        let shards = (0..3).map(|i| std::fs::read(shard_path(&devs[i as usize].root, 7, i)).unwrap()).collect();
+        let shards = (0..3).map(|i| t::read_segment(&devs[i as usize].root, SegmentKind::StripeShard { index: i }, 7)).collect();
         let work = dir.path().join("work");
         for i in 0..3 {
             let root = work.join(format!("d{i}"));
+            std::fs::create_dir_all(&root).unwrap();
             lchfs_store::backend::FileBackend::open(&root).unwrap();
-            std::fs::create_dir_all(root.join("segments/data")).unwrap();
         }
         Fixture { shards, records, work, _dir: dir }
     })
@@ -100,7 +101,7 @@ fuzz_target!(|input: Input| {
     }
     let devs: Vec<Vdev> = (0..3).map(|i| Vdev::new(i, f.work.join(format!("d{i}")))).collect();
     for (i, bytes) in shards.iter().enumerate() {
-        std::fs::write(shard_path(&devs[i].root, 7, i as u8), bytes).unwrap();
+        t::write_segment(&devs[i].root, SegmentKind::StripeShard { index: i as u8 }, 7, bytes);
     }
 
     // Engine.

@@ -1,5 +1,5 @@
 //! Fuzzes a whole segment file: the bytes are written as
-//! `segments/data/1.aseg` under a fresh device root and every reader
+//! data segment 1 on a fresh device and every reader
 //! path is driven over it -- header, the resyncing scan (footer or not), a
 //! verifying read of each record the scan yields, and the mount-time
 //! orphan reopen (which scans and would seal). None may panic on rot.
@@ -18,7 +18,6 @@ fn root() -> &'static std::path::Path {
     ROOT.get_or_init(|| {
         let dir = tempfile::tempdir().unwrap();
         lchfs_store::backend::FileBackend::open(dir.path()).unwrap();
-        std::fs::create_dir_all(dir.path().join("segments/data")).unwrap();
         dir
     })
     .path()
@@ -32,7 +31,7 @@ fuzz_target!(|data: &[u8]| {
     if file.len() < 4096 {
         file.resize(4096, 0);
     }
-    std::fs::write(root.join("segments/data/1.aseg"), &file).unwrap();
+    lchfs_store::testing::write_segment(root, lchfs_store::testing::SegmentKind::Data, 1, &file);
     let Ok(reader) = SegmentReader::open(root, 1, StreamKind::Data) else { return };
     let _ = reader.read_header();
     let mut scan = reader.scan();
