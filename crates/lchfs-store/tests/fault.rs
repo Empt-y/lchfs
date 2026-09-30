@@ -15,7 +15,7 @@
 use lchfs_format::PoolParams;
 use lchfs_store::segment::fault_injection;
 use lchfs_store::{Pool, VdevHealth};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 fn small_params() -> PoolParams {
     PoolParams {
@@ -38,12 +38,8 @@ fn payload(seed: u32) -> Vec<u8> {
         .collect()
 }
 
-fn data_segments(root: &Path) -> Vec<PathBuf> {
-    let mut v: Vec<_> = std::fs::read_dir(root.join("segments/data"))
-        .map(|rd| rd.flatten().map(|e| e.path()).collect())
-        .unwrap_or_default();
-    v.sort();
-    v
+fn data_segments(root: &Path) -> Vec<u64> {
+    lchfs_store::testing::segment_ids(root, lchfs_store::testing::SegmentKind::Data)
 }
 
 fn read_file(pool: &Pool, name: &str, len: usize) -> Vec<u8> {
@@ -51,12 +47,10 @@ fn read_file(pool: &Pool, name: &str, len: usize) -> Vec<u8> {
     pool.read(ino, 0, len as u32).unwrap().to_vec()
 }
 
-/// The device is gone from the filesystem: nothing new can be created
-/// under it. A plain rename would not do -- `create_dir_all` would put
-/// the tree straight back -- so the directory becomes a file.
+/// The device is going away: nothing new can be created on it, while
+/// what is already open keeps working.
 fn vanish(root: &Path) {
-    std::fs::rename(root.join("segments"), root.join("segments.gone")).unwrap();
-    std::fs::write(root.join("segments"), b"not a directory any more").unwrap();
+    lchfs_store::testing::vanish(root);
 }
 
 fn health(pool: &Pool, id: u16) -> VdevHealth {
@@ -208,9 +202,9 @@ fn a_primary_whose_segments_vanish_still_serves_through_the_mirror() {
     // remount from b's copy, since the primary never got one.
     assert_eq!(read_file(&pool, "more3", 30_000), payload(23));
     pool.checkpoint().unwrap();
+    // The device comes back (unmounting closed it, which ends the
+    // simulation: it reopens whole).
     drop(pool);
-    std::fs::remove_file(a.path().join("segments")).unwrap();
-    std::fs::rename(a.path().join("segments.gone"), a.path().join("segments")).unwrap();
     // While it was faulted its superblock was not advanced, so it comes
     // back behind b and is resilvered before the pool serves: the same
     // path a device absent at mount takes.

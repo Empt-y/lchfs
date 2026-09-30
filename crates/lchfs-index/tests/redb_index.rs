@@ -1,10 +1,29 @@
 use lchfs_format::{ExtentLocation, Hash32};
 use lchfs_index::{IndexStore, RedbIndex};
+use std::path::PathBuf;
+
+/// A freshly formatted device (an image in a temporary directory) with a
+/// small index region, and its path.
+fn device() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let options = lchfs_device::FormatOptions { zone_size: None, index_copy_len: Some(8 << 20) };
+    lchfs_device::format(dir.path(), options).unwrap();
+    let path = dir.path().to_path_buf();
+    (dir, path)
+}
+
+/// Every byte of the device's index region, both copies.
+fn index_region(path: &std::path::Path) -> Vec<u8> {
+    let dev = lchfs_device::Device::open(path).unwrap();
+    let region = dev.label().index;
+    let mut bytes = vec![0u8; region.len as usize];
+    dev.read_region(region, 0, &mut bytes).unwrap();
+    bytes
+}
 
 #[test]
 fn create_open_roundtrip_chunk_location() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("INDEX.redb");
+    let (_dir, path) = device();
 
     let hash = Hash32([7u8; 32]);
     let loc = ExtentLocation {
@@ -34,8 +53,7 @@ fn create_open_roundtrip_chunk_location() {
 
 #[test]
 fn inode_hash_roundtrip() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("INDEX.redb");
+    let (_dir, path) = device();
     let mut index = RedbIndex::create(&path).unwrap();
 
     assert_eq!(index.get_inode_hash(42).unwrap(), None);
@@ -46,8 +64,7 @@ fn inode_hash_roundtrip() {
 
 #[test]
 fn iter_chunk_locations_returns_everything_put() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("INDEX.redb");
+    let (_dir, path) = device();
     let mut index = RedbIndex::create(&path).unwrap();
 
     let entries: Vec<(Hash32, ExtentLocation)> = (0..50)
@@ -75,8 +92,7 @@ fn iter_chunk_locations_returns_everything_put() {
 
 #[test]
 fn fresh_index_starts_at_generation_zero() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("INDEX.redb");
+    let (_dir, path) = device();
     let index = RedbIndex::create(&path).unwrap();
     assert_eq!(index.generation(), 0);
 }
@@ -87,8 +103,8 @@ fn fresh_index_starts_at_generation_zero() {
 /// get a single answer without knowing replication exists.
 #[test]
 fn a_hash_can_hold_a_location_per_vdev() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut index = RedbIndex::create(&dir.path().join("INDEX.redb")).unwrap();
+    let (_dir, path) = device();
+    let mut index = RedbIndex::create(&path).unwrap();
 
     let hash = Hash32::of(b"replicated");
     let on_vdev0 = ExtentLocation { segment_id: 1, offset: 64, len: 128 };
@@ -116,8 +132,8 @@ fn a_hash_can_hold_a_location_per_vdev() {
 
 #[test]
 fn replicas_of_different_hashes_do_not_collide() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut index = RedbIndex::create(&dir.path().join("INDEX.redb")).unwrap();
+    let (_dir, path) = device();
+    let mut index = RedbIndex::create(&path).unwrap();
     let a = Hash32::of(b"a");
     let b = Hash32::of(b"b");
     let loc = |id| ExtentLocation { segment_id: id, offset: 0, len: 16 };
@@ -133,8 +149,8 @@ fn replicas_of_different_hashes_do_not_collide() {
 
 #[test]
 fn iter_all_lists_every_replica_and_delete_forgets_one() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut index = RedbIndex::create(&dir.path().join("INDEX.redb")).unwrap();
+    let (_dir, path) = device();
+    let mut index = RedbIndex::create(&path).unwrap();
     let a = Hash32([1u8; 32]);
     let b = Hash32([2u8; 32]);
     let loc = |segment_id| ExtentLocation {
@@ -166,8 +182,8 @@ fn iter_all_lists_every_replica_and_delete_forgets_one() {
 
 #[test]
 fn delete_vdev_locations_forgets_one_slot_and_leaves_the_rest() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut index = RedbIndex::create(&dir.path().join("INDEX.redb")).unwrap();
+    let (_dir, path) = device();
+    let mut index = RedbIndex::create(&path).unwrap();
     let loc = |segment_id| ExtentLocation {
         segment_id,
         offset: 4096,
@@ -187,8 +203,7 @@ fn delete_vdev_locations_forgets_one_slot_and_leaves_the_rest() {
 
 #[test]
 fn a_fresh_rewrite_keeps_locations_and_generation_and_drops_the_memo() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("INDEX.redb");
+    let (_dir, path) = device();
     let mut index = RedbIndex::create(&path).unwrap();
     let loc = ExtentLocation { segment_id: 7, offset: 4096, len: 100 };
     let kept = Hash32([0x11; 32]);
@@ -200,8 +215,8 @@ fn a_fresh_rewrite_keeps_locations_and_generation_and_drops_the_memo() {
     index.checkpoint(9).unwrap();
     assert_eq!(index.get_rekey_memo(old).unwrap(), Some(new));
     assert!(
-        std::fs::read(&path).unwrap().windows(32).any(|w| w == old.0),
-        "the check below means nothing unless the old file held the hash"
+        index_region(&path).windows(32).any(|w| w == old.0),
+        "the check below means nothing unless the old copy held the hash"
     );
 
     index.rewrite_fresh(&path).unwrap();
@@ -212,9 +227,8 @@ fn a_fresh_rewrite_keeps_locations_and_generation_and_drops_the_memo() {
     index.checkpoint(10).unwrap();
     drop(index);
 
-    let bytes = std::fs::read(&path).unwrap();
-    assert!(!bytes.windows(32).any(|w| w == old.0), "the memo's old hash survived in the file");
-    assert!(!dir.path().join("INDEX.redb.tmp").exists());
+    let bytes = index_region(&path);
+    assert!(!bytes.windows(32).any(|w| w == old.0), "the memo's old hash survived in the index region");
     let index = RedbIndex::open(&path).unwrap();
     assert_eq!(index.generation(), 10);
     assert_eq!(index.get_chunk_location(kept).unwrap(), Some(loc));

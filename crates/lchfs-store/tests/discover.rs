@@ -47,8 +47,8 @@ fn two_pools_devices_mixed_in_one_directory_are_told_apart() {
     assert_eq!(only.pools[0].uuid, uuid_xy);
 
     // Looking created nothing.
-    assert!(!dir.path().join("not-a-device/SUPERBLOCK").exists());
-    assert!(!dir.path().join("SUPERBLOCK").exists());
+    assert!(!lchfs_device::is_formatted(&dir.path().join("not-a-device")));
+    assert!(!lchfs_store::testing::ring_written(dir.path()));
 }
 
 #[test]

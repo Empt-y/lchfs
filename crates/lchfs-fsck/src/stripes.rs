@@ -19,15 +19,22 @@ use lchfs_format::{
 use lchfs_store::segment::{SEGMENT_HEADER_PAGE_SIZE, decode_record_bytes, verify_record_with};
 use reed_solomon_erasure::galois_8::ReedSolomon;
 use std::collections::HashMap;
-use std::fs::File;
+use lchfs_device::SegmentFile;
 use std::io;
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
-/// One shard file as found on one device.
+/// One shard as found on one device.
 struct ShardFile {
     vdev_id: u16,
-    path: PathBuf,
+    root: PathBuf,
+    segment_id: u64,
+    index: u8,
+}
+
+impl ShardFile {
+    fn open(&self) -> io::Result<SegmentFile> {
+        lchfs_store::stripe::open_shard(&self.root, self.segment_id, self.index)
+    }
 }
 
 /// A striped segment as fsck sees it: the reference descriptor and, for
@@ -39,7 +46,7 @@ pub struct Stripe {
     pub segment_id: u64,
     pub desc: StripeDescriptor,
     /// `good[i]` is the verified shard `i`, if any device given holds one.
-    good: Vec<Option<File>>,
+    good: Vec<Option<SegmentFile>>,
 }
 
 impl Stripe {
@@ -131,28 +138,21 @@ fn codec(k: u8, m: u8) -> Result<ReedSolomon, String> {
     ReedSolomon::new(k as usize, m as usize).map_err(|e| format!("reed-solomon: {e:?}"))
 }
 
-/// Every `<id>.ec<i>` under a device's data directory.
-fn shard_files(root: &Path) -> Vec<(u64, u8, PathBuf)> {
-    let mut out = Vec::new();
-    let Ok(rd) = std::fs::read_dir(root.join("segments").join("data")) else {
-        return out;
-    };
-    for entry in rd.flatten() {
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
-        let Some((stem, ext)) = name.split_once('.') else { continue };
-        if let Some(index) = ext.strip_prefix("ec")
-            && let (Ok(id), Ok(i)) = (stem.parse::<u64>(), index.parse::<u8>())
-        {
-            out.push((id, i, path));
-        }
-    }
-    out
+/// Every stripe shard on a device: `(segment id, shard index)`.
+fn shard_files(root: &Path) -> Vec<(u64, u8)> {
+    let Ok(dev) = lchfs_device::Device::open(root) else { return Vec::new() };
+    dev.segments()
+        .into_iter()
+        .filter_map(|(kind, id)| match kind {
+            lchfs_device::SegmentKind::StripeShard { index } => Some((id, index)),
+            _ => None,
+        })
+        .collect()
 }
 
-/// Parses a shard file's header page from the documented layout.
-fn read_shard_header(path: &Path) -> Result<Option<(SegmentHeader, StripeDescriptor)>, String> {
-    let file = File::open(path).map_err(|e| e.to_string())?;
+/// Parses a shard's header page from the documented layout.
+fn read_shard_header(shard: &ShardFile) -> Result<Option<(SegmentHeader, StripeDescriptor)>, String> {
+    let file = shard.open().map_err(|e| e.to_string())?;
     let mut page = vec![0u8; SEGMENT_HEADER_PAGE_SIZE as usize];
     file.read_exact_at(&mut page, 0).map_err(|e| e.to_string())?;
     Ok(parse_shard_page(&page))
@@ -222,11 +222,11 @@ pub fn scan_stripes(devices: &[(u16, &Path)]) -> StripeScan {
 
     let mut by_segment: HashMap<u64, Vec<(u8, ShardFile)>> = HashMap::new();
     for &(vdev_id, root) in devices {
-        for (segment_id, index, path) in shard_files(root) {
-            by_segment
-                .entry(segment_id)
-                .or_default()
-                .push((index, ShardFile { vdev_id, path }));
+        for (segment_id, index) in shard_files(root) {
+            by_segment.entry(segment_id).or_default().push((
+                index,
+                ShardFile { vdev_id, root: root.to_path_buf(), segment_id, index },
+            ));
         }
     }
     let mut ids: Vec<u64> = by_segment.keys().copied().collect();
@@ -240,7 +240,7 @@ pub fn scan_stripes(devices: &[(u16, &Path)]) -> StripeScan {
         let mut reference: Option<StripeDescriptor> = None;
         let mut parsed: Vec<(u8, ShardFile, StripeDescriptor)> = Vec::new();
         for (index, file) in files {
-            match read_shard_header(&file.path) {
+            match read_shard_header(&file) {
                 Ok(Some((header, desc))) => {
                     if header.segment_id != segment_id {
                         scan.findings.push(FsckError::StripeShardCorrupt {
@@ -309,7 +309,7 @@ pub fn scan_stripes(devices: &[(u16, &Path)]) -> StripeScan {
         // descriptor says it belongs on. A shard file that is there but
         // wrong is corrupt, not missing; only an index no device given
         // has a file for is missing.
-        let mut good: Vec<Option<File>> = (0..total).map(|_| None).collect();
+        let mut good: Vec<Option<SegmentFile>> = (0..total).map(|_| None).collect();
         let mut seen: Vec<bool> = vec![false; total];
         for (index, file, own) in parsed {
             let i = index as usize;
@@ -334,16 +334,16 @@ pub fn scan_stripes(devices: &[(u16, &Path)]) -> StripeScan {
                 });
                 continue;
             }
-            // The file is exactly a header page plus the shard, and that is
+            // The shard is exactly a header page plus its bytes, and that is
             // checked before its claimed size is allowed to size a buffer:
             // fsck reads corrupt pools for a living and must not be made
             // to allocate by a number on disk.
-            let bytes = File::open(&file.path).and_then(|f| {
-                let len = f.metadata()?.len();
+            let bytes = file.open().and_then(|f| {
+                let len = f.len();
                 if len != expected_len {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!("file is {len} bytes, a shard of this stripe is {expected_len}"),
+                        format!("shard is {len} bytes, a shard of this stripe is {expected_len}"),
                     ));
                 }
                 let mut buf = vec![0u8; desc.shard_size as usize];
@@ -460,15 +460,8 @@ fn write_shard(root: &Path, stripe: &Stripe, index: u8, bytes: &[u8]) -> Result<
     page[at..at + 4].copy_from_slice(&(encoded_desc.len() as u32).to_le_bytes());
     page[at + 4..at + 4 + encoded_desc.len()].copy_from_slice(&encoded_desc);
 
-    let dir = root.join("segments").join("data");
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let path = dir.join(format!("{}.ec{index}", stripe.segment_id));
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&path)
+    let file = lchfs_device::Device::open(root)
+        .and_then(|d| d.create_segment(lchfs_device::SegmentKind::StripeShard { index }, stripe.segment_id))
         .map_err(|e| e.to_string())?;
     file.write_all_at(&page, 0).map_err(|e| e.to_string())?;
     file.write_all_at(bytes, SEGMENT_HEADER_PAGE_SIZE).map_err(|e| e.to_string())?;

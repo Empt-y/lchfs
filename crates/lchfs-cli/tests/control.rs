@@ -33,7 +33,8 @@ fn every_command_round_trips_over_the_socket() {
     pool.checkpoint().unwrap();
 
     let sock = socket_path(&pool);
-    assert_eq!(sock, a.path().join("control.sock"));
+    assert_eq!(sock, lchfs_cli::control::socket_for_device(a.path()).unwrap());
+    assert!(sock.to_string_lossy().ends_with(&format!("{}.sock", lchfs_format::pool_uuid_hex(&pool.pool_uuid()))));
     let server = ControlServer::start(Arc::clone(&pool), sock.clone()).unwrap();
     assert!(sock.exists());
 
@@ -116,6 +117,7 @@ fn a_stale_socket_is_replaced_but_a_live_one_is_not() {
     let a = tempfile::tempdir().unwrap();
     let pool = Arc::new(Pool::create(a.path(), small_params()).unwrap());
     let sock = socket_path(&pool);
+    std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
     std::fs::write(&sock, b"stale").unwrap();
     let server = ControlServer::start(Arc::clone(&pool), sock.clone()).unwrap();
     assert!(request(&sock, &json!({ "cmd": "status" })).is_ok());

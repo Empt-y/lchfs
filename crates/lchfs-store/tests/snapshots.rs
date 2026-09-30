@@ -37,7 +37,7 @@ fn deterministic_bytes(seed: u64, len: usize) -> Vec<u8> {
 }
 
 fn load_locations(pool_root: &std::path::Path) -> Arc<ChunkLocationCache> {
-    let index = RedbIndex::open(&pool_root.join("INDEX.redb")).unwrap();
+    let index = RedbIndex::open(pool_root).unwrap();
     let cache = ChunkLocationCache::new();
     cache.extend(index.iter_preferred_locations().unwrap());
     Arc::new(cache)
@@ -174,16 +174,12 @@ fn gc_pass_includes_snapshot_roots_automatically() {
     let dir = tempfile::tempdir().unwrap();
     let (pool, snapshot_root) = setup_low_liveness_pool_with_snapshot(dir.path());
 
-    let data_dir = dir.path().join("segments/data");
-    let before: std::collections::HashSet<_> = std::fs::read_dir(&data_dir)
-        .unwrap()
-        .filter_map(|e| e.ok().map(|e| e.file_name()))
-        .collect();
+    let data_ids = || -> std::collections::HashSet<u64> {
+        lchfs_store::testing::segment_ids(dir.path(), lchfs_store::testing::SegmentKind::Data).into_iter().collect()
+    };
+    let before = data_ids();
     pool.run_gc_and_coalesce_pass().unwrap();
-    let after: std::collections::HashSet<_> = std::fs::read_dir(&data_dir)
-        .unwrap()
-        .filter_map(|e| e.ok().map(|e| e.file_name()))
-        .collect();
+    let after = data_ids();
     assert!(!before.is_subset(&after), "the coalesce pass should have deleted at least one segment");
     drop(pool);
 

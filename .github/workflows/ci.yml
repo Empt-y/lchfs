@@ -20,7 +20,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libfuse3-dev pkg-config libtss2-dev swtpm
+          sudo apt-get install -y libfuse3-dev fuse3 pkg-config libtss2-dev swtpm
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -42,6 +42,10 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # A pool on a real block device (the tests use sparse images).
+      - name: Loop device
+        run: sudo ci/loop-device.sh target/debug/lchfs
 
       # The whole suite again with every pool the engine creates encrypted
       # under a fixed test passphrase (lchfs-crypto's `test-encrypt-all`),

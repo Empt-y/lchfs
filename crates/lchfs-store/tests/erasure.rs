@@ -6,7 +6,8 @@
 use lchfs_format::PoolParams;
 use lchfs_store::Pool;
 use lchfs_store::stripe::segment_ids_with_shards;
-use std::path::{Path, PathBuf};
+use lchfs_store::testing::{self as t, SegmentKind};
+use std::path::Path;
 
 fn striped_params(k: u8, m: u8) -> PoolParams {
     PoolParams {
@@ -34,12 +35,8 @@ fn read_file(pool: &Pool, name: &str, len: usize) -> Vec<u8> {
     pool.read(ino, 0, len as u32).unwrap().to_vec()
 }
 
-fn aseg_files(root: &Path) -> Vec<PathBuf> {
-    let mut v: Vec<_> = std::fs::read_dir(root.join("segments/data"))
-        .map(|rd| rd.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "aseg")).collect())
-        .unwrap_or_default();
-    v.sort();
-    v
+fn aseg_files(root: &Path) -> Vec<u64> {
+    t::segment_ids(root, SegmentKind::Data)
 }
 
 /// Enough cold, full segments to stripe: 12 files of 30 KB at a 16 KiB
@@ -70,7 +67,7 @@ fn cold_segments_become_stripes_and_read_back_from_any_path() {
     for root in [a.path(), b.path(), c.path()] {
         assert_eq!(segment_ids_with_shards(root), striped, "every device holds one shard of each stripe");
         for id in &striped {
-            assert!(!root.join(format!("segments/data/{id}.aseg")).exists(), "mirror copy of {id} should be gone");
+            assert!(!t::segment_exists(root, SegmentKind::Data, *id), "mirror copy of {id} should be gone");
         }
     }
     let mirrored_left = aseg_files(a.path()).len();
@@ -95,7 +92,7 @@ fn cold_segments_become_stripes_and_read_back_from_any_path() {
     drop(pool);
 
     // And with the index gone, the slow path reassembles the stripes.
-    std::fs::remove_file(a.path().join("INDEX.redb")).unwrap();
+    lchfs_index::RedbIndex::remove(a.path()).unwrap();
     let pool = Pool::open_replicated(&[a.path(), b.path(), c.path()]).unwrap();
     for i in 0..14u32 {
         assert_eq!(read_file(&pool, &format!("f{i}"), 30_000), payload(i));
@@ -133,7 +130,7 @@ fn resilver_and_scrub_rebuild_lost_and_corrupt_shards() {
     // Lose every shard on c.
     for id in &striped {
         for i in lchfs_store::stripe::shards_on(c.path(), *id) {
-            std::fs::remove_file(lchfs_store::stripe::shard_path(c.path(), *id, i)).unwrap();
+            lchfs_store::stripe::remove_shard(c.path(), *id, i).unwrap();
         }
     }
     assert!(segment_ids_with_shards(c.path()).is_empty());
@@ -145,13 +142,13 @@ fn resilver_and_scrub_rebuild_lost_and_corrupt_shards() {
     // Corrupt one shard on b; scrub finds and rebuilds it.
     let id = striped[0];
     let i = lchfs_store::stripe::shards_on(b.path(), id)[0];
-    let p = lchfs_store::stripe::shard_path(b.path(), id, i);
-    let mut bytes = std::fs::read(&p).unwrap();
+    let p = (b.path(), SegmentKind::StripeShard { index: i }, id);
+    let mut bytes = t::read_segment(p.0, p.1, p.2);
     let n = bytes.len();
     for x in &mut bytes[n / 2..n / 2 + 64] {
         *x ^= 0xff;
     }
-    std::fs::write(&p, &bytes).unwrap();
+    t::write_segment(p.0, p.1, p.2, &bytes);
     let reports = pool.scrub().unwrap();
     let rb = reports.iter().find(|r| r.vdev_id == 1).unwrap();
     assert_eq!(rb.shards_corrupt, 1, "{rb:?}");
@@ -230,7 +227,7 @@ fn detach_repacks_the_stripes_that_name_the_leaving_device() {
     for root in [a.path(), b.path()] {
         assert!(segment_ids_with_shards(root).is_empty(), "every 2+1 stripe named vdev 2 and must be a mirror again");
     }
-    assert!(!c.path().join("SUPERBLOCK").exists());
+    assert!(!lchfs_store::testing::ring_written(c.path()));
 
     let pool = Pool::open_replicated(&[a.path(), b.path()]).unwrap();
     for i in 0..14u32 {
@@ -300,12 +297,12 @@ fn detach_refuses_when_a_stripe_cannot_be_read_back() {
     let id = striped[0];
     for root in [a.path(), b.path()] {
         for i in lchfs_store::stripe::shards_on(root, id) {
-            std::fs::remove_file(lchfs_store::stripe::shard_path(root, id, i)).unwrap();
+            lchfs_store::stripe::remove_shard(root, id, i).unwrap();
         }
     }
     let err = Pool::detach_vdev(&[a.path(), b.path(), c.path()]).unwrap_err().to_string();
     assert!(err.contains("refusing to detach"), "{err}");
-    assert!(c.path().join("SUPERBLOCK").exists(), "nothing was changed");
+    assert!(lchfs_store::testing::ring_written(c.path()), "nothing was changed");
 }
 
 #[test]
@@ -380,7 +377,7 @@ fn a_reconstructing_read_is_counted_and_a_pulled_device_is_faulted() {
     // in it reconstruct (losing c's parity shard would not).
     for i in lchfs_store::stripe::shards_on(&b, id) {
         assert!(i < 2, "b holds a data shard");
-        std::fs::remove_file(lchfs_store::stripe::shard_path(&b, id, i)).unwrap();
+        lchfs_store::stripe::remove_shard(&b, id, i).unwrap();
     }
     // The location cache is what read_verified consults; a remount reads
     // cold.
@@ -423,12 +420,12 @@ fn a_reconstructing_read_is_counted_and_a_pulled_device_is_faulted() {
 /// first record of the segment, header and all, is now wrong on that
 /// device, and the shard's own hash no longer matches.
 fn corrupt_first_record_in_shard0(root: &Path, id: u64) {
-    let p = lchfs_store::stripe::shard_path(root, id, 0);
-    let mut bytes = std::fs::read(&p).unwrap();
+    let p = (root, SegmentKind::StripeShard { index: 0 }, id);
+    let mut bytes = t::read_segment(p.0, p.1, p.2);
     for x in &mut bytes[4096..4096 + 300] {
         *x ^= 0xa5;
     }
-    std::fs::write(&p, &bytes).unwrap();
+    t::write_segment(p.0, p.1, p.2, &bytes);
 }
 
 /// Which device holds shard 0 of `id`.
@@ -518,18 +515,18 @@ fn a_segment_with_rot_on_the_primary_is_not_striped() {
     pool.checkpoint().unwrap();
     // Rot the first record of the oldest sealed segment on the primary
     // only, before any pass has run.
-    let oldest = aseg_files(a.path())[0].clone();
-    let mut bytes = std::fs::read(&oldest).unwrap();
+    let oldest = aseg_files(a.path())[0];
+    let mut bytes = t::read_segment(a.path(), SegmentKind::Data, oldest);
     for x in &mut bytes[4096..4096 + 64] {
         *x ^= 0xff;
     }
-    std::fs::write(&oldest, &bytes).unwrap();
+    t::write_segment(a.path(), SegmentKind::Data, oldest, &bytes);
     for _ in 0..8 {
         pool.run_gc_and_coalesce_pass().unwrap();
     }
-    let id: u64 = oldest.file_stem().unwrap().to_str().unwrap().parse().unwrap();
+    let id: u64 = oldest;
     assert!(!segment_ids_with_shards(a.path()).contains(&id), "the rotted segment must stay mirrored");
-    assert!(b.path().join(format!("segments/data/{id}.aseg")).exists(), "its good mirrors must survive");
+    assert!(t::segment_exists(b.path(), SegmentKind::Data, id), "its good mirrors must survive");
     assert!(!segment_ids_with_shards(a.path()).is_empty(), "other segments still convert");
     for i in 0..14u32 {
         assert_eq!(read_file(&pool, &format!("f{i}"), 30_000), payload(i));
@@ -550,8 +547,8 @@ fn a_hostile_descriptor_fails_the_read_and_nothing_else() {
     // list too short for k + m.
     for root in roots {
         for i in lchfs_store::stripe::shards_on(root, id) {
-            let p = lchfs_store::stripe::shard_path(root, id, i);
-            let mut file = std::fs::read(&p).unwrap();
+            let p = (root, SegmentKind::StripeShard { index: i }, id);
+            let mut file = t::read_segment(p.0, p.1, p.2);
             let at = lchfs_format::STRIPE_DESCRIPTOR_OFFSET;
             let len = u32::from_le_bytes(file[at..at + 4].try_into().unwrap()) as usize;
             let mut desc: lchfs_format::StripeDescriptor = lchfs_format::decode(&file[at + 4..at + 4 + len]).unwrap();
@@ -560,7 +557,7 @@ fn a_hostile_descriptor_fails_the_read_and_nothing_else() {
             let encoded = lchfs_format::encode(&desc).unwrap();
             file[at..at + 4].copy_from_slice(&(encoded.len() as u32).to_le_bytes());
             file[at + 4..at + 4 + encoded.len()].copy_from_slice(&encoded);
-            std::fs::write(&p, &file).unwrap();
+            t::write_segment(p.0, p.1, p.2, &file);
         }
     }
     let pool = Pool::open_replicated(&roots).unwrap();
@@ -609,7 +606,7 @@ fn replay_at_mount_reconstructs_striped_chunks_and_says_so() {
     let mut victims = std::collections::BTreeSet::new();
     for &id in &striped {
         let holder = holder_of_shard0(&roots, id);
-        std::fs::remove_file(lchfs_store::stripe::shard_path(holder, id, 0)).unwrap();
+        lchfs_store::stripe::remove_shard(holder, id, 0).unwrap();
         victims.insert(roots.iter().position(|r| *r == holder).unwrap() as u16);
     }
 
@@ -678,7 +675,7 @@ fn a_heal_copy_that_outlives_its_striped_mirror_is_read_where_it_is() {
     let striped = segment_ids_with_shards(a.path());
     assert!(!striped.is_empty(), "no segment was converted");
     for id in &striped {
-        assert!(!a.path().join(format!("segments/data/{id}.aseg")).exists());
+        assert!(!t::segment_exists(a.path(), SegmentKind::Data, *id));
     }
     drop(pool);
 

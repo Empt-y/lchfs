@@ -38,7 +38,7 @@ fn checkpoint_persists_chunk_locations_to_index() {
     pool.checkpoint().unwrap();
     drop(pool);
 
-    let index = RedbIndex::open(&dir.path().join("INDEX.redb")).unwrap();
+    let index = RedbIndex::open(dir.path()).unwrap();
     let locations = index.iter_chunk_locations().unwrap();
     assert!(
         !locations.is_empty(),
@@ -60,7 +60,7 @@ fn checkpoint_persists_chunk_locations_to_index() {
 #[test]
 fn index_generation_tracks_pool_generation_across_multiple_checkpoints() {
     let dir = tempfile::tempdir().unwrap();
-    let index_path = dir.path().join("INDEX.redb");
+    let index_path = dir.path().to_path_buf();
 
     // redb enforces a single open `Database` handle per process, so each
     // generation check below fully closes the `Pool` (and the `RedbIndex`
@@ -102,7 +102,7 @@ fn reopen_after_deleted_index_rebuilds_and_preserves_data() {
         pool.checkpoint().unwrap();
     }
 
-    std::fs::remove_file(dir.path().join("INDEX.redb")).unwrap();
+    lchfs_index::RedbIndex::remove(dir.path()).unwrap();
 
     let pool = Pool::open(dir.path()).unwrap();
     let ino = pool.lookup(1, "hello.txt").unwrap().expect("file survives");
@@ -114,7 +114,7 @@ fn reopen_after_deleted_index_rebuilds_and_preserves_data() {
 
     // The rebuild during that open should have produced a usable index
     // again, ready for the *next* mount's fast path.
-    let index = RedbIndex::open(&dir.path().join("INDEX.redb")).unwrap();
+    let index = RedbIndex::open(dir.path()).unwrap();
     assert!(!index.iter_chunk_locations().unwrap().is_empty());
 }
 
@@ -131,7 +131,7 @@ fn reopen_after_corrupt_index_rebuilds_and_preserves_data() {
         pool.checkpoint().unwrap();
     }
 
-    std::fs::write(dir.path().join("INDEX.redb"), b"not a valid redb database").unwrap();
+    lchfs_store::testing::corrupt_index(dir.path());
 
     let pool = Pool::open(dir.path()).unwrap();
     let ino = pool.lookup(1, "hello.txt").unwrap().expect("file survives");
@@ -156,8 +156,8 @@ fn reopen_with_stale_index_generation_falls_back_correctly() {
     }
 
     // Forge a stale-but-structurally-valid index: empty, generation 0.
-    std::fs::remove_file(dir.path().join("INDEX.redb")).unwrap();
-    RedbIndex::create(&dir.path().join("INDEX.redb")).unwrap();
+    lchfs_index::RedbIndex::remove(dir.path()).unwrap();
+    RedbIndex::create(dir.path()).unwrap();
 
     let pool = Pool::open(dir.path()).unwrap();
     let ino = pool.lookup(1, "hello.txt").unwrap().expect("file survives");

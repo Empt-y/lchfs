@@ -66,7 +66,7 @@ fn a_dead_primary_is_replaced_and_the_pool_keeps_writing() {
     assert_eq!(promoted, 1);
     assert_eq!(pool.primary_vdev(), 1);
     assert!(!pool.primary_faulted());
-    assert!(b.path().join("INDEX.redb").exists(), "the index was rebuilt on the new primary");
+    assert!(lchfs_index::RedbIndex::exists(b.path()), "the index was rebuilt on the new primary");
     assert_eq!(pool.repair_stats().promotions, 1);
 
     // Writes succeed again, and land on b alone.

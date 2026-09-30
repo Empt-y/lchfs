@@ -15,6 +15,7 @@ lchfs-compress = { workspace = true }
 lchfs-chunk = { workspace = true }
 reed-solomon-erasure = "6"
 lchfs-index = { workspace = true }
+lchfs-device = { workspace = true }
 crossbeam = { workspace = true }
 parking_lot = { workspace = true }
 roaring = { workspace = true }

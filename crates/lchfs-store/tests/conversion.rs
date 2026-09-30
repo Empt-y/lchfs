@@ -59,20 +59,7 @@ fn marked(marker: &str, seed: u64, len: usize) -> Vec<u8> {
 }
 
 fn all_bytes_under(root: &Path) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir).unwrap() {
-            let entry = entry.unwrap();
-            let ty = entry.file_type().unwrap();
-            if ty.is_dir() {
-                stack.push(entry.path());
-            } else if ty.is_file() {
-                out.extend(std::fs::read(entry.path()).unwrap());
-            }
-        }
-    }
-    out
+    lchfs_store::testing::device_bytes(root)
 }
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
@@ -289,14 +276,9 @@ fn a_key_rotation_destroys_the_old_key_and_refuses_its_records_after() {
     let mut p = populate(&pool);
     pool.checkpoint().unwrap();
     // Kept aside: an epoch-1 data segment, to inject after the rotation.
-    let data_dir = a.path().join("segments").join("data");
-    let old_segment = std::fs::read_dir(&data_dir)
-        .unwrap()
-        .flatten()
-        .map(|e| e.path())
-        .find(|p| p.extension().is_some_and(|x| x == "aseg"))
-        .unwrap();
-    let old_bytes = std::fs::read(&old_segment).unwrap();
+    use lchfs_store::testing::{SegmentKind, read_segment, segment_ids, write_segment};
+    let old_segment = segment_ids(a.path(), SegmentKind::Data)[0];
+    let old_bytes = read_segment(a.path(), SegmentKind::Data, old_segment);
 
     assert_eq!(pool.start_rekey().unwrap(), 2);
     run_to_end(&pool, &mut p);
@@ -315,8 +297,7 @@ fn a_key_rotation_destroys_the_old_key_and_refuses_its_records_after() {
     drop(pool);
 
     // An epoch-1 record put back is refused, not read.
-    let injected = data_dir.join("999999.aseg");
-    std::fs::write(&injected, &old_bytes).unwrap();
+    write_segment(a.path(), SegmentKind::Data, 999_999, &old_bytes);
     let key = lchfs_fsck::unlock(&[a.path()], &unlock()).unwrap();
     let reader = lchfs_store::segment::SegmentReader::open(a.path(), 999_999, lchfs_format::StreamKind::Data).unwrap();
     let (header, offset) = reader.scan().next().expect("the injected segment has a record");

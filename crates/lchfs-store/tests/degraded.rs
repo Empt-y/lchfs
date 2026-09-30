@@ -9,7 +9,8 @@
 
 use lchfs_format::PoolParams;
 use lchfs_store::Pool;
-use std::path::{Path, PathBuf};
+use lchfs_store::testing::{self as t, SegmentKind};
+use std::path::Path;
 
 fn small_params() -> PoolParams {
     PoolParams {
@@ -32,31 +33,14 @@ fn payload(seed: u32) -> Vec<u8> {
         .collect()
 }
 
-fn segment_files(root: &Path, stream: &str) -> Vec<PathBuf> {
-    let dir = root.join("segments").join(stream);
-    let mut out: Vec<PathBuf> = match std::fs::read_dir(&dir) {
-        Ok(rd) => rd.flatten().map(|e| e.path()).collect(),
-        Err(_) => Vec::new(),
-    };
-    out.sort();
-    out
-}
-
-/// Every file under `dir`, relative path -> bytes.
-fn tree(dir: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+/// Everything a device holds that a mount could write: its superblock
+/// ring and every segment, by name -> bytes.
+fn tree(dev: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
     let mut out = std::collections::BTreeMap::new();
-    fn walk(base: &Path, d: &Path, out: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>) {
-        let Ok(entries) = std::fs::read_dir(d) else { return };
-        for e in entries.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                walk(base, &p, out);
-            } else if let Ok(bytes) = std::fs::read(&p) {
-                out.insert(p.strip_prefix(base).unwrap().to_path_buf(), bytes);
-            }
-        }
+    out.insert("ring".to_string(), t::read_ring(dev));
+    for (kind, id) in t::segments(dev) {
+        out.insert(format!("{kind:?} {id}"), t::read_segment(dev, kind, id));
     }
-    walk(dir, dir, &mut out);
     out
 }
 
@@ -117,9 +101,7 @@ fn a_device_that_missed_writes_is_resilvered_when_it_rejoins() {
 
     // The proof: a loses its data, and everything -- including what was
     // written while b was away -- comes back from b.
-    for f in segment_files(a.path(), "data") {
-        std::fs::remove_file(f).unwrap();
-    }
+    t::remove_segments(a.path(), |k| matches!(k, SegmentKind::Data | SegmentKind::StripeShard { .. }));
     let pool = Pool::open_replicated(&[a.path(), b.path()]).unwrap();
     assert_eq!(read_file(&pool, "before", before.len()), before);
     assert_eq!(read_file(&pool, "during", during.len()), during);
@@ -162,7 +144,7 @@ fn a_pool_mounts_without_vdev_0_and_resilvers_it_when_it_returns() {
         let ino = pool.create_file(1, "during", 0o644).unwrap();
         pool.write(ino, 0, &during).unwrap();
         pool.checkpoint().unwrap();
-        assert!(b.path().join("INDEX.redb").exists(), "the stand-in primary keeps its own index");
+        assert!(lchfs_index::RedbIndex::exists(b.path()), "the stand-in primary keeps its own index");
     }
     assert_eq!(tree(a.path()), a_tree_while_away, "the absent primary must not be written to");
 
@@ -229,7 +211,7 @@ fn a_primary_behind_another_device_is_resilvered_not_refused() {
         pool.checkpoint().unwrap();
         ino
     };
-    let a_ring_at_creation = std::fs::read(a.path().join("SUPERBLOCK")).unwrap();
+    let a_ring_at_creation = lchfs_store::testing::read_ring(a.path());
 
     // Advance both devices, then roll only the primary's ring back. a now
     // says vdev 0 at the creation generation; b says vdev 1, ahead.
@@ -238,7 +220,7 @@ fn a_primary_behind_another_device_is_resilvered_not_refused() {
         pool.checkpoint().unwrap();
         pool.checkpoint().unwrap();
     }
-    std::fs::write(a.path().join("SUPERBLOCK"), &a_ring_at_creation).unwrap();
+    lchfs_store::testing::write_ring(a.path(), 0, &a_ring_at_creation);
 
     let pool = Pool::open_replicated(&[a.path(), b.path()]).unwrap();
     assert_eq!(pool.mount_resilver().len(), 1, "{:?}", pool.mount_resilver());

@@ -24,11 +24,13 @@ fn small_params() -> PoolParams {
 }
 
 #[test]
-fn create_leaves_the_lock_file_behind() {
+fn create_leaves_the_device_locked_while_open() {
     let dir = tempfile::tempdir().unwrap();
     let pool = Pool::create(dir.path(), small_params()).unwrap();
-    assert!(dir.path().join("LOCK").exists());
+    // The lock is on the device itself now, not a LOCK file beside it.
+    assert!(matches!(lchfs_store::lock_pool(dir.path()), Err(lchfs_store::PoolError::PoolLocked(_))));
     drop(pool);
+    lchfs_store::lock_pool(dir.path()).expect("closing the pool releases the device");
 }
 
 /// `flock(2)` is held by the open file description, not the process, so a
@@ -99,7 +101,6 @@ fn create_against_a_locked_pool_is_refused() {
 fn a_leftover_lock_file_does_not_wedge_the_pool() {
     let dir = tempfile::tempdir().unwrap();
     drop(Pool::create(dir.path(), small_params()).unwrap());
-    assert!(dir.path().join("LOCK").exists(), "LOCK file should persist on disk");
 
     Pool::open(dir.path()).expect("a stale LOCK file must not block reopening");
 }

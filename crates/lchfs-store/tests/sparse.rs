@@ -95,7 +95,7 @@ fn stored_bytes(pool_root: &std::path::Path, pool: &Pool, ino: u64) -> u64 {
 /// Live bytes reachable from `root`, via a real GC mark pass -- the same
 /// measurement gc.rs uses.
 fn live_bytes(pool_root: &std::path::Path, root: lchfs_format::Hash32) -> u64 {
-    let index = RedbIndex::open(&pool_root.join("INDEX.redb")).unwrap();
+    let index = RedbIndex::open(pool_root).unwrap();
     let cache = ChunkLocationCache::new();
     cache.extend(index.iter_preferred_locations().unwrap());
     let mut gc = GcEngine::new(
@@ -362,7 +362,6 @@ fn punched_extents_become_gc_reclaimable() {
 /// kind of thing that must not be guessed at.
 #[test]
 fn an_older_format_version_is_refused_by_name() {
-    use std::io::{Read, Seek, SeekFrom, Write};
 
     let dir = tempfile::tempdir().unwrap();
     let pool = Pool::create(dir.path(), small_params()).unwrap();
@@ -379,15 +378,10 @@ fn an_older_format_version_is_refused_by_name() {
             SUPERBLOCK_MAGIC, SUPERBLOCK_SLOT_COUNT, SUPERBLOCK_SLOT_SIZE, SuperblockSlot,
             compute_superblock_slot_checksum, finalize_superblock_slot_checksum,
         };
-        let path = dir.path().join("SUPERBLOCK");
-        let mut file = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        let mut ring = lchfs_store::testing::read_ring(dir.path());
         for slot_idx in 0..SUPERBLOCK_SLOT_COUNT {
-            let offset = slot_idx as u64 * SUPERBLOCK_SLOT_SIZE as u64;
-            let mut buf = vec![0u8; SUPERBLOCK_SLOT_SIZE];
-            file.seek(SeekFrom::Start(offset)).unwrap();
-            if file.read_exact(&mut buf).is_err() {
-                continue;
-            }
+            let offset = slot_idx as usize * SUPERBLOCK_SLOT_SIZE;
+            let buf = ring[offset..offset + SUPERBLOCK_SLOT_SIZE].to_vec();
             let encoded_len = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
             if encoded_len == 0 || 4 + encoded_len > buf.len() {
                 continue;
@@ -407,10 +401,9 @@ fn an_older_format_version_is_refused_by_name() {
             let mut out = vec![0u8; SUPERBLOCK_SLOT_SIZE];
             out[0..4].copy_from_slice(&(encoded.len() as u32).to_le_bytes());
             out[4..4 + encoded.len()].copy_from_slice(&encoded);
-            file.seek(SeekFrom::Start(offset)).unwrap();
-            file.write_all(&out).unwrap();
+            ring[offset..offset + SUPERBLOCK_SLOT_SIZE].copy_from_slice(&out);
         }
-        file.sync_all().unwrap();
+        lchfs_store::testing::write_ring(dir.path(), 0, &ring);
     }
 
     let err = Pool::open(dir.path()).unwrap_err().to_string();

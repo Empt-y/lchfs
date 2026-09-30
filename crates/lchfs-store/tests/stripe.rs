@@ -5,7 +5,8 @@
 use lchfs_format::{CodecId, ExtentKind, ExtentLocation, Hash32, StreamKind};
 use lchfs_store::Vdev;
 use lchfs_store::segment::{SEGMENT_HEADER_PAGE_SIZE, SegmentReader, SegmentWriter};
-use lchfs_store::stripe::{StripeReader, rebuild_shard, shard_path, shards_on, write_stripe};
+use lchfs_store::stripe::{StripeReader, rebuild_shard, remove_shard, shards_on, write_stripe};
+use lchfs_store::testing::{SegmentKind, read_segment, write_segment};
 use std::path::PathBuf;
 
 /// A device is where its ring is: a writer refuses to create a segment
@@ -36,7 +37,7 @@ fn sealed_segment(root: &std::path::Path, id: u64) -> Vec<(ExtentLocation, Vec<u
 }
 
 fn body_of(root: &std::path::Path, id: u64) -> Vec<u8> {
-    let bytes = std::fs::read(root.join(format!("segments/data/{id}.aseg"))).unwrap();
+    let bytes = read_segment(root, SegmentKind::Data, id);
     bytes[SEGMENT_HEADER_PAGE_SIZE as usize..].to_vec()
 }
 
@@ -88,7 +89,7 @@ fn a_missing_shard_is_reconstructed_on_read_and_rebuilt_on_disk() {
     write_stripe(&body, 11, 3, 1, &devs).unwrap();
 
     // Lose data shard 1 entirely.
-    std::fs::remove_file(shard_path(&devs[1].root, 11, 1)).unwrap();
+    remove_shard(&devs[1].root, 11, 1).unwrap();
     let reader = StripeReader::open(11, root_of(&devs), &devs).unwrap();
     assert_eq!(reader.missing(), vec![1]);
     for (loc, payload) in &records {
@@ -102,7 +103,7 @@ fn a_missing_shard_is_reconstructed_on_read_and_rebuilt_on_disk() {
     let reader = StripeReader::open(11, root_of(&devs), &devs).unwrap();
     assert!(reader.missing().is_empty());
     assert!(reader.verify_shard(1).unwrap());
-    let rebuilt = std::fs::read(shard_path(&devs[1].root, 11, 1)).unwrap();
+    let rebuilt = read_segment(&devs[1].root, SegmentKind::StripeShard { index: 1 }, 11);
     // Byte-identical to what write_stripe would have produced: the same
     // header page and the same shard bytes.
     let fresh = tempfile::tempdir().unwrap();
@@ -114,7 +115,7 @@ fn a_missing_shard_is_reconstructed_on_read_and_rebuilt_on_disk() {
         })
         .collect();
     write_stripe(&body, 11, 3, 1, &fresh_devs).unwrap();
-    let original = std::fs::read(shard_path(&fresh_devs[1].root, 11, 1)).unwrap();
+    let original = read_segment(&fresh_devs[1].root, SegmentKind::StripeShard { index: 1 }, 11);
     assert_eq!(rebuilt, original);
 }
 
@@ -127,14 +128,14 @@ fn a_parity_shard_can_go_too_and_more_than_m_cannot() {
     let devs: Vec<Vdev> = dirs.iter().enumerate().map(|(i, d)| Vdev::new(i as u16, d.path().to_path_buf())).collect();
     write_stripe(&body, 12, 2, 2, &devs).unwrap();
     // Two of four gone -- one data, one parity -- still readable at k=2,m=2.
-    std::fs::remove_file(shard_path(&devs[0].root, 12, 0)).unwrap();
-    std::fs::remove_file(shard_path(&devs[3].root, 12, 3)).unwrap();
+    remove_shard(&devs[0].root, 12, 0).unwrap();
+    remove_shard(&devs[3].root, 12, 3).unwrap();
     let reader = StripeReader::open(12, root_of(&devs), &devs).unwrap();
     assert_eq!(reader.missing(), vec![0, 3]);
     let (loc, payload) = &records[5];
     assert_eq!(reader.read_record(*loc).unwrap().1, *payload);
     // Three gone is past what m=2 can cover.
-    std::fs::remove_file(shard_path(&devs[1].root, 12, 1)).unwrap();
+    remove_shard(&devs[1].root, 12, 1).unwrap();
     let reader = StripeReader::open(12, root_of(&devs), &devs).unwrap();
     assert!(reader.read_record(*loc).is_err());
 }
@@ -147,12 +148,12 @@ fn a_corrupted_shard_fails_verification_and_is_read_through_parity() {
     let body = body_of(src.path(), 13);
     let devs: Vec<Vdev> = dirs.iter().enumerate().map(|(i, d)| Vdev::new(i as u16, d.path().to_path_buf())).collect();
     write_stripe(&body, 13, 2, 1, &devs).unwrap();
-    let p = shard_path(&devs[0].root, 13, 0);
-    let mut bytes = std::fs::read(&p).unwrap();
+    let shard0 = SegmentKind::StripeShard { index: 0 };
+    let mut bytes = read_segment(&devs[0].root, shard0, 13);
     for x in &mut bytes[SEGMENT_HEADER_PAGE_SIZE as usize + 100..SEGMENT_HEADER_PAGE_SIZE as usize + 164] {
         *x ^= 0xff;
     }
-    std::fs::write(&p, &bytes).unwrap();
+    write_segment(&devs[0].root, shard0, 13, &bytes);
     let reader = StripeReader::open(13, root_of(&devs), &devs).unwrap();
     assert!(!reader.verify_shard(0).unwrap());
     assert!(reader.verify_shard(1).unwrap());
@@ -162,7 +163,7 @@ fn a_corrupted_shard_fails_verification_and_is_read_through_parity() {
     let (loc0, payload0) = &records[0];
     assert_eq!(reader.read_record(*loc0).unwrap().1, *payload0);
     // With no parity to fall back on, the failure is honest.
-    std::fs::remove_file(shard_path(&devs[2].root, 13, 2)).unwrap();
+    remove_shard(&devs[2].root, 13, 2).unwrap();
     let reader = StripeReader::open(13, root_of(&devs), &devs).unwrap();
     assert!(reader.read_record(*loc0).is_err());
     let reader = StripeReader::open(13, root_of(&devs), &devs).unwrap();

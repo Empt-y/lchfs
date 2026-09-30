@@ -15,6 +15,7 @@ fn lchfs(args: &[&str]) -> Output {
         .arg("-w")
         .arg(env!("CARGO_BIN_EXE_lchfs"))
         .args(args)
+        .env("LCHFS_ALLOW_IMAGES", "1")
         .env_remove("SSH_ASKPASS")
         .env_remove("LCHFS_ASKPASS")
         .env("RUST_LOG", "error")
@@ -97,7 +98,7 @@ fn a_tpm_slot_alone_is_never_created() {
     // passphrase slot too -- asked for, and here there is no one to ask.
     let err = fails(&["create-pool", "--encrypt", "--tpm", s(&pool)]);
     assert!(err.contains("needs a terminal"), "{err}");
-    assert!(!pool.join("SUPERBLOCK").exists() && !lchfs_crypto::keyring::exists_on(&pool), "nothing may be created");
+    assert!(!lchfs_store::testing::ring_written(&pool) && !lchfs_crypto::keyring::exists_on(&pool), "nothing may be created");
 }
 
 #[test]
@@ -212,7 +213,7 @@ fn a_keyring_backup_restores_only_what_is_missing_unless_forced() {
     assert!(out.contains("intact"), "{out}");
 
     // Lost: the pool cannot be opened, and the backup brings it back.
-    std::fs::remove_file(lchfs_crypto::keyring::path_on(&pool)).unwrap();
+    lchfs_crypto::keyring::remove_on(&pool).unwrap();
     let out = ok(&["key", "restore", s(&backup), s(&pool), "--passphrase-file", s(&one)]);
     assert!(out.contains("1 device(s) restored"), "{out}");
     ok(&["fsck", s(&pool), "--passphrase-file", s(&one)]);
@@ -319,6 +320,7 @@ fn lchfs_with_askpass(args: &[&str], askpass: &Path, allow_debug: bool) -> Outpu
     cmd.arg("-w")
         .arg(env!("CARGO_BIN_EXE_lchfs"))
         .args(args)
+        .env("LCHFS_ALLOW_IMAGES", "1")
         .env_remove("SSH_ASKPASS")
         .env("LCHFS_ASKPASS", askpass)
         .env("RUST_LOG", "error")
@@ -369,6 +371,7 @@ fn a_passphrase_through_a_pipe_unlocks() {
         .args(["-c", r#"printf 'piped secret\n' | setsid -w "$0" fsck "$1" --passphrase-fd 0"#])
         .arg(env!("CARGO_BIN_EXE_lchfs"))
         .arg(&pool)
+        .env("LCHFS_ALLOW_IMAGES", "1")
         .env_remove("SSH_ASKPASS")
         .env_remove("LCHFS_ASKPASS")
         .output()

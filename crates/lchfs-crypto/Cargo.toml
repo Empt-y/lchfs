@@ -32,6 +32,7 @@ x-wing = { workspace = true }
 zeroize = { workspace = true }
 getrandom = { workspace = true }
 constant_time_eq = { workspace = true }
+lchfs-device = { workspace = true }
 nix = { workspace = true, features = ["mman", "feature"] }
 tss-esapi = { workspace = true, optional = true }
 
