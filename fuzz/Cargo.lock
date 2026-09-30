@@ -33,6 +33,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "arc-swap"
+version = "1.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "argon2"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -42,6 +51,7 @@ dependencies = [
  "blake2",
  "cpufeatures",
  "password-hash",
+ "zeroize",
 ]
 
 [[package]]
@@ -172,6 +182,7 @@ dependencies = [
  "cfg-if",
  "cipher",
  "cpufeatures",
+ "zeroize",
 ]
 
 [[package]]
@@ -184,6 +195,7 @@ dependencies = [
  "chacha20",
  "cipher",
  "poly1305",
+ "zeroize",
 ]
 
 [[package]]
@@ -516,12 +528,29 @@ dependencies = [
  "bincode",
  "blake3",
  "chacha20poly1305",
+ "constant_time_eq",
  "crc32fast",
  "getrandom 0.3.4",
+ "lchfs-device",
+ "nix",
  "serde",
  "thiserror",
  "x-wing",
  "zeroize",
+]
+
+[[package]]
+name = "lchfs-device"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "crc32fast",
+ "getrandom 0.3.4",
+ "nix",
+ "parking_lot 0.12.5",
+ "redb",
+ "serde",
+ "tracing",
 ]
 
 [[package]]
@@ -539,6 +568,7 @@ name = "lchfs-fsck"
 version = "0.1.0"
 dependencies = [
  "lchfs-crypto",
+ "lchfs-device",
  "lchfs-format",
  "lchfs-index",
  "lchfs-store",
@@ -565,6 +595,7 @@ name = "lchfs-index"
 version = "0.1.0"
 dependencies = [
  "lchfs-crypto",
+ "lchfs-device",
  "lchfs-format",
  "redb",
  "thiserror",
@@ -574,12 +605,14 @@ dependencies = [
 name = "lchfs-store"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "blake3",
  "bytes",
  "crossbeam",
  "lchfs-chunk",
  "lchfs-compress",
  "lchfs-crypto",
+ "lchfs-device",
  "lchfs-format",
  "lchfs-index",
  "nix",
@@ -909,6 +942,12 @@ dependencies = [
  "linux-raw-sys",
  "windows-sys",
 ]
+
+[[package]]
+name = "rustversion"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "scopeguard"

@@ -427,3 +427,57 @@ fn fsck_without_a_key_says_so_instead_of_reporting_corruption() {
     let replicas = lchfs_fsck::check_replicas(&[dir.path()]);
     assert!(replicas.errors.iter().all(|e| matches!(e, lchfs_fsck::FsckError::KeyRequired)), "{:?}", replicas.errors);
 }
+
+/// Writes the seed corpora of the `sealed_segment` and `sealed_inner` fuzz
+/// targets. Run by hand when the format changes:
+/// `cargo test -p lchfs-store --test encryption write_sealed_fuzz_seeds -- --ignored`.
+/// The key and pool uuid must match the targets' `crypto()`.
+#[test]
+#[ignore]
+fn write_sealed_fuzz_seeds() {
+    use lchfs_compress::Codec;
+    use lchfs_crypto::Key32;
+    use lchfs_crypto::epoch::EpochKeys;
+    use lchfs_format::{CodecId, ExtentKind, RecordCrypto, StreamKind};
+    use lchfs_store::segment::SegmentWriter;
+    let crypto = RecordCrypto::new([3; 16], 1, 1, Padding::Padme, vec![EpochKeys::derive(1, &Key32::from_bytes([7; 32]))]);
+    let seeds = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/seeds");
+
+    // A sealed segment: raw and zstd chunks of a few sizes, then sealed
+    // with its footer.
+    let dir = tempfile::tempdir().unwrap();
+    lchfs_store::backend::FileBackend::open(dir.path()).unwrap();
+    let mut w = SegmentWriter::create(&[dir.path()], 1, StreamKind::Data, 0).unwrap();
+    for (i, len) in [0usize, 1, 100, 4096, 20_000].into_iter().enumerate() {
+        let data: Vec<u8> = (0..len).map(|j| ((i * 31 + j * 7) % 251) as u8).collect();
+        let (epoch, hash) = crypto.address(&data);
+        let (codec, payload) = if i % 2 == 1 {
+            (CodecId::Zstd, lchfs_compress::ZstdCodec.compress(&data, 3))
+        } else {
+            (CodecId::None, data.clone())
+        };
+        lchfs_store::crypto::append_fresh(&mut w, &crypto, epoch, ExtentKind::RawChunk, hash, codec, len as u32, &payload).unwrap();
+    }
+    w.seal().unwrap();
+    let out = seeds.join("sealed_segment");
+    std::fs::create_dir_all(&out).unwrap();
+    let segment = lchfs_store::testing::read_segment(dir.path(), lchfs_store::testing::SegmentKind::Data, 1);
+    std::fs::write(out.join("five-sealed-records"), segment).unwrap();
+
+    // Inner plaintexts (mode byte 0): the inner header -- encoded as the
+    // same fields in the same order `seal` writes, which bincode lays out
+    // identically for a tuple -- then the payload. And mode 1: one outer
+    // header byte flipped over a valid record.
+    let out = seeds.join("sealed_inner");
+    std::fs::create_dir_all(&out).unwrap();
+    let data = b"a chunk of file content".to_vec();
+    let (_, hash) = crypto.address(&data);
+    let inner_header = (ExtentKind::RawChunk, CodecId::None, data.len() as u32, data.len() as u32, vec![hash]);
+    let mut seed = vec![0u8];
+    seed.extend_from_slice(&lchfs_format::encode(&inner_header).unwrap());
+    seed.extend_from_slice(&data);
+    std::fs::write(out.join("valid-inner"), seed).unwrap();
+    let mut seed = vec![1u8, 0, 1, 0xFF];
+    seed.extend_from_slice(&data);
+    std::fs::write(out.join("flip-magic"), seed).unwrap();
+}

@@ -1013,6 +1013,7 @@ name = "lchfs-format"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "criterion",
  "lchfs-crypto",
  "proptest",
  "serde",

@@ -45,3 +45,7 @@ tempfile = { workspace = true }
 [[bench]]
 name = "hashing"
 harness = false
+
+[[bench]]
+name = "crypto"
+harness = false

@@ -16,8 +16,9 @@
 //!    is an order statistic that climbs with N even at equal per-thread speed.
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use lchfs_crypto::keyring::{NewSlot, Padding};
 use lchfs_format::PoolParams;
-use lchfs_store::Pool;
+use lchfs_store::{EncryptionSetup, Pool};
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::{Duration, Instant};
 
@@ -55,6 +56,29 @@ const BYTES_PER_THREAD: usize = 32 * 1024 * 1024;
 const WRITE_SIZE: usize = 256 * 1024; // a few chunks per write (chunk_avg 64 KiB)
 const WRITES_PER_THREAD: usize = BYTES_PER_THREAD / WRITE_SIZE;
 const THREAD_COUNTS: &[usize] = &[1, 2, 4, 8, 12, 16];
+/// Every sweep runs against a plaintext pool and an encrypted one
+/// (ARCHITECTURE.md §18): keyed addressing, Padmé and an AEAD seal per
+/// record are the whole difference.
+const MODES: &[&str] = &["plain", "encrypted"];
+
+fn create_pool(dir: &std::path::Path, mode: &str) -> Pool {
+    match mode {
+        "plain" => Pool::create(dir, bench_params()).unwrap(),
+        _ => Pool::create_encrypted(
+            dir,
+            bench_params(),
+            EncryptionSetup {
+                padding: Padding::Padme,
+                slots: vec![NewSlot::Passphrase {
+                    passphrase: lchfs_crypto::testing::TEST_PASSPHRASE,
+                    cost: lchfs_crypto::testing::TEST_KDF,
+                    label: "bench".into(),
+                }],
+            },
+        )
+        .unwrap(),
+    }
+}
 
 fn run_sweep(
     c: &mut Criterion,
@@ -65,9 +89,10 @@ fn run_sweep(
     group.measurement_time(Duration::from_secs(5));
     group.sample_size(10); // real file I/O per iteration -- keep it affordable
 
+    for &mode in MODES {
     for &threads in THREAD_COUNTS {
         group.throughput(Throughput::Bytes((threads * BYTES_PER_THREAD) as u64));
-        group.bench_with_input(BenchmarkId::from_parameter(threads), &threads, |b, &threads| {
+        group.bench_with_input(BenchmarkId::new(mode, threads), &threads, |b, &threads| {
             b.iter_custom(|iters| {
                 let mut total = Duration::ZERO;
                 for _ in 0..iters {
@@ -77,7 +102,7 @@ fn run_sweep(
                     // the same cold-but-equal state. Pool/file setup is
                     // outside the timed region below.
                     let dir = tempfile::tempdir().unwrap();
-                    let pool = Arc::new(Pool::create(dir.path(), bench_params()).unwrap());
+                    let pool = Arc::new(create_pool(dir.path(), mode));
                     let inos: Vec<u64> = (0..threads)
                         .map(|i| pool.create_file(1, &format!("f{i}"), 0o644).unwrap())
                         .collect();
@@ -91,6 +116,7 @@ fn run_sweep(
                 total
             });
         });
+    }
     }
     group.finish();
 }

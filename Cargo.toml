@@ -57,6 +57,8 @@ constant_time_eq = "0.4.2"
 # which maps the pages secrets live in (lchfs-crypto sets its own lints).
 [workspace.lints.rust]
 unsafe_code = "forbid"
+# cargo-fuzz builds with `--cfg fuzzing`; hooks for it hide behind that.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
 
 [package]
 name = "lchfs"
