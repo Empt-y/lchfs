@@ -128,10 +128,20 @@ pub struct SuperblockSlotV2 {
 /// 16 bytes used once per pool. Deriving it from time+pid was rejected: two
 /// pools created in the same second on one machine could collide, and the
 /// whole point of the value is to tell pools apart.
+#[cfg(unix)]
 pub fn generate_pool_uuid() -> std::io::Result<[u8; 16]> {
     use std::io::Read;
     let mut buf = [0u8; 16];
     std::fs::File::open("/dev/urandom")?.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+/// Windows has no `/dev/urandom`: the same CSPRNG through `getrandom`
+/// (`ProcessPrng`), which lchfs-crypto already depends on.
+#[cfg(windows)]
+pub fn generate_pool_uuid() -> std::io::Result<[u8; 16]> {
+    let mut buf = [0u8; 16];
+    getrandom::fill(&mut buf).map_err(|e| std::io::Error::other(e.to_string()))?;
     Ok(buf)
 }
 

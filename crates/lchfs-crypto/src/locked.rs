@@ -3,11 +3,14 @@
 //! Every key and passphrase lchfs holds sits in pages mapped for the
 //! purpose, never on the ordinary heap:
 //!
-//! - **locked** (`mlock`) so they are never written to swap -- best effort,
-//!   since `RLIMIT_MEMLOCK` may be too small; [`status`] says whether it
+//! - **locked** (`mlock`, `VirtualLock` on Windows) so they are never
+//!   written to swap -- best effort, since `RLIMIT_MEMLOCK` (the working-set
+//!   minimum on Windows) may be too small; [`status`] says whether it
 //!   worked;
-//! - **left out of core dumps** (`MADV_DONTDUMP`);
-//! - **not inherited by a forked child** (`MADV_DONTFORK`). Deliberately not
+//! - **left out of core dumps** (`MADV_DONTDUMP`; Unix only -- Windows has
+//!   no per-region equivalent for full dumps);
+//! - **not inherited by a forked child** (`MADV_DONTFORK`; Windows has no
+//!   fork). Deliberately not
 //!   `MADV_WIPEONFORK`: a child that somehow went on using a key would then
 //!   see an all-zero key and seal data nobody can read back, silently. With
 //!   DONTFORK the page is simply absent in the child, and touching it
@@ -25,10 +28,8 @@
 
 #![allow(unsafe_code)]
 
-use nix::sys::mman::{MapFlags, MmapAdvise, ProtFlags, madvise, mlock, mmap_anonymous, mprotect, munmap};
 use std::ffi::c_void;
 use std::fmt;
-use std::num::NonZeroUsize;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -55,10 +56,7 @@ pub fn status() -> LockStatus {
 fn page_size() -> usize {
     static PAGE: OnceLock<usize> = OnceLock::new();
     *PAGE.get_or_init(|| {
-        nix::unistd::sysconf(nix::unistd::SysconfVar::PAGE_SIZE)
-            .ok()
-            .flatten()
-            .map(|p| p as usize)
+        os::page_size()
             .filter(|p| p.is_power_of_two() && *p >= 4096)
             .unwrap_or(4096)
     })
@@ -87,17 +85,8 @@ impl Region {
             .filter(|&d| d <= isize::MAX as usize / 2)
             .unwrap_or_else(|| panic!("{len} bytes is too large for a secret"));
         let mapping_len = data_len + 2 * page;
-        // SAFETY: a fresh anonymous private mapping at an address of the
-        // kernel's choosing aliases nothing that exists.
-        let mapping = unsafe {
-            mmap_anonymous(
-                None,
-                NonZeroUsize::new(mapping_len).expect("non-zero"),
-                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-                MapFlags::MAP_PRIVATE,
-            )
-        }
-        .unwrap_or_else(|e| panic!("mapping {mapping_len} bytes for secrets failed: {e}"));
+        let mapping =
+            os::map(mapping_len).unwrap_or_else(|e| panic!("mapping {mapping_len} bytes for secrets failed: {e}"));
         let base = mapping.as_ptr().cast::<u8>();
         // SAFETY: both offsets stay inside the mapping just created.
         let data = unsafe { NonNull::new_unchecked(base.add(page)) };
@@ -106,20 +95,13 @@ impl Region {
         // points into them. A failure here only loses the fence, never
         // makes memory unsafe, so it is not fatal.
         unsafe {
-            let _ = mprotect(mapping, page, ProtFlags::PROT_NONE);
-            let _ = mprotect(tail.cast(), page, ProtFlags::PROT_NONE);
+            os::guard(mapping, page);
+            os::guard(tail.cast(), page);
         }
         // SAFETY: advice and locking on the data pages of our own mapping
         // change how the kernel treats them, not their contents.
-        unsafe {
-            let d = data.cast::<c_void>();
-            // Kernels too old for either advice return EINVAL; the secret
-            // is no less usable for it.
-            let _ = madvise(d, data_len, MmapAdvise::MADV_DONTDUMP);
-            let _ = madvise(d, data_len, MmapAdvise::MADV_DONTFORK);
-            if mlock(d, data_len).is_err() {
-                LOCK_FAILED.store(true, Ordering::Relaxed);
-            }
+        if !unsafe { os::protect_secret(data.cast(), data_len) } {
+            LOCK_FAILED.store(true, Ordering::Relaxed);
         }
         Region {
             mapping,
@@ -138,7 +120,122 @@ impl Region {
         // no reference into it outlives this call.
         unsafe { std::slice::from_raw_parts_mut(self.data.as_ptr(), self.data_len) }.zeroize();
         // SAFETY: exactly the mapping `map` made. Unmapping also unlocks it.
-        let _ = unsafe { munmap(self.mapping, self.mapping_len) };
+        unsafe { os::unmap(self.mapping, self.mapping_len) };
+    }
+}
+
+/// The handful of virtual-memory calls `Region` needs, per platform.
+#[cfg(unix)]
+mod os {
+    use nix::sys::mman::{MapFlags, MmapAdvise, ProtFlags, madvise, mlock, mmap_anonymous, mprotect, munmap};
+    use std::ffi::c_void;
+    use std::num::NonZeroUsize;
+    use std::ptr::NonNull;
+
+    pub fn page_size() -> Option<usize> {
+        nix::unistd::sysconf(nix::unistd::SysconfVar::PAGE_SIZE)
+            .ok()
+            .flatten()
+            .map(|p| p as usize)
+    }
+
+    /// A fresh private read-write mapping of `len` (non-zero) bytes.
+    pub fn map(len: usize) -> Result<NonNull<c_void>, nix::Error> {
+        // SAFETY: a fresh anonymous private mapping at an address of the
+        // kernel's choosing aliases nothing that exists.
+        unsafe {
+            mmap_anonymous(
+                None,
+                NonZeroUsize::new(len).expect("non-zero"),
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_PRIVATE,
+            )
+        }
+    }
+
+    /// Makes `len` bytes at `at` inaccessible. Best effort.
+    ///
+    /// # Safety
+    /// `at..at+len` is inside a mapping from [`map`] that nothing points into.
+    pub unsafe fn guard(at: NonNull<c_void>, len: usize) {
+        let _ = unsafe { mprotect(at, len, ProtFlags::PROT_NONE) };
+    }
+
+    /// Keeps the pages out of dumps and forked children, and locks them.
+    /// False if the lock failed.
+    ///
+    /// # Safety
+    /// `at..at+len` is inside a mapping from [`map`].
+    pub unsafe fn protect_secret(at: NonNull<c_void>, len: usize) -> bool {
+        // Kernels too old for either advice return EINVAL; the secret is no
+        // less usable for it.
+        unsafe {
+            let _ = madvise(at, len, MmapAdvise::MADV_DONTDUMP);
+            let _ = madvise(at, len, MmapAdvise::MADV_DONTFORK);
+            mlock(at, len).is_ok()
+        }
+    }
+
+    /// # Safety
+    /// Exactly a mapping [`map`] returned, which nothing points into.
+    pub unsafe fn unmap(at: NonNull<c_void>, len: usize) {
+        let _ = unsafe { munmap(at, len) };
+    }
+}
+
+#[cfg(windows)]
+mod os {
+    use std::ffi::c_void;
+    use std::ptr::NonNull;
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc, VirtualFree, VirtualLock,
+        VirtualProtect,
+    };
+    use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+
+    pub fn page_size() -> Option<usize> {
+        // SAFETY: GetSystemInfo only fills the struct it is given.
+        let info = unsafe {
+            let mut info: SYSTEM_INFO = std::mem::zeroed();
+            GetSystemInfo(&mut info);
+            info
+        };
+        Some(info.dwPageSize as usize)
+    }
+
+    /// A fresh private read-write allocation of `len` (non-zero) bytes.
+    pub fn map(len: usize) -> std::io::Result<NonNull<c_void>> {
+        // SAFETY: a fresh allocation at an address of the system's choosing
+        // aliases nothing that exists.
+        let p = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        NonNull::new(p).ok_or_else(std::io::Error::last_os_error)
+    }
+
+    /// Makes `len` bytes at `at` inaccessible. Best effort.
+    ///
+    /// # Safety
+    /// `at..at+len` is inside an allocation from [`map`] that nothing
+    /// points into.
+    pub unsafe fn guard(at: NonNull<c_void>, len: usize) {
+        let mut old = 0;
+        let _ = unsafe { VirtualProtect(at.as_ptr(), len, PAGE_NOACCESS, &mut old) };
+    }
+
+    /// Locks the pages into the working set. False if that failed. There
+    /// is no fork to exclude them from, and no per-region opt-out of full
+    /// memory dumps.
+    ///
+    /// # Safety
+    /// `at..at+len` is inside an allocation from [`map`].
+    pub unsafe fn protect_secret(at: NonNull<c_void>, len: usize) -> bool {
+        unsafe { VirtualLock(at.as_ptr(), len) != 0 }
+    }
+
+    /// # Safety
+    /// Exactly an allocation [`map`] returned, which nothing points into.
+    pub unsafe fn unmap(at: NonNull<c_void>, _len: usize) {
+        // Releasing also unlocks. MEM_RELEASE takes a size of zero.
+        let _ = unsafe { VirtualFree(at.as_ptr(), 0, MEM_RELEASE) };
     }
 }
 
@@ -421,6 +518,7 @@ mod tests {
 
     /// The kernel's flags for the mapping that holds `addr`, from
     /// /proc/self/smaps (`dd` = dontdump, `dc` = dontfork, `lo` = locked).
+    #[cfg(target_os = "linux")]
     fn vm_flags(addr: usize) -> Vec<String> {
         let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
         let mut inside = false;
@@ -462,6 +560,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn secret_pages_are_left_out_of_dumps_and_forks() {
         let slot = Slot::new();
         let bytes = LockedBytes::from_slice(b"hunter2");

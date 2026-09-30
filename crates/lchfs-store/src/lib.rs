@@ -40,6 +40,7 @@ pub mod dedup;
 pub mod delta_log;
 pub mod gc;
 pub mod ingress;
+pub mod platform;
 pub mod prep;
 pub mod rekey;
 pub mod segment;
@@ -1074,6 +1075,7 @@ impl Pool {
 
         let mut inodes = HashMap::new();
         let (now_secs, now_nanos) = now_unix();
+        let owner = platform::current_owner();
         // The root inode is owned by whoever runs `create`, not hardcoded to
         // uid/gid 0 -- with `DefaultPermissions` enabled at mount time, a
         // root owned by uid 0 would lock a non-root mounting user out of
@@ -1083,8 +1085,8 @@ impl Pool {
             InodeObject {
                 kind: InodeKind::Directory,
                 mode: 0o755,
-                uid: nix::unistd::getuid().as_raw(),
-                gid: nix::unistd::getgid().as_raw(),
+                uid: owner.0,
+                gid: owner.1,
                 size: 0,
                 nlink: 2,
                 atime: (now_secs, now_nanos),

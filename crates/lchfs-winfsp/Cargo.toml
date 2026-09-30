@@ -1,0 +1,39 @@
+[package]
+name = "lchfs-winfsp"
+description = "Windows frontend for LCHFS: mounts a pool as a drive through WinFsp"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+# `unsafe` is denied crate-wide and allowed only in `ffi`, the WinFsp
+# boundary (the workspace forbids it outright everywhere else).
+[lints.rust]
+unsafe_code = "deny"
+
+[[bin]]
+name = "lchfs-win"
+path = "src/main.rs"
+
+[dependencies]
+lchfs-store = { workspace = true }
+lchfs-format = { workspace = true }
+lchfs-crypto = { workspace = true }
+tracing = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+] }
+clap = { workspace = true }
+anyhow = { workspace = true }
+zeroize = { workspace = true }
+tracing-subscriber = { workspace = true }
+rpassword = "7"
+ctrlc = { version = "3", features = ["termination"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
